@@ -1393,6 +1393,12 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     df_temp.to_csv(path, index=False, compression='gzip')
 
 
+def infer_independent_esm(
+
+
+
+
+
 def infer_barcode(name, replicate_files, corr_cutoff_pct, gamma=None, output_dir='.', plot_gamma=True):
     '''
     Infer selection coefficients from barcoded count data. Here we equate barcodes with
