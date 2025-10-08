@@ -11,7 +11,7 @@ Zhenchen Hong<sup>1,\*</sup>, Kai Shimagaki<sup>2,3,\*</sup>, and John P. Barton
 <sup>\*</sup> equal contributions  
 <sup>#</sup> correspondence to [jpbarton@pitt.edu](mailto:jpbarton@pitt.edu)
 
-This work is currently available on the bioRxiv at [this link](https://www.biorxiv.org/content/10.1101/2024.01.29.577759v1).
+This work was published on [Bioinformatics](https://academic.oup.com/bioinformatics/article/40/8/btae499/7730007).
 
 # Contents
 
