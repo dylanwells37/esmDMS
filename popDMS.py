@@ -1316,11 +1316,12 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     freq_types = ['single']
     replicates = [i+1 for i in range(n_replicates)]
     aa_freqs = get_aa_freqs(freq_dir, name, freq_types, replicates)
-
+    
     # Get frequency change and covariance, used to compute selection coefficients, and map to indices
     dx, icov, aa2i = compute_dx_covariance_independent(aa_freqs)
     L = len(dx[0])
-    
+    print(f"dx shape: {np.array(dx).shape}")
+    print(f"icov shape: {np.array(icov).shape}")
     # Compute optimal regularization value
     gamma_opt = 1
 
@@ -1342,6 +1343,8 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
             s = np.zeros_like(dx)
             for r_idx in range(n_replicates):
                 for seq_i in range(L):
+                    
+
                     s[r_idx][seq_i] = np.inner(np.linalg.inv(icov[r_idx][seq_i] + g*np.eye(len(icov[r_idx][seq_i]))), dx[r_idx][seq_i])
                 
             corrs.append(np.mean([st.pearsonr(s[i].flatten(), s[j].flatten()).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
@@ -1391,12 +1394,131 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     path = get_selection_file(output_dir, name, file_ext='.csv.gz')
     df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
     df_temp.to_csv(path, index=False, compression='gzip')
+    
+    return aa_freqs
 
 
-def infer_independent_esm(
+def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
+                               max_reads=1e5, output_dir='.', name='esm_inference', plot_gamma=True):
+    """function to just infer to modularize the code for esm"""
+    print("0")
+    dx, icov = compute_dx_covariance_independent_esm(embedding_df)
+    L = len(dx[0])
+    
+    print(f"dx shape: {np.array(dx).shape}")
+    print(f"icov shape: {np.array(icov).shape}")
+    
+    print("1")
+    # Compute optimal regularization value
+    gamma_opt = 1
+    
+    if gamma is not None:
+        gamma_opt = gamma
+        
+    elif n_replicates==1:
+        print('Only one replicate, setting gamma = 1')
+        gamma_opt = 1
+        
+    else:
+        print("2")
+        ## Get correlations for each value of gamma
+        gamma_values = np.logspace(np.log10(1/max_reads), 4, num=20)
+        ## Get correlations for each value of gamma
+        corrs = []
+        for g in gamma_values:
+            s = np.zeros_like(dx)
+            print(f"Shape of s: {s.shape}")
+            
+            for r_idx in range(n_replicates):
+                s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + g*np.eye(len(icov[r_idx]))), dx[r_idx])
+            corrs.append(np.mean([st.pearsonr(s[i].flatten(), s[j].flatten()).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
+            
+        ## (Optional) plot the results
+        if plot_gamma:
+            print("4")
+            plot_regularization(corrs, gamma_values)
+            
+        ## Select best regularization value
+        gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
+        print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
+        
+    ## Compute selection coefficients at optimal gamma
+    s = np.zeros_like(dx)
+    for r_idx in range(n_replicates):
+        s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + gamma_opt*np.eye(len(icov[r_idx]))), dx[r_idx])
+    
+    s_joint = np.inner(np.linalg.inv(np.sum(icov, axis=0) + gamma_opt*np.eye(len(icov[0]))), np.sum(dx, axis=0))
+    
+    # Optionally normalize selection coefficiients @TODO
+    
+    # Convert selection coefficients to a data frame and save to file
+    
+    sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in n_replicates] + ['joint']
+    sel_data = []
+    for dim in range(L):
+        sel_data.append([dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]])
+        
+    path = get_selection_file(output_dir, name, file_ext='.csv.gz')
+    df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
+    df_temp.to_csv(path, index=False, compression='gzip')
+    
+    return [dx, icov, s, s_joint, gamma_opt]
+    
 
-
-
+def compute_dx_covariance_independent_esm(embedding_df):
+    """Compute the dx and icov from an embedding dataframe.
+    
+    Dataframe will have shape:
+    
+    generation | embeddings | frequency | replicate
+    
+    where embeddings is a list of floats of length d (embedding dimension).
+    """
+    
+    reps = len(np.unique(embedding_df['Replicate']))
+    d = len(embedding_df.iloc[0]['Embedding'])
+    
+    # Shape dx vector (reps x [d]) and covariance matrix (reps x [d, d]), compute for each replicate
+    dx  = [np.zeros(d) for i in range(reps)]
+    icov = [np.zeros((d, d)) for i in range(reps)]
+    
+    for r_idx in range(reps):
+        # Get times
+        times = np.sort(np.unique(embedding_df[embedding_df['Replicate']==r_idx+1]['Generation']))
+        times.sort()
+        
+        dtsum = np.array([times[1]-times[0]] + [times[i+1]-times[i-1] for i in range(1, len(times)-1)] + [times[-1]-times[-2]])
+        
+        # Compute dense frequency vector to speed calculations
+        x = np.array([np.zeros(d) for i in range(len(times))])
+        for i in range(len(times)):
+            t = times[i]
+            df_t = embedding_df[(embedding_df['Replicate']==r_idx+1) & (embedding_df['Generation']==t)]
+            for df_iter, row in df_t.iterrows():
+                x[i] += np.array(row['Embedding']) * row['Frequency']
+            
+            x[i] = x[i] / np.sum(df_t['Frequency'])  # Normalize to ensure it's a frequency vector
+        
+        # Compute dx (final - initial frequency)
+        dx[r_idx] = x[-1] - x[0]
+        # Compute integrated covariance
+        ## Off-diagonal terms, same time (note: diagonals will temporarily be incorrect)
+        icov[r_idx] = np.tensordot(dtsum, -np.array([np.outer(x[i], x[i])/3 for i in range(len(times))]), axes=1)
+        ## Off-diagonal terms, cross times
+        for i in range(1, len(times)):
+            dt = times[i] - times[i-1]
+            icov[r_idx] -= dt * (np.outer(x[i-1], x[i]) + np.outer(x[i], x[i-1]))/6
+            
+        ## Diagonal terms, same time (overwrite previous diagonals)
+        icov[r_idx][np.diag_indices_from(icov[r_idx])] = dtsum.dot((x/2) - (x**2/3))
+        
+        ## Diagonal terms, cross times
+        for i in range(1, len(times)):
+            dt = times[i] - times[i-1]
+            icov[r_idx][np.diag_indices_from(icov[r_idx])] -= dt * (x[i] * x[i-1])/3
+    
+    return dx, icov
+    
 
 
 def infer_barcode(name, replicate_files, corr_cutoff_pct, gamma=None, output_dir='.', plot_gamma=True):
@@ -1428,6 +1550,9 @@ def infer_barcode(name, replicate_files, corr_cutoff_pct, gamma=None, output_dir
 
     # Get frequency change and covariance, used to compute selection coefficients, and map to indices
     dx, icov = compute_dx_covariance_barcode(b2i, barcode_freqs, times)
+    
+    print(f"Shape of dx: {np.array(dx).shape}")
+    print(f"Shape of icov: {np.array(icov).shape}")
     
     # Compute optimal regularization value
     gamma_opt = 1
