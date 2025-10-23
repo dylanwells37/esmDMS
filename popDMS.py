@@ -1401,14 +1401,9 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
                                max_reads=1e5, output_dir='.', name='esm_inference', plot_gamma=True):
     """function to just infer to modularize the code for esm"""
-    print("0")
-    dx, icov = compute_dx_covariance_independent_esm(embedding_df)
+    dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
     L = len(dx[0])
     
-    print(f"dx shape: {np.array(dx).shape}")
-    print(f"icov shape: {np.array(icov).shape}")
-    
-    print("1")
     # Compute optimal regularization value
     gamma_opt = 1
     
@@ -1420,14 +1415,12 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         gamma_opt = 1
         
     else:
-        print("2")
         ## Get correlations for each value of gamma
         gamma_values = np.logspace(np.log10(1/max_reads), 4, num=20)
         ## Get correlations for each value of gamma
         corrs = []
         for g in gamma_values:
             s = np.zeros_like(dx)
-            print(f"Shape of s: {s.shape}")
             
             for r_idx in range(n_replicates):
                 s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + g*np.eye(len(icov[r_idx]))), dx[r_idx])
@@ -1435,7 +1428,6 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
             
         ## (Optional) plot the results
         if plot_gamma:
-            print("4")
             plot_regularization(corrs, gamma_values)
             
         ## Select best regularization value
@@ -1453,7 +1445,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
     
     # Convert selection coefficients to a data frame and save to file
     
-    sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in n_replicates] + ['joint']
+    sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates+1)] + ['joint']
     sel_data = []
     for dim in range(L):
         sel_data.append([dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]])
@@ -1462,7 +1454,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
     df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
     df_temp.to_csv(path, index=False, compression='gzip')
     
-    return [dx, icov, s, s_joint, gamma_opt]
+    return [dx, icov, s, s_joint, gamma_opt, x_array]
     
 
 def compute_dx_covariance_independent_esm(embedding_df):
@@ -1482,6 +1474,8 @@ def compute_dx_covariance_independent_esm(embedding_df):
     dx  = [np.zeros(d) for i in range(reps)]
     icov = [np.zeros((d, d)) for i in range(reps)]
     
+    x_array = []
+    
     for r_idx in range(reps):
         # Get times
         times = np.sort(np.unique(embedding_df[embedding_df['Replicate']==r_idx+1]['Generation']))
@@ -1498,6 +1492,8 @@ def compute_dx_covariance_independent_esm(embedding_df):
                 x[i] += np.array(row['Embedding']) * row['Frequency']
             
             x[i] = x[i] / np.sum(df_t['Frequency'])  # Normalize to ensure it's a frequency vector
+        
+        x_array.append(x)
         
         # Compute dx (final - initial frequency)
         dx[r_idx] = x[-1] - x[0]
@@ -1517,7 +1513,7 @@ def compute_dx_covariance_independent_esm(embedding_df):
             dt = times[i] - times[i-1]
             icov[r_idx][np.diag_indices_from(icov[r_idx])] -= dt * (x[i] * x[i-1])/3
     
-    return dx, icov
+    return dx, icov, x_array
     
 
 
