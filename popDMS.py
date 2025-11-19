@@ -1174,6 +1174,29 @@ def plot_regularization(corrs, gamma_values):
     plt.show()
 
 
+def plot_regularization_all(corrs_list, gamma_values):
+    '''
+    Plot correlation as a function of regularization strength for multiple data sets.
+    '''
+    
+    
+    labels = ["Rep 1 vs 2", "Rep 1 vs 3", "Rep 2 vs 3"]
+    fig = plt.figure()
+    
+    corrs_list = np.array(corrs_list)
+    # transpose to get each replicate pair
+    corrs_list = corrs_list.T
+    for i in range(corrs_list.shape[0]):
+        plt.plot(gamma_values, corrs_list[i], label=labels[i])
+    
+    plt.xscale('log')
+    plt.xlabel('Regularization strength (gamma)')
+    plt.ylabel('Correlation between replicates')
+    plt.legend()
+    plt.show()
+
+
+
 def infer_correlated(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=False, freq_dir='.', output_dir='.', with_epistasis=False, plot_gamma=True):
     '''
     Infer selection coefficients from data that includes correlations (counts)
@@ -1419,16 +1442,28 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         gamma_values = np.logspace(np.log10(1/max_reads), 4, num=20)
         ## Get correlations for each value of gamma
         corrs = []
+        corrs_list = []
         for g in gamma_values:
             s = np.zeros_like(dx)
             
             for r_idx in range(n_replicates):
                 s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + g*np.eye(len(icov[r_idx]))), dx[r_idx])
             corrs.append(np.mean([st.pearsonr(s[i].flatten(), s[j].flatten()).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
-            
+
+            temp_list = []
+            for i in range(n_replicates):
+                for j in range(i+1, n_replicates):
+                    if i!=j:
+                        temp_list.append(st.pearsonr(s[i], s[j]).statistic)
+            corrs_list.append(temp_list)
+
         ## (Optional) plot the results
         if plot_gamma:
-            plot_regularization(corrs, gamma_values)
+            print(f"corrs_list: {corrs_list}")
+            print(f"gamma_values: {gamma_values}")
+            print(f"corrs: {corrs}")
+            
+            plot_regularization_all(corrs_list, gamma_values)
             
         ## Select best regularization value
         gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
@@ -1454,8 +1489,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
     df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
     df_temp.to_csv(path, index=False, compression='gzip')
     
-    return [dx, icov, s, s_joint, gamma_opt, x_array]
-    
+    return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
 
 def compute_dx_covariance_independent_esm(embedding_df):
     """Compute the dx and icov from an embedding dataframe.
@@ -1466,6 +1500,8 @@ def compute_dx_covariance_independent_esm(embedding_df):
     
     where embeddings is a list of floats of length d (embedding dimension).
     """
+    
+    #print(f"EMBEDDINGS DF HEAD:\n{embedding_df.head()}")
     
     reps = len(np.unique(embedding_df['Replicate']))
     d = len(embedding_df.iloc[0]['Embedding'])
@@ -1547,8 +1583,8 @@ def infer_barcode(name, replicate_files, corr_cutoff_pct, gamma=None, output_dir
     # Get frequency change and covariance, used to compute selection coefficients, and map to indices
     dx, icov = compute_dx_covariance_barcode(b2i, barcode_freqs, times)
     
-    print(f"Shape of dx: {np.array(dx).shape}")
-    print(f"Shape of icov: {np.array(icov).shape}")
+    #print(f"Shape of dx: {np.array(dx).shape}")
+    #print(f"Shape of icov: {np.array(icov).shape}")
     
     # Compute optimal regularization value
     gamma_opt = 1
@@ -1569,10 +1605,18 @@ def infer_barcode(name, replicate_files, corr_cutoff_pct, gamma=None, output_dir
             for r_idx in range(n_replicates):
                 s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + g*np.eye(len(icov[r_idx]))), dx[r_idx])
             corrs.append(np.mean([st.pearsonr(s[i], s[j]).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
+            corrs_list = []
+            for i in range(n_replicates):
+                for j in range(i+1, n_replicates):
+                    if i!=j:
+                        corrs_list.append(st.pearsonr(s[i], s[j]).statistic)
 
         ## (Optional) plot the results
         if plot_gamma:
-            plot_regularization(corrs, gamma_values)
+            print(f"corrs: {corrs}")
+            print(f"corrs_list: {corrs_list}")
+            
+            plot_regulatization_all(corrs_list, gamma_values)
 
         ## Select best regularization value
         gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
