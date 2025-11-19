@@ -1422,7 +1422,7 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
 
 
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
-                               max_reads=1e5, output_dir='.', name='esm_inference', plot_gamma=True):
+                               max_reads=1e10, output_dir='.', name='esm_inference', plot_gamma=True):
     """function to just infer to modularize the code for esm"""
     dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
     L = len(dx[0])
@@ -1439,7 +1439,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         
     else:
         ## Get correlations for each value of gamma
-        gamma_values = np.logspace(np.log10(1/max_reads), 4, num=20)
+        gamma_values = np.logspace(np.log10(1/max_reads), 4, num=200)
         ## Get correlations for each value of gamma
         corrs = []
         corrs_list = []
