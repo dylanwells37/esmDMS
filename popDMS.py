@@ -1268,7 +1268,7 @@ def infer_correlated(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=Fa
 
         ## Select best regularization value
         gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
-        print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
+        #print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
     
     ## Compute selection coefficients at optimal gamma
     s = np.zeros_like(dx)
@@ -1378,7 +1378,7 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
 
         ## Select best regularization value
         gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
-        print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
+        #print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
     
     ## Compute selection coefficients at optimal gamma
     s = np.zeros_like(dx)
@@ -1422,7 +1422,8 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
 
 
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
-                               max_reads=1e10, output_dir='.', name='esm_inference', plot_gamma=True):
+                               max_reads=1e10, output_dir='.', name='esm_inference', plot_gamma=True,
+                               verbose=False):
     """function to just infer to modularize the code for esm"""
     dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
     L = len(dx[0])
@@ -1434,7 +1435,8 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         gamma_opt = gamma
         
     elif n_replicates==1:
-        print('Only one replicate, setting gamma = 1')
+        if verbose:
+            print('Only one replicate, setting gamma = 1')
         gamma_opt = 1
         
     else:
@@ -1458,7 +1460,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
             corrs_list.append(temp_list)
 
         ## (Optional) plot the results
-        if plot_gamma:
+        if plot_gamma and verbose:
             print(f"corrs_list: {corrs_list}")
             print(f"gamma_values: {gamma_values}")
             print(f"corrs: {corrs}")
@@ -1467,7 +1469,8 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
             
         ## Select best regularization value
         gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
-        print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
+        #if verbose:
+        #    print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
         
     ## Compute selection coefficients at optimal gamma
     s = np.zeros_like(dx)
@@ -1484,10 +1487,11 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
     sel_data = []
     for dim in range(L):
         sel_data.append([dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]])
-        
-    path = get_selection_file(output_dir, name, file_ext='.csv.gz')
-    df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
-    df_temp.to_csv(path, index=False, compression='gzip')
+    
+    if output_dir is not None:
+        path = get_selection_file(output_dir, name, file_ext='.csv.gz')
+        df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
+        df_temp.to_csv(path, index=False, compression='gzip')
     
     return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
 
@@ -1620,7 +1624,7 @@ def infer_barcode(name, replicate_files, corr_cutoff_pct, gamma=None, output_dir
 
         ## Select best regularization value
         gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
-        print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
+        #print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
     
     ## Compute selection coefficients at optimal gamma
     s = np.zeros_like(dx)
