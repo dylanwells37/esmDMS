@@ -425,9 +425,12 @@ def embedding_df_transfer_optimized(embed_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(data_list)
 
 
-def run_inference_calcs(layer_df, output_path, verbose=False):
+def run_inference_calcs(layer_df, output_path, verbose=False, pre_processed=False):
     """Run the inference calculations for the layer-specific dataframe"""
-    inference_df = embedding_df_transfer_optimized(layer_df)  
+    if pre_processed:
+        inference_df = layer_df
+    else:
+        inference_df = embedding_df_transfer_optimized(layer_df)  
     data = popDMS.mini_infer_independent_esm(inference_df, n_replicates=3,
                                             output_dir=output_path, verbose=verbose)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
@@ -493,6 +496,81 @@ def analyze_layers(whole_df, output_path=None, embed_path=None, dataname='BF520'
         
         if verbose:
             print(f"Wrote inference results for layer {layer}")
+        
+    return layer_results
+
+
+def get_unique_df(filepath=default_emb_path):
+    """Get the protein dataframe from the embedding pickle file,
+    combining all entries with the same protein sequence"""
+    
+    whole_df = pd.read_pickle(filepath)
+
+    # Combine the prenums and postnums of any entries with the same potein sequence
+    whole_df['PreNums'] = whole_df['PreNums'].apply(lambda x: np.array(x))
+    whole_df['PostNums'] = whole_df['PostNums'].apply(lambda x: np.array(x))
+    whole_df = whole_df.groupby('ProteinSequence').agg({
+        'PreNums': lambda x: np.sum(x.tolist(), axis=0),
+        'PostNums': lambda x: np.sum(x.tolist(), axis=0),
+        'Embeddings': 'first'
+    }).reset_index()
+
+    whole_df = whole_df[whole_df["Embeddings"].notnull()].reset_index(drop=True)
+
+    return whole_df
+
+
+
+
+def analyze_layers_piecewise(whole_df=None, in_path=None, output_path=None, embed_path=None, dataname='BF520',
+                                verbose=False):
+    """
+    WHOLE PIPELINE, DF -> LAYER RESULTS
+    
+    Input:
+    whole_df: dataframe with embeddings for all layers
+    output_path: path to save the inference results
+    embed_path: path to save the layer-specific embedding dataframes
+    dataname: name of the dataset for saving files
+    
+    Output:
+    data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array] for layer
+    output as a list of data for each layer"""
+    #nonzero_df = whole_df[whole_df["Embeddings"].notnull()].reset_index(drop=True)
+    layer_count = 31 #nonzero_df["Embeddings"][0].shape[0]
+    
+    layer_dfs = []
+    for layer in range(layer_count):
+        
+        if in_path is not None:
+            layer_df = pickle.load(open(f"{in_path}/layer{layer}/inference_df.pkl", 'rb'))
+        
+        #print(layer_df.head())
+        
+        embeddings = np.array([x for x in layer_df["Embedding"].to_list()])
+        dimensions = embeddings.shape[1]
+        for dim in range(dimensions):
+            embeddings[:, dim] = z_normalize(embeddings[:, dim])
+        layer_df["Embedding"] = [embeddings[i] for i in range(embeddings.shape[0])]
+        layer_dfs.append(layer_df)
+        
+
+    
+    layer_results = []
+    for layer in range(layer_count):
+        if verbose:
+            print(f"Analyzing layer {layer}")
+        layer_df = layer_dfs[layer]
+        
+        layer_path = None
+        
+            
+        # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array] for layer
+        data = run_inference_calcs(layer_df, layer_path, verbose=verbose,
+                                   pre_processed=True) 
+        layer_results.append(data)
+        
+
         
     return layer_results
 
