@@ -425,13 +425,14 @@ def embedding_df_transfer_optimized(embed_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(data_list)
 
 
-def run_inference_calcs(layer_df, output_path, verbose=False, pre_processed=False):
+def run_inference_calcs(layer_df, output_path, verbose=False, pre_processed=False,
+                        n_replicates=3):
     """Run the inference calculations for the layer-specific dataframe"""
     if pre_processed:
         inference_df = layer_df
     else:
         inference_df = embedding_df_transfer_optimized(layer_df)  
-    data = popDMS.mini_infer_independent_esm(inference_df, n_replicates=3,
+    data = popDMS.mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
                                             output_dir=output_path, verbose=verbose)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
     
@@ -573,6 +574,72 @@ def analyze_layers_piecewise(whole_df=None, in_path=None, output_path=None, embe
 
         
     return layer_results
+
+
+def analyze_layers_cross_variant(whole_df=None, in_paths=None, output_path=None, 
+                                 embed_path=None, dataname='BF520', verbose=False,
+                                 normalize=True):
+    """
+    WHOLE PIPELINE, DF -> LAYER RESULTS
+    
+    Input:
+    whole_df: dataframe with embeddings for all layers
+    output_path: path to save the inference results
+    embed_path: path to save the layer-specific embedding dataframes
+    dataname: name of the dataset for saving files
+    
+    Output:
+    data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array] for layer
+    output as a list of data for each layer"""
+    #nonzero_df = whole_df[whole_df["Embeddings"].notnull()].reset_index(drop=True)
+    layer_count = 31 #nonzero_df["Embeddings"][0].shape[0]
+    
+    
+    layer_dfs = []
+    for layer in range(layer_count):
+        layer_dfs_layer = []
+        if in_paths is not None:
+            for in_path in in_paths:
+                layer_df = pickle.load(open(f"{in_path}/layer{layer}/inference_df.pkl", 'rb'))
+                layer_dfs_layer.append(layer_df)
+        
+        # Construct the layer_df by concatenating on the embedding dimension.
+        layer_df = layer_dfs_layer[0].copy()
+        num_reps = len(layer_df["Replicate"].unique())
+        
+        total_paths = len(layer_dfs_layer)
+        for path_idx in range(1, total_paths):
+            # add num_reps * total_paths to the replicate number in the new dataframe
+            df_to_add = layer_dfs_layer[path_idx].copy()
+            df_to_add["Replicate"] = df_to_add["Replicate"] + path_idx * num_reps
+            layer_df = pd.concat([layer_df, df_to_add], ignore_index=True)
+        
+        if normalize:
+            embeddings = np.array([x for x in layer_df["Embedding"].to_list()])
+            dimensions = embeddings.shape[1]
+            for dim in range(dimensions):
+                embeddings[:, dim] = z_normalize(embeddings[:, dim])
+            layer_df["Embedding"] = [embeddings[i] for i in range(embeddings.shape[0])]
+            layer_dfs.append(layer_df)
+    
+    layer_results = []
+    for layer in range(layer_count):
+        if verbose:
+            print(f"Analyzing layer {layer}")
+        layer_df = layer_dfs[layer]
+        
+        layer_path = None
+        
+        num_reps = len(layer_df["Replicate"].unique())
+        print(f"Layer {layer} has {num_reps} replicates after combining datasets.")
+        print(layer_df.head())
+        # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array] for layer
+        data = run_inference_calcs(layer_df, layer_path, verbose=verbose,
+                                   pre_processed=True, n_replicates=num_reps) 
+        layer_results.append(data)
+        
+    return layer_results
+
 
 
 def get_unique_df(filepath=default_emb_path):

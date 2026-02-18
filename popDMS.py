@@ -1177,17 +1177,17 @@ def plot_regularization(corrs, gamma_values):
 def plot_regularization_all(corrs_list, gamma_values):
     '''
     Plot correlation as a function of regularization strength for multiple data sets.
-    '''
-    
-    
-    labels = ["Rep 1 vs 2", "Rep 1 vs 3", "Rep 2 vs 3"]
+    '''    
     fig = plt.figure()
     
     corrs_list = np.array(corrs_list)
     # transpose to get each replicate pair
     corrs_list = corrs_list.T
+    label_num = corrs_list.shape[0]
+    
+    
     for i in range(corrs_list.shape[0]):
-        plt.plot(gamma_values, corrs_list[i], label=labels[i])
+        plt.plot(gamma_values, corrs_list[i])#, label=labels[i])
     
     plt.xscale('log')
     plt.xlabel('Regularization strength (gamma)')
@@ -1366,12 +1366,9 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
             s = np.zeros_like(dx)
             for r_idx in range(n_replicates):
                 for seq_i in range(L):
-                    
-
                     s[r_idx][seq_i] = np.inner(np.linalg.inv(icov[r_idx][seq_i] + g*np.eye(len(icov[r_idx][seq_i]))), dx[r_idx][seq_i])
                 
             corrs.append(np.mean([st.pearsonr(s[i].flatten(), s[j].flatten()).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
-
         ## (Optional) plot the results
         if plot_gamma:
             plot_regularization(corrs, gamma_values)
@@ -1422,7 +1419,7 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
 
 
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
-                               max_reads=1e10, output_dir='.', name='esm_inference', plot_gamma=True,
+                               max_reads=1e2, output_dir='.', name='esm_inference', plot_gamma=True,
                                verbose=False):
     """function to just infer to modularize the code for esm"""
     dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
@@ -1441,7 +1438,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         
     else:
         ## Get correlations for each value of gamma
-        gamma_values = np.logspace(np.log10(1/max_reads), 4, num=200)
+        gamma_values = np.logspace(np.log10(1/max_reads), 4, num=20)
         ## Get correlations for each value of gamma
         corrs = []
         corrs_list = []
