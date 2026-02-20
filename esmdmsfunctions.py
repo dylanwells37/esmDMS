@@ -1,12 +1,12 @@
 import os
-import shutil
+#import shutil
 import pandas as pd
 import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
-from sklearn.metrics import silhouette_score
+#from sklearn.decomposition import PCA
+#from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+#from sklearn.metrics import silhouette_score
 import pickle
 import time
 
@@ -21,7 +21,7 @@ reload(popDMS)
 ## GLOBAL VARIABLES
 
 
-pwd = os.getcwd()
+pwd = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
 
 # Pick an ESM-2 model size
 model_name = "facebook/esm2_t30_150M_UR50D"
@@ -521,61 +521,6 @@ def get_unique_df(filepath=default_emb_path):
     return whole_df
 
 
-
-
-def analyze_layers_piecewise(whole_df=None, in_path=None, output_path=None, embed_path=None, dataname='BF520',
-                                verbose=False):
-    """
-    WHOLE PIPELINE, DF -> LAYER RESULTS
-    
-    Input:
-    whole_df: dataframe with embeddings for all layers
-    output_path: path to save the inference results
-    embed_path: path to save the layer-specific embedding dataframes
-    dataname: name of the dataset for saving files
-    
-    Output:
-    data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array] for layer
-    output as a list of data for each layer"""
-    #nonzero_df = whole_df[whole_df["Embeddings"].notnull()].reset_index(drop=True)
-    layer_count = 31 #nonzero_df["Embeddings"][0].shape[0]
-    
-    layer_dfs = []
-    for layer in range(layer_count):
-        
-        if in_path is not None:
-            layer_df = pickle.load(open(f"{in_path}/layer{layer}/inference_df.pkl", 'rb'))
-        
-        #print(layer_df.head())
-        
-        embeddings = np.array([x for x in layer_df["Embedding"].to_list()])
-        dimensions = embeddings.shape[1]
-        for dim in range(dimensions):
-            embeddings[:, dim] = z_normalize(embeddings[:, dim])
-        layer_df["Embedding"] = [embeddings[i] for i in range(embeddings.shape[0])]
-        layer_dfs.append(layer_df)
-        
-
-    
-    layer_results = []
-    for layer in range(layer_count):
-        if verbose:
-            print(f"Analyzing layer {layer}")
-        layer_df = layer_dfs[layer]
-        
-        layer_path = None
-        
-            
-        # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array] for layer
-        data = run_inference_calcs(layer_df, layer_path, verbose=verbose,
-                                   pre_processed=True) 
-        layer_results.append(data)
-        
-
-        
-    return layer_results
-
-
 def analyze_layers_cross_variant(whole_df=None, in_paths=None, output_path=None, 
                                  embed_path=None, dataname='BF520', verbose=False,
                                  normalize=True):
@@ -805,4 +750,833 @@ def shuffle_replicates(df: pd.DataFrame, replicates: list, random_seed: int = No
         shuffled_df[post_col] = [post_counts[i].tolist() for i in range(shuffled_df.shape[0])]
     return shuffled_df
         
+
+
+## SIMULATION FUNCTION ##################################
+
+
+# Now, let's calculate the fitness for each variant based on its embedding and the selection coefficients
+def calculate_fitness_exp(embedding, selection_coefficients):
+    fitness = np.exp(np.dot(embedding, selection_coefficients))
+    if np.isinf(fitness):
+        fitness = 1e10  # Cap infinite fitness to a large number
+    return fitness
+
+def calc_all_fitness_exp(embeddings, selection_coefficients,
+                         embedding_clip=None):
+    fitnesses = []
+    for embedding in embeddings:
+        if embedding_clip is not None:
+            embedding = np.clip(embedding, embedding_clip[0], embedding_clip[1])
+        fitness = calculate_fitness_exp(embedding, selection_coefficients)
+        fitnesses.append(fitness)
+    return np.array(fitnesses)
+
+def calculate_fitness_plus1(embedidng, selection_coefficients):
+    fitness = 1 + np.dot(embedidng, selection_coefficients)
+    return max(fitness, 0)  # Ensure fitness is not negative
+
+def calc_all_fitness_plus1(embeddings, selection_coefficients,
+                            embedding_clip=None):
+    fitnesses = []
+    for embedding in embeddings:
+        if embedding_clip is not None:
+            embedding = np.clip(embedding, embedding_clip[0], embedding_clip[1])
+        fitness = calculate_fitness_plus1(embedding, selection_coefficients)
+        fitnesses.append(fitness)
+    return np.array(fitnesses)
+
+def simulate_generation_multinomial(current_counts, fitnesses):
+    population_size = np.sum(current_counts)
+    total_fitness = np.sum(current_counts * fitnesses)
+    probabilities = (current_counts * fitnesses) / total_fitness
+    # if a probability is below 0, set it to zero
+    # if a probability is above 1, set it to 1
+    probabilities = np.clip(probabilities, 0, 1)
+    next_counts = np.random.multinomial(population_size, probabilities)
+    return next_counts # Check if output is a different scale
+
+
+
+def get_df_selection(random_seed=42, selected_layer=12, normalize_embeddings=True, input_df=None):
+    """Get the starting information for the simulation,
+    i.e. the layer dataframe and the initial counts for each replicate.
+    
+    Args:
+        input_df: Optional pre-built dataframe containing Rep1/2/3_PreNums,
+                  Rep1/2/3_PostNums, and an 'Embedding' column for the selected
+                  layer. If provided, data loading and layer decomposition are
+                  skipped entirely.
+    """
+    rc('text', usetex=True)
+    pd.set_option('display.max_columns', 100)
+    np.random.seed(random_seed)
+
+    if input_df is not None:
+        # Expect input_df to already have Rep{1,2,3}_Pre/PostNums and 'Embedding'
+        required_cols = [
+            'Rep1_PreNums', 'Rep2_PreNums', 'Rep3_PreNums',
+            'Rep1_PostNums', 'Rep2_PostNums', 'Rep3_PostNums',
+            'Embedding'
+        ]
+        missing = [c for c in required_cols if c not in input_df.columns]
+        if missing:
+            raise ValueError(f"input_df is missing required columns: {missing}")
+        df_selection = input_df.copy()
+
+    else:
+        pwd = os.getcwd()
+        init_pop = get_unique_df(pwd + '/data/sequence_data/all_reps_BF520_protein_embeddings.pkl')
+        n_reps = 3
+
+        replicate_dfs = []
+        for rep in range(n_reps):
+            df_rep = init_pop.copy()
+            df_rep['PreNums']  = df_rep['PreNums'].apply(lambda x: x[rep])
+            df_rep['PostNums'] = df_rep['PostNums'].apply(lambda x: x[rep])
+            df_rep = df_rep.drop(columns=['ProteinSequence'])
+            replicate_dfs.append(df_rep)
+
+        # Only decompose the selected layer — skip the full loop
+        decomposed_dfs = []
+        for rep_df in replicate_dfs:
+            decomposed_df = rep_df[['PreNums', 'PostNums']].copy()
+            decomposed_df[f'Layer{selected_layer}'] = rep_df['Embeddings'].apply(
+                lambda x: x[selected_layer]
+            )
+            decomposed_dfs.append(decomposed_df)
+
+        df_selection = pd.DataFrame()
+        for i, decomposed_df in enumerate(decomposed_dfs):
+            df_selection[f'Rep{i+1}_PreNums']  = decomposed_df['PreNums']
+            df_selection[f'Rep{i+1}_PostNums'] = decomposed_df['PostNums']
+        df_selection['Embedding'] = decomposed_dfs[-1][f'Layer{selected_layer}']
+
+    if normalize_embeddings:
+        embeddings   = np.vstack(df_selection['Embedding'].tolist())
+        z_embeddings = z_normalize(embeddings)
+        df_selection['Embedding'] = [z_embeddings[i] for i in range(z_embeddings.shape[0])]
+
+    start_counts1 = df_selection["Rep1_PreNums"].values
+    start_counts2 = df_selection["Rep2_PreNums"].values
+    start_counts3 = df_selection["Rep3_PreNums"].values
+
+    return df_selection, (start_counts1, start_counts2, start_counts3)
+
+
+def run_simulation(df_selection, selection_coefficients, initial_counts, 
+                   n_gens=30, embedding_clip=None, save_every=1, fitness='exp'):
+    embeddings = np.vstack(df_selection['Embedding'].values)
+    
+    if fitness == 'exp':
+        fitnesses = calc_all_fitness_exp(embeddings, selection_coefficients,
+                                        embedding_clip=embedding_clip)
+    elif fitness == 'plus1':
+        fitnesses = calc_all_fitness_plus1(embeddings, selection_coefficients,
+                                        embedding_clip=embedding_clip)
+    else:
+        raise ValueError("Invalid fitness function specified.")
+    
+    #print("intial counts shape and type:", np.array(initial_counts).shape, type(initial_counts))
+    generation_counts = [initial_counts]
+    n_reps = len(initial_counts)
+    last_counts = initial_counts
+    
+    print(last_counts)
+    
+    for gen in range(n_gens):
         
+        this_gen = []
+        for rep in range(n_reps):
+            rep_counts = last_counts[rep]
+            next_counts = simulate_generation_multinomial(rep_counts, fitnesses)
+            this_gen.append(next_counts)
+        if (gen + 1) % save_every == 0:
+            #print(f"Completed generation {gen + 1}")
+            generation_counts.append(this_gen)
+        last_counts = this_gen
+    #print(f"generation_counts length: {len(generation_counts)}")
+    #print(f"generation_counts shape: {np.array(generation_counts).shape}")
+    return generation_counts, fitnesses
+
+
+def simulation_df_transfer(df_selection, generation_counts):
+    #["Generation", "Embedding", "Frequency", "Replicate"]
+    emb_vals = df_selection["Embedding"].values
+    #generation counts format [[gen1data], [gen2data],...]
+    data_list = []
+    for gen, gen_data in enumerate(generation_counts):
+        for rep, rep_data in enumerate(gen_data):
+            for i, count in enumerate(rep_data):
+                data_list.append({
+                    "Generation": gen,
+                    "Embedding": emb_vals[i],
+                    "Frequency": count,
+                    "Replicate": rep + 1
+                })
+    return pd.DataFrame(data_list)
+
+def run_inference_calcs_sims(df_selection, generation_counts, output_path,
+                             save_output=False):
+    """Run the inference calculations:
+    WHOLE PIPELINE FROM READING IN EMBEDDINGS DATAFRAME
+    """
+    inference_df = simulation_df_transfer(df_selection, generation_counts)
+    
+    if save_output:
+        # make directory
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+        # save inference_df
+        inference_df.to_pickle(output_path + 'inference_df.pkl')
+        print(f"SAVED INFERENCE DF TO {output_path}")
+    
+       
+    data = popDMS.mini_infer_independent_esm(inference_df, n_replicates=3)
+    return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
+
+def other_methods(df_selection, generation_counts, generation=-1):
+    """Find the enrichment ratio, log ratio, and log enrichment"""
+    first_gen = generation_counts[0]
+    last_gen = generation_counts[generation]
+    
+    enrichments = []
+    log_ratios = []
+    #log_enrichments = []
+    
+    embeddings = np.vstack(df_selection['Embedding'].values)
+    
+    for rep in range(len(first_gen)):
+        start_counts = first_gen[rep]
+        end_counts = last_gen[rep]
+        
+        embedding_avg_before = np.sum(embeddings.T * start_counts, axis=1) / np.sum(start_counts)
+        embedding_avg_after = np.sum(embeddings.T * end_counts, axis=1) / np.sum(end_counts)
+        
+        
+        embedding_sum = np.sum(embedding_avg_before) + np.sum(embedding_avg_after) / 2
+        
+        enrichment = (embedding_avg_after / embedding_avg_before) / embedding_sum
+        
+        log_ratio = np.log((embedding_avg_after / embedding_avg_before) / embedding_sum)
+        
+        #log_enrichment = np.log(enrichment)
+        
+        log_ratios.append(log_ratio)
+        enrichments.append(enrichment)
+        
+    return np.array(enrichments), np.array(log_ratios) #, np.array(log_enrichments)
+
+def normalize_embeddings(df):
+    #print(df.head())
+    embedding_array = np.array([x for x in df["Embedding"].to_list()])
+    #print(embedding_array.shape)
+    z_embeddings = np.zeros_like(embedding_array)
+    dimensions = embedding_array.shape[1]
+    for dim in range(dimensions):
+        z_embeddings[:, dim] = z_normalize(embedding_array[:, dim])
+        
+    # insert back into the dataframe
+    df["Embedding"] = [z_embeddings[i] for i in range(z_embeddings.shape[0])]
+    return df
+
+
+def generate_selection(embeddings):
+    embedding_ranges = embeddings.max(axis=0) - embeddings.min(axis=0)
+    selection_coefficients = np.zeros(embeddings.shape[1])
+    # Find the indices of the top, lowest, and middle range dimensions
+    sorted_indices = np.argsort(embedding_ranges)
+    high_range_idx = sorted_indices[-1]
+    # Give these dimensions higher selection coefficients
+    selection_coefficients[high_range_idx] = 0.10
+    return selection_coefficients
+
+def generate_one_selection(embeddings):
+    selection_coefficients = np.zeros(embeddings.shape[1])
+    embedding_ranges = embeddings.max(axis=0) - embeddings.min(axis=0)
+    # Find the indices of the top, lowest, and middle range dimensions
+    sorted_indices = np.argsort(embedding_ranges)
+    high_range_idx = sorted_indices[-1]
+    # Give these dimensions higher selection coefficients
+    selection_coefficients[high_range_idx] = 0.10
+    return selection_coefficients
+
+def get_simulation_results(n_layers, n_gens, n_reps, 
+                           sel_func=generate_selection,
+                           inference=True, fitness='plus1',
+                           save_every=1):
+    all_layer_fits = {}
+    all_selection_coefficients = {}
+    detailed_selection_results = {}
+    all_generation_counts = {}
+    whole_embedding_matrix = {}
+    for layer in range(n_layers):
+        print(f"Running layer {layer}...")
+        df_selection, initial_counts = get_df_selection(random_seed=42, selected_layer=layer,
+                                                        normalize_embeddings=False)
+        print(df_selection.head())
+        df_selection = normalize_embeddings(df_selection)
+
+        # Generate selection coefficients using the provided function
+        embedding_matrix = np.vstack(df_selection['Embedding'].tolist())
+        whole_embedding_matrix[layer] = embedding_matrix
+        selection_coefficients = sel_func(embedding_matrix)
+        all_selection_coefficients[layer] = selection_coefficients
+        
+        print("Running simulation...")
+        generation_counts, layer_fits = run_simulation(df_selection, selection_coefficients, 
+                                           initial_counts, n_gens=n_gens, save_every=save_every,
+                                           fitness=fitness)
+        all_generation_counts[layer] = generation_counts
+        all_layer_fits[layer] = layer_fits
+
+        if inference:
+            gen=n_gens
+            print(f"  Analyzing generation {gen}...")
+            layer_results = []
+            test_path = pwd + f"/simulations/layer_{layer}_gen_{gen}/"
+            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1], test_path)
+            found_sel_coeffs = data[2]
+            layer_results.append(found_sel_coeffs)
+
+            detailed_selection_results[layer] = layer_results
+
+    return all_layer_fits, all_selection_coefficients, detailed_selection_results, all_generation_counts, whole_embedding_matrix
+    
+    
+    
+def calc_inferred_fits(sim_data, fitness='plus1', layer=0):
+    """ Calculate the inferred fitness score of every individual in the population across layer and generation using the inferred selection coefficients and the embeddings"""
+    sel_coefs = sim_data[2][layer][0]
+    embeddings = sim_data[4][layer]
+    n_reps = sel_coefs.shape[0]
+    n_indivs = embeddings.shape[0]
+    inferred_fits = []
+    for indiv in range(n_indivs):
+        indiv_fits = []
+        for rep in range(n_reps):
+            if fitness == 'exp':
+                fit = calculate_fitness_exp(embeddings[indiv], sel_coefs[rep])
+            elif fitness == 'plus1':
+                fit = calculate_fitness_plus1(embeddings[indiv], sel_coefs[rep])
+            else:
+                raise ValueError("Invalid fitness function specified.")
+            indiv_fits.append(fit)
+        inferred_fits.append(indiv_fits)
+    return np.array(inferred_fits)
+    
+def comp_inf_vs_real_fits(sim_data, layer, fitness='plus1'):
+    """Compare the inferred and real fitness scores."""
+    # For each layer, plot the fitness growth over time
+    all_layer_fits = sim_data[0][layer]
+    all_gen_counts = sim_data[3]
+    embeddings = sim_data[4][layer]
+    n_gens = len(all_gen_counts[0]) - 1
+    n_reps = len(all_gen_counts[0][0])
+
+    # Print the shape of all these data
+    #print(fitness)
+    inferred_fits = calc_inferred_fits(sim_data, fitness=fitness, 
+                                       layer=layer)
+
+    # Z-normalize the real fits
+    real_fits = np.array(all_layer_fits)
+    real_fits = z_normalize(real_fits)
+
+    # Normalize the inferred fits per replicate
+    rep_fits = {}
+    for rep in range(n_reps):
+        rep_fits[rep] = z_normalize(inferred_fits[:, rep])
+
+    # Make a plot showing the comparison between the real and inferred
+    # fitness scores for each replicate, with a diagonal line for reference
+    fig, axes = plt.subplots(1, n_reps, figsize=(6 * n_reps, 6), squeeze=False)
+    axes = axes.flatten()
+    plt.style.use('seaborn-v0_8-darkgrid')
+
+    all_real = []
+    all_inferred = []
+
+    for rep in range(n_reps):
+        ax = axes[rep]
+        r = real_fits
+        inf = rep_fits[rep]
+        ax.scatter(r, inf, alpha=0.5)
+        ax.set_xlabel('Real Fitness (Normalized)')
+        ax.set_ylabel('Inferred Fitness (Normalized)')
+        ax.set_title(f'Layer {layer} — Replicate {rep}')
+
+        # Diagonal reference line
+        lims = [min(r.min(), inf.min()) - 0.5,
+                max(r.max(), inf.max()) + 0.5]
+        ax.plot(lims, lims, color='red', linestyle='--')
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+
+        # Compute and annotate Pearson r
+        
+        
+        corr, pval = pearsonr(r, inf)
+        ax.annotate(f'r = {corr:.3f}\np = {pval:.2e}',
+                     xy=(0.05, 0.95), xycoords='axes fraction',
+                     ha='left', va='top',
+                     fontsize=11, bbox=dict(boxstyle='round', fc='white', alpha=0.8))
+
+        all_real.extend(r)
+        all_inferred.extend(inf)
+
+    plt.suptitle(f'Real vs Inferred Fitness — Layer {layer}', fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+    # Also return the overall correlation across all replicates
+    overall_corr, overall_pval = pearsonr(all_real, all_inferred)
+    print(f'Overall Pearson r = {overall_corr:.4f}, p = {overall_pval:.2e}')
+
+    return rep_fits, overall_corr
+
+
+
+def find_fixed_gen(generation_counts, cutoff_pct=0.75):
+    # Return the generation at which 90% of the population has the same dominant type
+    for gen in range(len(generation_counts)):
+        for rep in range(len(generation_counts[gen])):
+            rep_counts = generation_counts[gen][rep]
+            total_count = np.sum(rep_counts)
+            max_count = np.max(rep_counts)
+            #print(f"Generation: {gen} Replicate: {rep} Max Count: {max_count} Total Count: {total_count}")
+            if max_count / total_count >= cutoff_pct:
+                return gen
+    return len(generation_counts) - 1  # Return the last generation if never reaches cutoff
+
+def averaged_covariance(sim_data, layer=0):
+    layer_df = get_df_selection(random_seed=42, selected_layer=layer,
+                                    normalize_embeddings=False)[0]
+    layer_df = normalize_embeddings(layer_df)
+    embeddings = np.vstack(layer_df['Embedding'].tolist())
+
+    # Get the selection coefficients
+    true_selection = sim_data[1][layer]
+    layer_generation_counts = sim_data[3][layer]
+    inferred_selection = sim_data[2][layer][0]
+    best_dim_idx = np.argmax(np.abs(true_selection))
+
+    # Find the covariance between all embeddings with the best dimension
+    best_dim_values = embeddings[:, best_dim_idx]
+    fixed_gen = find_fixed_gen(layer_generation_counts)
+    print(f"Cutoff generation for layer {layer}: {fixed_gen}")
+    total_covariances = []
+    for gen in range(fixed_gen):
+        # Find the covariance using a weighted approach and the population from the first selection event (gen=1)
+        weights = np.average(layer_generation_counts[gen], axis=0)
+        covariances = []
+        for dim in range(embeddings.shape[1]):
+            dim_values = embeddings[:, dim]
+            mean_best = np.average(best_dim_values, weights=weights)
+            mean_dim = np.average(dim_values, weights=weights)
+            covariance = np.average((best_dim_values - mean_best) * (dim_values - mean_dim), weights=weights)
+            covariances.append(covariance)
+        covariances = np.array(covariances)
+        total_covariances.append(covariances)
+    avg_covariances = np.mean(total_covariances, axis=0)
+    # Plot the selection coefficients in order of rank, colored by covariance with best dimension
+    # Plot all three replicates
+    plt.figure(figsize=(15, 5))
+    plt.style.use('seaborn-v0_8-darkgrid')
+    for rep in range(3):
+        rep_inf_sel = inferred_selection[rep]
+        
+        normalized_selection = z_normalize(rep_inf_sel)
+        
+        # Use this:
+        sorted_indices = np.argsort(normalized_selection)[::-1]  # Sort descending
+        x_vals = np.arange(len(normalized_selection))  # Simple 0, 1, 2, ... for x-axis
+        y_vals = normalized_selection[sorted_indices]  # Values in descending order
+        covariances_sorted = avg_covariances[sorted_indices]  # Sort covariances to match
+        
+        plt.subplot(1, 3, rep + 1)
+        scatter = plt.scatter(x_vals, y_vals, c=covariances_sorted, cmap='coolwarm', alpha=0.7)
+        plt.colorbar(scatter, label='Average Covariance with Best Dimension')
+        plt.title(f'Layer {layer} Replicate {rep + 1}')
+        plt.xlabel('Rank of Inferred Selection Coefficient')
+        plt.ylabel('Inferred Selection Coefficient (Normalized)')
+        plt.axhline(0, color='black', linestyle='--')
+        
+        
+        # For the best dimension highlight:
+        best_dim_position = np.where(sorted_indices == best_dim_idx)[0]
+        plt.scatter(best_dim_position, normalized_selection[best_dim_idx],
+                    color='yellow', edgecolor='black', s=100, label='Best Dimension')
+        
+    plt.tight_layout()
+    plt.show()
+
+# plot fitness over time
+def plot_fitness_over_time(sim_data):
+    # For each layer, plto the fitness growth over time
+    
+    all_layer_fits = sim_data[0]
+    all_gen_counts = sim_data[3]
+    
+    n_gens = len(all_gen_counts[0]) - 1
+    n_reps = len(all_gen_counts[0][0])
+    
+    avg_fitness_over_time = {}
+    for layer in range(len(all_layer_fits.keys())):
+        layer_fits = all_layer_fits[layer]
+        layer_counts = all_gen_counts[layer]
+        avg_fitness_by_rep = []
+        for gen in range(len(layer_counts)):
+            gen_counts = layer_counts[gen]
+            gen_fitnesses = []
+            for rep in range(n_reps):
+                rep_counts = gen_counts[rep]
+                fitnesses = np.array(layer_fits)
+                fitnesses = z_normalize(fitnesses)
+                fitnesses = fitnesses / np.max(fitnesses)
+                avg_fitness = np.sum(fitnesses * rep_counts) / np.sum(rep_counts)
+                gen_fitnesses.append(avg_fitness)
+            avg_fitness_by_rep.append(gen_fitnesses)
+        # Add the replicate information to the layer
+        avg_fitness_over_time[layer] = avg_fitness_by_rep
+
+    # Plot the growtih in fitness over time for each layer and replicate
+    save_every = 1
+    x_vals = np.arange(0, n_gens + 1, save_every)
+    
+    plt.figure(figsize=(10, 6))
+    plt.style.use('seaborn-v0_8-darkgrid')
+    for layer in range(1, len(avg_fitness_over_time.keys())):
+        layer_avg_fitness = np.array(avg_fitness_over_time[layer])
+        for rep in range(n_reps):
+            #print(x_vals.shape, layer_avg_fitness[:, rep].shape)
+            plt.plot(x_vals, layer_avg_fitness[:, rep], label=f'Layer {layer} Replicate {rep + 1}')
+    plt.xlabel('Generation')
+    plt.ylabel('Average Fitness')
+    plt.title('Average Fitness over Generations for Each Layer and Replicate')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+    
+    
+def plot_inferred_vs_true_sel(sim_data):
+    # The selections of every coefficients, and the inferred selections of every coefficient across layer and generation
+    detailed_selection_results = sim_data[2]
+    all_sel_coeffs = sim_data[1]
+    n_reps = detailed_selection_results[0][0].shape[0]
+    for layer in detailed_selection_results.keys():
+        layer_selection = layer
+        true_selection = all_sel_coeffs[layer_selection]
+        normalized_selection = z_normalize(true_selection)
+
+        for gen in range(len(detailed_selection_results[0])):
+            inferred_selection = detailed_selection_results[layer_selection][gen]
+            
+            fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+            plt.style.use('seaborn-v0_8-darkgrid')
+            for rep in range(n_reps):
+                x = true_selection
+                y = z_normalize(inferred_selection[rep])
+                
+                
+                axs[rep].scatter(x, y, alpha=0.5)
+                axs[rep].set_title(f'Layer {layer_selection} Generation {gen * 2 + 1} Replicate {rep + 1}')
+                axs[rep].set_xlabel('True Selection Coefficients')
+                axs[rep].set_ylabel('Inferred Selection Coefficients')
+                """axs[rep].plot([min(normalized_selection), max(normalized_selection)],
+                            [min(normalized_selection), max(normalized_selection)],
+                            color='red', linestyle='--')"""
+            
+                axs[rep].set_xlim(-0.05, 0.12)
+            
+            plt.tight_layout()
+            plt.show()
+
+def ordered_cov_plots(sim_data, layer=0):
+    layer_df = get_df_selection(random_seed=42, selected_layer=layer,
+                                    normalize_embeddings=False)[0]
+    layer_df = normalize_embeddings(layer_df)
+    embeddings = np.vstack(layer_df['Embedding'].tolist())
+
+    # Get the selection coefficients
+    true_selection = sim_data[1][layer]
+    layer_generation_counts = sim_data[3][layer]
+    inferred_selection = sim_data[2][layer][0]
+    best_dim_idx = np.argmax(np.abs(true_selection))
+
+    # Find the covariance between all embeddings with the best dimension
+    best_dim_values = embeddings[:, best_dim_idx]
+    
+    for gen in range(50):
+        print(f"Generation: {gen}")
+        # Find the covariance using a weighted approach and the population from the first selection event (gen=1)
+        weights = np.average(layer_generation_counts[gen], axis=0)
+        covariances = []
+        for dim in range(embeddings.shape[1]):
+            dim_values = embeddings[:, dim]
+            mean_best = np.average(best_dim_values, weights=weights)
+            mean_dim = np.average(dim_values, weights=weights)
+            covariance = np.average((best_dim_values - mean_best) * (dim_values - mean_dim), weights=weights)
+            covariances.append(covariance)
+        covariances = np.array(covariances)
+
+        # Plot the selection coefficients in order of rank, colored by covariance with best dimension
+        # Plot all three replicates
+        plt.figure(figsize=(15, 5))
+        plt.style.use('seaborn-v0_8-darkgrid')
+        for rep in range(3):
+            rep_inf_sel = inferred_selection[rep]
+            
+            normalized_selection = z_normalize(rep_inf_sel)
+            
+            # Use this:
+            sorted_indices = np.argsort(normalized_selection)[::-1]  # Sort descending
+            x_vals = np.arange(len(normalized_selection))  # Simple 0, 1, 2, ... for x-axis
+            y_vals = normalized_selection[sorted_indices]  # Values in descending order
+            covariances_sorted = covariances[sorted_indices]  # Sort covariances to match
+            
+            plt.subplot(1, 3, rep + 1)
+            scatter = plt.scatter(x_vals, y_vals, c=covariances_sorted, cmap='coolwarm', alpha=0.7)
+            plt.colorbar(scatter, label='Covariance with Best Dimension')
+            plt.title(f'Layer {layer} Replicate {rep + 1}')
+            plt.xlabel('Rank of Inferred Selection Coefficient')
+            plt.ylabel('Inferred Selection Coefficient (Normalized)')
+            plt.axhline(0, color='black', linestyle='--')
+            
+            
+            # For the best dimension highlight:
+            best_dim_position = np.where(sorted_indices == best_dim_idx)[0]
+            plt.scatter(best_dim_position, normalized_selection[best_dim_idx],
+                        color='yellow', edgecolor='black', s=100, label='Best Dimension')
+            
+
+        plt.tight_layout()
+        plt.show()
+    
+
+from scipy.stats import rankdata, spearmanr
+
+def comp_inf_vs_real_fits_rank(sim_data, layer, fitness='plus1'):
+    """Compare the inferred and real fitness scores using ranks."""
+    # For each layer, plot the fitness growth over time
+    all_layer_fits = sim_data[0][layer]
+    all_gen_counts = sim_data[3]
+    embeddings = sim_data[4][layer]
+    n_gens = len(all_gen_counts[0]) - 1
+    n_reps = len(all_gen_counts[0][0])
+
+    # Compute inferred fitness
+    inferred_fits = calc_inferred_fits(sim_data, fitness=fitness,
+                                       layer=layer)
+
+    # Real fits (same across replicates)
+    real_fits = np.array(all_layer_fits)
+
+    # Rank-transform helper (average ranks for ties, 1-indexed)
+    def rank_transform(x):
+        return rankdata(x, method='average')
+
+    # Rank the real fits once
+    real_ranks = rank_transform(real_fits)
+    n_variants = len(real_fits)
+
+    # Rank inferred fits per replicate
+    rep_ranks = {}
+    for rep in range(n_reps):
+        rep_ranks[rep] = rank_transform(inferred_fits[:, rep])
+
+    # Plot — create figure with constrained_layout instead of tight_layout
+    plt.close('all')
+    fig, axes = plt.subplots(1, n_reps,
+                             figsize=(6 * n_reps, 6))#,
+                             #squeeze=False,
+                             #constrained_layout=True)
+    axes = axes.flatten()
+
+    all_real_ranks = []
+    all_inf_ranks = []
+
+    for rep in range(n_reps):
+        ax = axes[rep]
+        r = real_ranks
+        inf = rep_ranks[rep]
+
+        ax.scatter(r, inf, alpha=0.5)
+        ax.set_xlabel('Real Fitness (Rank)')
+        ax.set_ylabel('Inferred Fitness (Rank)')
+        ax.set_title(f'Layer {layer} — Replicate {rep}')
+        ax.grid(True, alpha=0.3)
+
+        # Diagonal reference line
+        ax.plot([1, n_variants], [1, n_variants], color='red', linestyle='--')
+        ax.set_xlim(0, n_variants + 1)
+        ax.set_ylim(0, n_variants + 1)
+
+        # Spearman rho
+        rho, pval = spearmanr(real_fits, inferred_fits[:, rep])
+        ax.annotate(f'\rho = {rho:.3f}\np = {pval:.2e}',
+                     xy=(0.05, 0.95), xycoords='axes fraction',
+                     ha='left', va='top',
+                     fontsize=11, bbox=dict(boxstyle='round', fc='white', alpha=0.8))
+
+        all_real_ranks.extend(r)
+        all_inf_ranks.extend(inf)
+
+    fig.suptitle(f'Real vs Inferred Fitness (Rank) — Layer {layer}',
+                 fontsize=14)
+    #fig.savefig(f'rank_comparison_layer_{layer}.png', dpi=100, bbox_inches='tight')
+    plt.show()
+    #plt.close(fig)
+
+    # Overall Spearman correlation across all replicates
+    overall_rho, overall_pval = spearmanr(all_real_ranks, all_inf_ranks)
+    print(f'Overall Spearman ρ = {overall_rho:.4f}, p = {overall_pval:.2e}')
+    return rep_ranks, overall_rho
+
+## SELECTION FUNCTIONS ############
+def gaussian_selection(embeddings):
+    width = 0.02
+    center = 0.0
+    sel_coeffs = np.random.normal(loc=center, scale=width, size=embeddings.shape[1])
+    return sel_coeffs
+
+def zero_selection(embeddings):
+    return np.zeros(embeddings.shape[1])
+
+def generate_selection(embeddings):
+    embedding_ranges = embeddings.max(axis=0) - embeddings.min(axis=0)
+    # Find the indices of the top, lowest, and middle range dimensions
+    selection_coefficients = np.zeros(embeddings.shape[1])
+    sorted_indices = np.argsort(embedding_ranges)
+    high_range_idx = sorted_indices[-1]
+    # Give these dimensions higher selection coefficients
+    selection_coefficients[high_range_idx] = 0.10
+    return selection_coefficients
+
+
+## DEFINITIONS (DIRTY NOW, CLEAN UP LATER)
+def get_layer_df_piecewise(layer, in_paths, normalize=True):
+    """Get the combined layer_df from multiple input sources, together"""
+    dfs = []
+    for in_path in in_paths:
+        df = pickle.load(open(f"{in_path}/layer{layer}/inference_df.pkl", 'rb'))
+        dfs.append(df) 
+    layer_df = dfs[0].copy()
+    num_reps = len(layer_df["Replicate"].unique())
+    
+    """print(layer_df.columns)"""
+    
+    total_paths = len(in_paths)
+    for path_idx in range(1, total_paths):
+        df_to_add = dfs[path_idx].copy()
+        df_to_add["Replicate"] = df_to_add["Replicate"] + path_idx * num_reps
+        layer_df = pd.concat([layer_df, df_to_add], ignore_index=True)
+
+    if normalize:
+        embeddings = np.array([x for x in layer_df["Embedding"].to_list()])
+        dimensions = embeddings.shape[1]
+        for dim in range(dimensions):
+            embeddings[:, dim] = z_normalize(embeddings[:, dim])
+        layer_df["Embedding"] = [embeddings[i] for i in range(embeddings.shape[0])]
+
+    return layer_df
+
+def convert_long_to_wide(df):
+    """Convert layer_df from long format to wide format.
+    
+    Before: one row per (Embedding, Replicate, Generation) with a Frequency column.
+    After:  one row per unique Embedding with columns Rep{i}_PreNums / Rep{i}_PostNums.
+    
+    Generation 0 -> PreNums, Generation 1 -> PostNums.
+    Replicates are 0-indexed in the input and 1-indexed in the output.
+    """
+    gen_map = {0: 'PreNums', 1: 'PostNums'}
+    # Use tuple as a hashable embedding key
+    df = df.copy()
+    df['_emb_key'] = df['Embedding'].apply(tuple)
+    # Pivot Frequency into (Replicate, Generation) columns
+    wide = df.pivot_table(
+        index='_emb_key',
+        columns=['Replicate', 'Generation'],
+        values='Frequency',
+        aggfunc='sum'
+    ).fillna(0)
+    # Flatten and rename columns: (rep, gen) -> Rep{rep+1}_{PreNums|PostNums}
+    wide.columns = [
+        f'Rep{rep}_{gen_map[gen]}'
+        for rep, gen in wide.columns
+    ]
+    wide = wide.reset_index()
+    # Restore numpy arrays and drop the temp key
+    wide['Embedding'] = wide['_emb_key'].apply(np.array)
+    wide = wide.drop(columns='_emb_key')
+    # Reorder: all Pre/Post columns first, then Embedding
+    rep_cols = [c for c in wide.columns if c != 'Embedding']
+    wide = wide[rep_cols + ['Embedding']].reset_index(drop=True)
+    return wide
+
+def get_simulation_results_piecewise(n_layers, n_gens, n_reps,
+                                    in_paths, 
+                                    sel_func=generate_selection,
+                                    inference=True, fitness='plus1',
+                                    save_every=1):
+    all_layer_fits = {}
+    all_selection_coefficients = {}
+    detailed_selection_results = {}
+    all_generation_counts = {}
+    
+    for layer in range(n_layers):
+        print(f"Running layer {layer}...")
+        
+        df_layer = get_layer_df_piecewise(layer, in_paths, normalize=True)
+        df_selection = convert_long_to_wide(df_layer)
+        
+        n_reps = len(df_selection.columns) // 2  # Assuming each replicate has PreNums and PostNums
+        
+        initial_counts = []
+        for rep in range(n_reps):
+            pre_col = f'Rep{rep + 1}_PreNums'
+            if pre_col not in df_selection.columns:
+                raise ValueError(f"Expected column {pre_col} not found in df_selection: {df_selection.columns}")
+            initial_counts.append(df_selection[pre_col].values)
+        
+
+        # Generate selection coefficients using the provided function
+        embedding_matrix = np.vstack(df_selection['Embedding'].values)
+        selection_coefficients = sel_func(embedding_matrix)
+        all_selection_coefficients[layer] = selection_coefficients
+        
+        print("Running simulation...")
+        generation_counts, layer_fits = run_simulation(df_selection, selection_coefficients, 
+                                           initial_counts, n_gens=n_gens, save_every=save_every,
+                                           fitness=fitness)
+        all_generation_counts[layer] = generation_counts
+        all_layer_fits[layer] = layer_fits
+
+        if inference:
+            gen=n_gens
+            print(f"  Analyzing generation {gen}...")
+            layer_results = []
+            test_path = pwd + f"/simulations/layer_{layer}_gen_{gen}/"
+            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1], 
+                                            test_path, save_output=False)
+            found_sel_coeffs = data[2]
+            layer_results.append(found_sel_coeffs)
+            detailed_selection_results[layer] = layer_results
+
+    return all_layer_fits, all_selection_coefficients, detailed_selection_results, all_generation_counts, embedding_matrix
+
+
+sim_folder = pwd + "/esm_sim_saves/"
+
+def save_sim_data(sim_data, filename):
+    if not os.path.exists(sim_folder):
+        os.makedirs(sim_folder)
+    with open(sim_folder + filename, 'wb') as f:
+        pickle.dump(sim_data, f)
+        
+        
+def load_sim_data(filename):
+    with open(sim_folder + filename, 'rb') as f:
+        sim_data = pickle.load(f)
+    return sim_data

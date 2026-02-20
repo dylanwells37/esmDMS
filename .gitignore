@@ -13,6 +13,10 @@ figures_slides.py
 figures/slides-*.pdf
 figures/old
 output/merged_preference/backup
+old_files
+output
+esm_sim_saves
+.vscode
 
 data
 testing
