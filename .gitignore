@@ -17,6 +17,7 @@ old_files
 output
 esm_sim_saves
 .vscode
+job_outs
 
 data
 testing

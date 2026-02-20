@@ -1419,7 +1419,7 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
 
 
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
-                               max_reads=1e2, output_dir='.', name='esm_inference', plot_gamma=True,
+                               max_reads=1e2, output_dir=None, name='esm_inference', plot_gamma=True,
                                verbose=False):
     """function to just infer to modularize the code for esm"""
     dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)

@@ -1,34 +1,33 @@
+import ast
 import os
-#import shutil
+import time
+
 import pandas as pd
 import numpy as np
-import torch
-from transformers import AutoModel, AutoTokenizer
+import pickle
+from scipy.stats import pearsonr, rankdata, spearmanr
+import matplotlib.pyplot as plt
+
+from popDMS import mini_infer_independent_esm
+
+"""import torch
+from transformers import AutoModel, AutoTokenizer"""
 #from sklearn.decomposition import PCA
 #from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 #from sklearn.metrics import silhouette_score
-import pickle
-import time
-
-import matplotlib.pyplot as plt
-
-import popDMS
-from importlib import reload
-
-# reload popDMS
-reload(popDMS)
+#import shutil
+#from matplotlib import rc
 
 ## GLOBAL VARIABLES
-
-
 pwd = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
+default_emb_path = pwd + '/data/sequence_data/all_reps_BF520_protein_embeddings.pkl'
 
 # Pick an ESM-2 model size
-model_name = "facebook/esm2_t30_150M_UR50D"
+"""model_name = "facebook/esm2_t30_150M_UR50D"
 tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False)
-model = AutoModel.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)"""
 
-CODON2AA = {'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',            # Map from codons to amino acids
+"""CODON2AA = {'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',            # Map from codons to amino acids
             'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
             'AAC':'N', 'AAT':'N', 'AAA':'K', 'AAG':'K',
             'AGC':'S', 'AGT':'S', 'AGA':'R', 'AGG':'R',
@@ -43,9 +42,7 @@ CODON2AA = {'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',            # Map from co
             'TCA':'S', 'TCC':'S', 'TCG':'S', 'TCT':'S',
             'TTC':'F', 'TTT':'F', 'TTA':'L', 'TTG':'L',
             'TAC':'Y', 'TAT':'Y', 'TAA':'*', 'TAG':'*',
-            'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W' }
-
-default_emb_path = pwd + '/data/sequence_data/all_reps_BF520_protein_embeddings.pkl'
+            'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W' }"""
 
 
 ## FUNCTIONS
@@ -432,7 +429,7 @@ def run_inference_calcs(layer_df, output_path, verbose=False, pre_processed=Fals
         inference_df = layer_df
     else:
         inference_df = embedding_df_transfer_optimized(layer_df)  
-    data = popDMS.mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
+    data = mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
                                             output_dir=output_path, verbose=verbose)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
     
@@ -586,27 +583,6 @@ def analyze_layers_cross_variant(whole_df=None, in_paths=None, output_path=None,
     return layer_results
 
 
-
-def get_unique_df(filepath=default_emb_path):
-    """Get the protein dataframe from the embedding pickle file,
-    combining all entries with the same protein sequence"""
-    
-    whole_df = pd.read_pickle(filepath)
-
-    # Combine the prenums and postnums of any entries with the same potein sequence
-    whole_df['PreNums'] = whole_df['PreNums'].apply(lambda x: np.array(x))
-    whole_df['PostNums'] = whole_df['PostNums'].apply(lambda x: np.array(x))
-    whole_df = whole_df.groupby('ProteinSequence').agg({
-        'PreNums': lambda x: np.sum(x.tolist(), axis=0),
-        'PostNums': lambda x: np.sum(x.tolist(), axis=0),
-        'Embeddings': 'first'
-    }).reset_index()
-
-    whole_df = whole_df[whole_df["Embeddings"].notnull()].reset_index(drop=True)
-
-    return whole_df
-
-
 def z_normalize(array: np.ndarray) -> np.ndarray:
     """Z-normalize the input numpy array."""
     mean = np.mean(array)
@@ -617,9 +593,6 @@ def z_normalize(array: np.ndarray) -> np.ndarray:
 
 
 ## PLOTTING
-
-import scipy as sp 
-import scipy.stats as st
 
 def make_grfp_plots_inf(inference_data, normalize=True):
     """Make GRFP plots for the dataframe"""
@@ -678,7 +651,7 @@ def get_correlations(selection_data):
         s = selection_data[layer]
         layer_corrs = []
         for (rep_i, rep_j) in rep_combs:
-            corr = st.pearsonr(s[rep_i], s[rep_j])[0]
+            corr = pearsonr(s[rep_i], s[rep_j])[0]
             layer_corrs.append(corr)
         all_corrs.append(layer_corrs)
     
@@ -798,36 +771,35 @@ def simulate_generation_multinomial(current_counts, fitnesses):
 
 
 
-def get_df_selection(random_seed=42, selected_layer=12, normalize_embeddings=True, input_df=None):
+def get_df_selection(init_pop, random_seed=42, 
+                     selected_layer=12, normalize_embeddings=True, 
+                     processed_df=None):
     """Get the starting information for the simulation,
     i.e. the layer dataframe and the initial counts for each replicate.
     
     Args:
-        input_df: Optional pre-built dataframe containing Rep1/2/3_PreNums,
+        processed_df: Optional pre-built dataframe containing Rep1/2/3_PreNums,
                   Rep1/2/3_PostNums, and an 'Embedding' column for the selected
                   layer. If provided, data loading and layer decomposition are
                   skipped entirely.
     """
-    rc('text', usetex=True)
     pd.set_option('display.max_columns', 100)
     np.random.seed(random_seed)
 
-    if input_df is not None:
-        # Expect input_df to already have Rep{1,2,3}_Pre/PostNums and 'Embedding'
+    if processed_df is not None:
+        # Expect processed_df to already have Rep{1,2,3}_Pre/PostNums and 'Embedding'
         required_cols = [
             'Rep1_PreNums', 'Rep2_PreNums', 'Rep3_PreNums',
             'Rep1_PostNums', 'Rep2_PostNums', 'Rep3_PostNums',
             'Embedding'
         ]
-        missing = [c for c in required_cols if c not in input_df.columns]
+        missing = [c for c in required_cols if c not in processed_df.columns]
         if missing:
-            raise ValueError(f"input_df is missing required columns: {missing}")
-        df_selection = input_df.copy()
+            raise ValueError(f"processed_df is missing required columns: {missing}")
+        df_selection = processed_df.copy()
 
     else:
-        pwd = os.getcwd()
-        init_pop = get_unique_df(pwd + '/data/sequence_data/all_reps_BF520_protein_embeddings.pkl')
-        n_reps = 3
+        n_reps = init_pop['PreNums'].iloc[0].shape[0]
 
         replicate_dfs = []
         for rep in range(n_reps):
@@ -853,9 +825,11 @@ def get_df_selection(random_seed=42, selected_layer=12, normalize_embeddings=Tru
         df_selection['Embedding'] = decomposed_dfs[-1][f'Layer{selected_layer}']
 
     if normalize_embeddings:
-        embeddings   = np.vstack(df_selection['Embedding'].tolist())
-        z_embeddings = z_normalize(embeddings)
-        df_selection['Embedding'] = [z_embeddings[i] for i in range(z_embeddings.shape[0])]
+        embeddings = np.vstack(df_selection['Embedding'].values)
+        dims = embeddings.shape[1]
+        for dim in range(dims):
+            embeddings[:, dim] = z_normalize(embeddings[:, dim])
+        df_selection['Embedding'] = list(embeddings)
 
     start_counts1 = df_selection["Rep1_PreNums"].values
     start_counts2 = df_selection["Rep2_PreNums"].values
@@ -916,7 +890,7 @@ def simulation_df_transfer(df_selection, generation_counts):
                 })
     return pd.DataFrame(data_list)
 
-def run_inference_calcs_sims(df_selection, generation_counts, output_path,
+def run_inference_calcs_sims(df_selection, generation_counts, output_path=None,
                              save_output=False):
     """Run the inference calculations:
     WHOLE PIPELINE FROM READING IN EMBEDDINGS DATAFRAME
@@ -931,8 +905,9 @@ def run_inference_calcs_sims(df_selection, generation_counts, output_path,
         inference_df.to_pickle(output_path + 'inference_df.pkl')
         print(f"SAVED INFERENCE DF TO {output_path}")
     
-       
-    data = popDMS.mini_infer_independent_esm(inference_df, n_replicates=3)
+    n_replicates = len(inference_df["Replicate"].unique())
+    data = mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
+                                            output_dir=output_path, verbose=False)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
 
 def other_methods(df_selection, generation_counts, generation=-1):
@@ -1001,20 +976,27 @@ def generate_one_selection(embeddings):
     selection_coefficients[high_range_idx] = 0.10
     return selection_coefficients
 
-def get_simulation_results(n_layers, n_gens, n_reps, 
+def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
                            sel_func=generate_selection,
                            inference=True, fitness='plus1',
                            save_every=1):
+    """Run the whole pipeline of reading in the embedding dataframe, generating selection coefficients,
+    running the simulation, and running inference calculations on the simulated data."""
     all_layer_fits = {}
     all_selection_coefficients = {}
     detailed_selection_results = {}
     all_generation_counts = {}
     whole_embedding_matrix = {}
+    
+    whole_df = get_unique_df(embedding_df_path)
+    n_layers = whole_df["Embeddings"][0].shape[0]
+    
     for layer in range(n_layers):
         print(f"Running layer {layer}...")
-        df_selection, initial_counts = get_df_selection(random_seed=42, selected_layer=layer,
+        df_selection, initial_counts = get_df_selection(whole_df, random_seed=42, 
+                                                        selected_layer=layer,
                                                         normalize_embeddings=False)
-        print(df_selection.head())
+        #print(df_selection.head())
         df_selection = normalize_embeddings(df_selection)
 
         # Generate selection coefficients using the provided function
@@ -1034,11 +1016,10 @@ def get_simulation_results(n_layers, n_gens, n_reps,
             gen=n_gens
             print(f"  Analyzing generation {gen}...")
             layer_results = []
-            test_path = pwd + f"/simulations/layer_{layer}_gen_{gen}/"
-            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1], test_path)
+
+            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1])
             found_sel_coeffs = data[2]
             layer_results.append(found_sel_coeffs)
-
             detailed_selection_results[layer] = layer_results
 
     return all_layer_fits, all_selection_coefficients, detailed_selection_results, all_generation_counts, whole_embedding_matrix
@@ -1124,14 +1105,13 @@ def comp_inf_vs_real_fits(sim_data, layer, fitness='plus1'):
 
         all_real.extend(r)
         all_inferred.extend(inf)
+        plt.suptitle(f'Real vs Inferred Fitness — Layer {layer}', fontsize=14, y=1.02)
+        plt.tight_layout()
+        plt.show()
 
-    plt.suptitle(f'Real vs Inferred Fitness — Layer {layer}', fontsize=14, y=1.02)
-    plt.tight_layout()
-    plt.show()
-
-    # Also return the overall correlation across all replicates
-    overall_corr, overall_pval = pearsonr(all_real, all_inferred)
-    print(f'Overall Pearson r = {overall_corr:.4f}, p = {overall_pval:.2e}')
+        # Also return the overall correlation across all replicates
+        overall_corr, overall_pval = pearsonr(all_real, all_inferred)
+        print(f'Overall Pearson r = {overall_corr:.4f}, p = {overall_pval:.2e}')
 
     return rep_fits, overall_corr
 
@@ -1354,7 +1334,7 @@ def ordered_cov_plots(sim_data, layer=0):
         plt.show()
     
 
-from scipy.stats import rankdata, spearmanr
+
 
 def comp_inf_vs_real_fits_rank(sim_data, layer, fitness='plus1'):
     """Compare the inferred and real fitness scores using ranks."""
@@ -1435,7 +1415,7 @@ def comp_inf_vs_real_fits_rank(sim_data, layer, fitness='plus1'):
 
 ## SELECTION FUNCTIONS ############
 def gaussian_selection(embeddings):
-    width = 0.02
+    width = 0.001
     center = 0.0
     sel_coeffs = np.random.normal(loc=center, scale=width, size=embeddings.shape[1])
     return sel_coeffs
