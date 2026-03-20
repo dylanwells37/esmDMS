@@ -1427,92 +1427,129 @@ def safe_error_bars(mat):
     return np.sqrt(np.diag(np.linalg.inv(mat_pd)))
 
 
-def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
+def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
                                max_reads=1e2, output_dir=None, name='esm_inference', plot_gamma=True,
-                               verbose=False, calc_error_bars=False):
+                               verbose=False, calc_error_bars=False,
+                               variance_cutoff=0.0, infer_ignored_dims=True):
     """function to just infer to modularize the code for esm"""
     dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
     L = len(dx[0])
-    
-    # Compute optimal regularization value
-    gamma_opt = 1
-    
-    if gamma is not None:
-        gamma_opt = gamma
-        
-    elif n_replicates==1:
+
+    # Determine which dimensions to use based on variance_cutoff
+    if variance_cutoff > 0.0:
+        all_embeddings = np.vstack(embedding_df['Embedding'].values)
+        dim_variances = np.var(all_embeddings, axis=0)
+        sorted_dims = np.argsort(dim_variances)[::-1]
+        cumulative_variance = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
+        n_keep = int(np.searchsorted(cumulative_variance, variance_cutoff)) + 1
+        kept_dims = np.sort(sorted_dims[:n_keep])
+        ignored_dims = np.setdiff1d(np.arange(L), kept_dims)
         if verbose:
-            print('Only one replicate, setting gamma = 1')
-        gamma_opt = 1
-        
+            print(f"Variance cutoff {variance_cutoff:.2f}: keeping {len(kept_dims)}/{L} dims")
     else:
-        ## Get correlations for each value of gamma
-        gamma_values = np.logspace(np.log10(1/max_reads), 4, num=20)
-        ## Get correlations for each value of gamma
-        corrs = []
-        corrs_list = []
-        for g in gamma_values:
-            s = np.zeros_like(dx)
-            
-            for r_idx in range(n_replicates):
-                s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + g*np.eye(len(icov[r_idx]))), dx[r_idx])
-            corrs.append(np.mean([st.pearsonr(s[i].flatten(), s[j].flatten()).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
+        kept_dims = np.arange(L)
+        ignored_dims = np.array([], dtype=int)
 
-            temp_list = []
-            for i in range(n_replicates):
-                for j in range(i+1, n_replicates):
-                    if i!=j:
-                        temp_list.append(st.pearsonr(s[i], s[j]).statistic)
-            corrs_list.append(temp_list)
+    def _infer_dims(active_dims):
+        """Run inference (gamma selection + s computation) on a subset of dimensions."""
+        L_sub = len(active_dims)
+        dx_sub = np.array([dx[r][active_dims] for r in range(n_replicates)])
+        icov_sub = [icov[r][np.ix_(active_dims, active_dims)] for r in range(n_replicates)]
 
-        ## (Optional) plot the results
-        if plot_gamma and verbose:
-            print(f"corrs_list: {corrs_list}")
-            print(f"gamma_values: {gamma_values}")
-            print(f"corrs: {corrs}")
-            
-            plot_regularization_all(corrs_list, gamma_values)
-            
-        ## Select best regularization value
-        gamma_opt = get_best_regularization(corrs, gamma_values, corr_cutoff_pct)
-        #if verbose:
-        #    print('Found best regularization strength gamma = %.1e, R = %.2f' % (gamma_opt, corrs[list(gamma_values).index(gamma_opt)]))
-        
-    ## Compute selection coefficients at optimal gamma
-    s = np.zeros_like(dx)
+        # Compute optimal regularization value
+        gamma_sub = 1
+        if gamma is not None:
+            gamma_sub = gamma
+        elif n_replicates == 1:
+            if verbose:
+                print('Only one replicate, setting gamma = 1')
+            gamma_sub = 1
+        else:
+            gamma_vals = np.logspace(np.log10(1/max_reads), 4, num=20)
+            corrs = []
+            corrs_list = []
+            for g in gamma_vals:
+                s_temp = np.zeros((n_replicates, L_sub))
+                for r_idx in range(n_replicates):
+                    s_temp[r_idx] = np.inner(np.linalg.inv(icov_sub[r_idx] + g*np.eye(L_sub)), dx_sub[r_idx])
+                corrs.append(np.mean([st.pearsonr(s_temp[i].flatten(), s_temp[j].flatten()).statistic
+                                      for i in range(n_replicates) for j in range(i+1, n_replicates)]))
+                temp_list = []
+                for i in range(n_replicates):
+                    for j in range(i+1, n_replicates):
+                        if i != j:
+                            temp_list.append(st.pearsonr(s_temp[i], s_temp[j]).statistic)
+                corrs_list.append(temp_list)
 
-    error_bars = np.zeros_like(dx)
+            if plot_gamma and verbose:
+                print(f"corrs_list: {corrs_list}")
+                print(f"gamma_values: {gamma_vals}")
+                print(f"corrs: {corrs}")
+                plot_regularization_all(corrs_list, gamma_vals)
 
+            gamma_sub = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
 
-    for r_idx in range(n_replicates):
-        s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + gamma_opt*np.eye(len(icov[r_idx]))), dx[r_idx])
-        # compute the error bars for each selection coefficient as the square root of the diagonal of the covariance matrix
+        # Compute selection coefficients at optimal gamma
+        s_sub = np.zeros((n_replicates, L_sub))
+        err_sub = np.zeros((n_replicates, L_sub))
+        for r_idx in range(n_replicates):
+            reg = icov_sub[r_idx] + gamma_sub * np.eye(L_sub)
+            s_sub[r_idx] = np.inner(np.linalg.inv(reg), dx_sub[r_idx])
+            if calc_error_bars:
+                err_sub[r_idx] = np.sqrt(np.diag(np.linalg.inv(reg)))
+
+        icov_sub_sum = np.sum(icov_sub, axis=0)
+        dx_sub_sum = np.sum(dx_sub, axis=0)
+        reg_joint = icov_sub_sum + n_replicates * gamma_sub * np.eye(L_sub)
+        s_joint_sub = np.inner(np.linalg.inv(reg_joint), dx_sub_sum)
         if calc_error_bars:
-            error_bars[r_idx] = np.sqrt(np.diag(np.linalg.inv(icov[r_idx] + gamma_opt*np.eye(len(icov[r_idx])))))
+            s_joint_err_sub = np.sqrt(np.diag(np.linalg.inv(reg_joint)))
+        else:
+            s_joint_err_sub = None
 
-    s_joint = np.inner(np.linalg.inv(np.sum(icov, axis=0) + n_replicates*gamma_opt*np.eye(len(icov[0]))), np.sum(dx, axis=0))
-    if calc_error_bars:
-        s_joint_error_bars = np.sqrt(np.diag(np.linalg.inv(np.sum(icov, axis=0) + n_replicates * gamma_opt * np.eye(len(icov[0])))))
-    else:
-        s_joint_error_bars = None
-        
+        return s_sub, s_joint_sub, err_sub, s_joint_err_sub, gamma_sub
+
+    # Run inference on important dims
+    s_kept, s_joint_kept, err_kept, s_joint_err_kept, gamma_opt = _infer_dims(kept_dims)
+
+    # Build full output arrays; ignored dims are NaN by default
+    s = np.full((n_replicates, L), np.nan)
+    s_joint = np.full(L, np.nan)
+    error_bars = np.full((n_replicates, L), np.nan)
+    s_joint_error_bars = np.full(L, np.nan) if calc_error_bars else None
+
+    s[:, kept_dims] = s_kept
+    s_joint[kept_dims] = s_joint_kept
+    error_bars[:, kept_dims] = err_kept
+    if calc_error_bars and s_joint_err_kept is not None:
+        s_joint_error_bars[kept_dims] = s_joint_err_kept
+
+    # Optionally also infer the ignored dims
+    if len(ignored_dims) > 0 and infer_ignored_dims:
+        s_ign, s_joint_ign, err_ign, s_joint_err_ign, _ = _infer_dims(ignored_dims)
+        s[:, ignored_dims] = s_ign
+        s_joint[ignored_dims] = s_joint_ign
+        error_bars[:, ignored_dims] = err_ign
+        if calc_error_bars and s_joint_err_ign is not None:
+            s_joint_error_bars[ignored_dims] = s_joint_err_ign
+
     # Convert selection coefficients to a data frame and save to file
-    
     sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates+1)] + ['joint']
     sel_data = []
     for dim in range(L):
         sel_data.append([dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]])
-    
+
     if output_dir is not None:
         path = get_selection_file(output_dir, name, file_ext='.csv.gz')
         df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
         df_temp.to_csv(path, index=False, compression='gzip')
-    
+
     return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
 
 
-def infer_gamma_range(embedding_df, n_replicates=1, 
-                      gamma_values=None, max_reads=1e2):
+def infer_gamma_range(embedding_df, n_replicates=1,
+                      gamma_values=None, max_reads=1e2,
+                      variance_cutoff=0.0, infer_ignored_dims=True):
     """
     Infer selection coefficients across a range of gamma values.
 
@@ -1522,8 +1559,10 @@ def infer_gamma_range(embedding_df, n_replicates=1,
         The gamma values used.
     s_by_gamma : np.ndarray, shape (n_gamma, n_replicates, L)
         Per-replicate selection coefficients for each gamma.
+        Ignored dims (per variance_cutoff) are NaN unless infer_ignored_dims=True.
     s_joint_by_gamma : np.ndarray, shape (n_gamma, L)
         Joint selection coefficients for each gamma.
+        Ignored dims are NaN unless infer_ignored_dims=True.
     """
     dx, icov, _ = compute_dx_covariance_independent_esm(embedding_df)
 
@@ -1534,23 +1573,49 @@ def infer_gamma_range(embedding_df, n_replicates=1,
     L = len(dx[0])
     n_gamma = len(gamma_values)
 
-    s_by_gamma      = np.zeros((n_gamma, n_replicates, L))
-    s_joint_by_gamma = np.zeros((n_gamma, L))
+    # Determine which dimensions to use based on variance_cutoff
+    if variance_cutoff > 0.0:
+        all_embeddings = np.vstack(embedding_df['Embedding'].values)
+        dim_variances = np.var(all_embeddings, axis=0)
+        sorted_dims = np.argsort(dim_variances)[::-1]
+        cumulative_variance = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
+        n_keep = int(np.searchsorted(cumulative_variance, variance_cutoff)) + 1
+        kept_dims = np.sort(sorted_dims[:n_keep])
+        ignored_dims = np.setdiff1d(np.arange(L), kept_dims)
+    else:
+        kept_dims = np.arange(L)
+        ignored_dims = np.array([], dtype=int)
 
-    icov_sum = np.sum(icov, axis=0)   # precompute once
-    dx_sum   = np.sum(dx,  axis=0)
+    def _gamma_sweep(active_dims):
+        L_sub = len(active_dims)
+        dx_sub = np.array([dx[r][active_dims] for r in range(n_replicates)])
+        icov_sub = [icov[r][np.ix_(active_dims, active_dims)] for r in range(n_replicates)]
+        icov_sub_sum = np.sum(icov_sub, axis=0)
+        dx_sub_sum = np.sum(dx_sub, axis=0)
 
-    for g_idx, g in enumerate(gamma_values):
-        reg = g * np.eye(L)
+        s_sub = np.zeros((n_gamma, n_replicates, L_sub))
+        s_joint_sub = np.zeros((n_gamma, L_sub))
 
-        for r_idx in range(n_replicates):
-            s_by_gamma[g_idx, r_idx] = np.inner(
-                np.linalg.inv(icov[r_idx] + reg), dx[r_idx]
-            )
+        for g_idx, g in enumerate(gamma_values):
+            reg = g * np.eye(L_sub)
+            for r_idx in range(n_replicates):
+                s_sub[g_idx, r_idx] = np.inner(np.linalg.inv(icov_sub[r_idx] + reg), dx_sub[r_idx])
+            s_joint_sub[g_idx] = np.inner(np.linalg.inv(icov_sub_sum + reg), dx_sub_sum)
 
-        s_joint_by_gamma[g_idx] = np.inner(
-            np.linalg.inv(icov_sum + reg), dx_sum
-        )
+        return s_sub, s_joint_sub
+
+    # Initialize output arrays with NaN for ignored dims
+    s_by_gamma = np.full((n_gamma, n_replicates, L), np.nan)
+    s_joint_by_gamma = np.full((n_gamma, L), np.nan)
+
+    s_kept, s_joint_kept = _gamma_sweep(kept_dims)
+    s_by_gamma[:, :, kept_dims] = s_kept
+    s_joint_by_gamma[:, kept_dims] = s_joint_kept
+
+    if len(ignored_dims) > 0 and infer_ignored_dims:
+        s_ign, s_joint_ign = _gamma_sweep(ignored_dims)
+        s_by_gamma[:, :, ignored_dims] = s_ign
+        s_joint_by_gamma[:, ignored_dims] = s_joint_ign
 
     return gamma_values, s_by_gamma, s_joint_by_gamma
 

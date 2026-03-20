@@ -1005,13 +1005,14 @@ def simulation_df_transfer_vectorized(df_selection, generation_counts):
     })
 
 def run_inference_calcs_sims(df_selection, generation_counts, output_path=None,
-                             save_output=False, calc_error_bars=False, variance_cutoff=0.0):
+                             save_output=False, calc_error_bars=False, variance_cutoff=0.0,
+                             infer_ignored_dims=True):
     """Run the inference calculations:
     WHOLE PIPELINE FROM READING IN EMBEDDINGS DATAFRAME
     """
     print("Transferring simulation data to inference dataframe format...")
     inference_df = simulation_df_transfer(df_selection, generation_counts)
-    
+
     if save_output:
         # make directory
         if output_path is not None:
@@ -1024,21 +1025,25 @@ def run_inference_calcs_sims(df_selection, generation_counts, output_path=None,
     n_replicates = len(inference_df["Replicate"].unique())
     data = mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
                                             output_dir=output_path, verbose=False,
-                                            calc_error_bars=calc_error_bars)
+                                            calc_error_bars=calc_error_bars,
+                                            variance_cutoff=variance_cutoff,
+                                            infer_ignored_dims=infer_ignored_dims)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
 
 
 def run_gamma_analysis_sims(df_selection, generation_counts, output_path=None,
-                             save_output=False):
+                             save_output=False, variance_cutoff=0.0, infer_ignored_dims=True):
     """Run the inference calculations:
     WHOLE PIPELINE FROM READING IN EMBEDDINGS DATAFRAME
     """
     print("Transferring simulation data to inference dataframe format...")
     inference_df = simulation_df_transfer(df_selection, generation_counts)
-    
+
     print("Running inference calculations on simulated data...")
     n_replicates = len(inference_df["Replicate"].unique())
-    data = infer_gamma_range(inference_df, n_replicates=n_replicates)
+    data = infer_gamma_range(inference_df, n_replicates=n_replicates,
+                             variance_cutoff=variance_cutoff,
+                             infer_ignored_dims=infer_ignored_dims)
     return data # data = [gammas, s, s_joint]
 
 
@@ -1120,7 +1125,7 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
                            sel_func=generate_selection,
                            inference=True, gamma_analysis=True, fitness='plus1',
                            save_every=1, layers=[0], variance_cutoff=0.0,
-                           calc_error_bars=False):
+                           calc_error_bars=False, infer_ignored_dims=True):
     """Run the whole pipeline of reading in the embedding dataframe, generating selection coefficients,
     running the simulation, and running inference calculations on the simulated data."""
     all_layer_fits = {}
@@ -1176,8 +1181,9 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
             gen=n_gens
             print(f"  Analyzing generation {gen}...")
             layer_results = []
-            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1], 
-                                            calc_error_bars=calc_error_bars, variance_cutoff=variance_cutoff)
+            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1],
+                                            calc_error_bars=calc_error_bars, variance_cutoff=variance_cutoff,
+                                            infer_ignored_dims=infer_ignored_dims)
             found_sel_coeffs = data[2]
             found_sel_coeffs_joint = data[3]
 
@@ -1191,7 +1197,9 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
             detailed_selection_results[layer] = layer_results
             
         if gamma_analysis:
-            gamma_data = run_gamma_analysis_sims(df_selection, generation_counts)
+            gamma_data = run_gamma_analysis_sims(df_selection, generation_counts,
+                                                 variance_cutoff=variance_cutoff,
+                                                 infer_ignored_dims=infer_ignored_dims)
             all_gamma_analysis[layer] = gamma_data
             
         for name, obj in list(globals().items()):
