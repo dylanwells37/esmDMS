@@ -1418,9 +1418,18 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     return aa_freqs
 
 
+def safe_error_bars(mat):
+    """Compute error bars ensuring positive-definite inverse."""
+    eigvals, eigvecs = np.linalg.eigh(mat)
+    # Clamp eigenvalues to a small positive floor
+    eigvals_clamped = np.maximum(eigvals, 1e-10)
+    mat_pd = eigvecs @ np.diag(eigvals_clamped) @ eigvecs.T
+    return np.sqrt(np.diag(np.linalg.inv(mat_pd)))
+
+
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5, 
                                max_reads=1e2, output_dir=None, name='esm_inference', plot_gamma=True,
-                               verbose=False):
+                               verbose=False, calc_error_bars=False):
     """function to just infer to modularize the code for esm"""
     dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
     L = len(dx[0])
@@ -1471,13 +1480,22 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         
     ## Compute selection coefficients at optimal gamma
     s = np.zeros_like(dx)
+
+    error_bars = np.zeros_like(dx)
+
+
     for r_idx in range(n_replicates):
         s[r_idx] = np.inner(np.linalg.inv(icov[r_idx] + gamma_opt*np.eye(len(icov[r_idx]))), dx[r_idx])
-    
-    s_joint = np.inner(np.linalg.inv(np.sum(icov, axis=0) + gamma_opt*np.eye(len(icov[0]))), np.sum(dx, axis=0))
-    
-    # Optionally normalize selection coefficiients @TODO
-    
+        # compute the error bars for each selection coefficient as the square root of the diagonal of the covariance matrix
+        if calc_error_bars:
+            error_bars[r_idx] = np.sqrt(np.diag(np.linalg.inv(icov[r_idx] + gamma_opt*np.eye(len(icov[r_idx])))))
+
+    s_joint = np.inner(np.linalg.inv(np.sum(icov, axis=0) + n_replicates*gamma_opt*np.eye(len(icov[0]))), np.sum(dx, axis=0))
+    if calc_error_bars:
+        s_joint_error_bars = np.sqrt(np.diag(np.linalg.inv(np.sum(icov, axis=0) + n_replicates * gamma_opt * np.eye(len(icov[0])))))
+    else:
+        s_joint_error_bars = None
+        
     # Convert selection coefficients to a data frame and save to file
     
     sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates+1)] + ['joint']
@@ -1490,7 +1508,53 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
         df_temp.to_csv(path, index=False, compression='gzip')
     
-    return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
+    return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
+
+
+def infer_gamma_range(embedding_df, n_replicates=1, 
+                      gamma_values=None, max_reads=1e2):
+    """
+    Infer selection coefficients across a range of gamma values.
+
+    Returns
+    -------
+    gamma_values : np.ndarray
+        The gamma values used.
+    s_by_gamma : np.ndarray, shape (n_gamma, n_replicates, L)
+        Per-replicate selection coefficients for each gamma.
+    s_joint_by_gamma : np.ndarray, shape (n_gamma, L)
+        Joint selection coefficients for each gamma.
+    """
+    dx, icov, _ = compute_dx_covariance_independent_esm(embedding_df)
+
+    if gamma_values is None:
+        gamma_values = np.logspace(np.log10(1 / max_reads), 4, num=20)
+    gamma_values = np.asarray(gamma_values)
+
+    L = len(dx[0])
+    n_gamma = len(gamma_values)
+
+    s_by_gamma      = np.zeros((n_gamma, n_replicates, L))
+    s_joint_by_gamma = np.zeros((n_gamma, L))
+
+    icov_sum = np.sum(icov, axis=0)   # precompute once
+    dx_sum   = np.sum(dx,  axis=0)
+
+    for g_idx, g in enumerate(gamma_values):
+        reg = g * np.eye(L)
+
+        for r_idx in range(n_replicates):
+            s_by_gamma[g_idx, r_idx] = np.inner(
+                np.linalg.inv(icov[r_idx] + reg), dx[r_idx]
+            )
+
+        s_joint_by_gamma[g_idx] = np.inner(
+            np.linalg.inv(icov_sum + reg), dx_sum
+        )
+
+    return gamma_values, s_by_gamma, s_joint_by_gamma
+
+
 
 def compute_dx_covariance_independent_esm(embedding_df):
     """Compute the dx and icov from an embedding dataframe.
@@ -1510,14 +1574,12 @@ def compute_dx_covariance_independent_esm(embedding_df):
     # Shape dx vector (reps x [d]) and covariance matrix (reps x [d, d]), compute for each replicate
     dx  = [np.zeros(d) for i in range(reps)]
     icov = [np.zeros((d, d)) for i in range(reps)]
-    
     x_array = []
     
     for r_idx in range(reps):
         # Get times
         times = np.sort(np.unique(embedding_df[embedding_df['Replicate']==r_idx+1]['Generation']))
         times.sort()
-        
         dtsum = np.array([times[1]-times[0]] + [times[i+1]-times[i-1] for i in range(1, len(times)-1)] + [times[-1]-times[-2]])
         
         # Compute dense frequency vector to speed calculations
@@ -1527,11 +1589,9 @@ def compute_dx_covariance_independent_esm(embedding_df):
             df_t = embedding_df[(embedding_df['Replicate']==r_idx+1) & (embedding_df['Generation']==t)]
             for df_iter, row in df_t.iterrows():
                 x[i] += np.array(row['Embedding']) * row['Frequency']
-            
             x[i] = x[i] / np.sum(df_t['Frequency'])  # Normalize to ensure it's a frequency vector
         
         x_array.append(x)
-        
         # Compute dx (final - initial frequency)
         dx[r_idx] = x[-1] - x[0]
         # Compute integrated covariance

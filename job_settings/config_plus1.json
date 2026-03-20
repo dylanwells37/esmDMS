@@ -1,9 +1,9 @@
 {
     "n_gens": 50,
-    "embedding_df_path": "/net/dali/home/barton/dhw28/popDMS/esmDMS/data/sequence_data/all_reps_BF520_protein_embeddings.pkl",
     "sel_func": "gaussian",
-    "inference": true,
-    "fitness": "plus1",
+    "inference": 1,
+    "fitness": "exp",
     "save_every": 1,
-    "output_file": "one_plus_multi_sel_data.pkl"
+    "layers": [0],
+    "calc_error_bars": 1
 }
