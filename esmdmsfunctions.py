@@ -46,7 +46,6 @@ CODON2AA = {'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',            # Map from co
             'TAC':'Y', 'TAT':'Y', 'TAA':'*', 'TAG':'*',
             'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W' }
 
-
 ## FUNCTIONS
 
 def load_codoncounts(filepath):
@@ -1208,7 +1207,172 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
                 print(f"{name}: {size / 1024**2:.1f} MB")
 
     return all_layer_fits, all_selection_coefficients, detailed_selection_results, all_gamma_analysis, all_generation_counts#, whole_embedding_matrix
-    
+
+
+def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_path,
+                                       sel_func=generate_selection,
+                                       inference=True, gamma_analysis=True, fitness='plus1',
+                                       save_every=1, layers=[0],
+                                       variance_explained_cutoff=0.95,
+                                       weight_by_initial_freq=False,
+                                       calc_error_bars=False, infer_ignored_dims=True):
+    """Run the simulation pipeline with embeddings projected into the eigenvector
+    (PCA) basis of their covariance matrix.
+
+    Parameters
+    ----------
+    n_gens : int
+        Number of generations to simulate.
+    embedding_df_path : str
+        Path to the embedding data directory containing layer subdirectories.
+    sel_func : callable
+        Function that takes the number of dimensions and returns selection coefficients.
+    inference : bool
+        Whether to run popDMS inference on the simulated data.
+    gamma_analysis : bool
+        Whether to run gamma range analysis on the simulated data.
+    fitness : str
+        Fitness function to use ('plus1' or 'exp').
+    save_every : int
+        Save generation counts every this many generations.
+    layers : list of int
+        Which ESM-2 layers to process.
+    variance_explained_cutoff : float
+        Fraction of total variance that must be explained by the retained
+        eigenvectors (e.g., 0.95 keeps enough PCs to explain 95% of variance).
+        Set to 1.0 to keep all eigenvectors.
+    weight_by_initial_freq : bool
+        If True, weight the covariance matrix by the mean pre-selection counts
+        across replicates. If False, use an unweighted covariance matrix.
+    calc_error_bars : bool
+        Whether to calculate error bars on inferred selection coefficients.
+    infer_ignored_dims : bool
+        Passed through to mini_infer_independent_esm.
+
+    Returns
+    -------
+    all_layer_fits : dict
+        layer -> array of per-variant fitness values used in the simulation.
+    all_selection_coefficients : dict
+        layer -> true selection coefficients used (in eigenvector space).
+    detailed_selection_results : dict
+        layer -> [s, s_joint, s_errors, s_joint_errors] from inference.
+    all_gamma_analysis : dict
+        layer -> gamma analysis results.
+    all_generation_counts : dict
+        layer -> generation counts from the simulation.
+    eigenvector_info : dict
+        layer -> dict with keys 'eigenvalues', 'eigenvectors', 'n_components',
+        'variance_explained', and 'projection_matrix'.
+    """
+    all_layer_fits = {}
+    all_selection_coefficients = {}
+    detailed_selection_results = {}
+    all_generation_counts = {}
+    all_gamma_analysis = {}
+    eigenvector_info = {}
+
+    n_layers = 31
+
+    for layer in layers:
+        if layer >= n_layers:
+            print(f"Layer {layer} is out of bounds for the embeddings (only {n_layers} layers available). Skipping.")
+            continue
+        print(f"Running layer {layer}...")
+
+        df_selection = load_final_df(layer, embedding_df_path)
+        n_reps = len([c for c in df_selection.columns if 'PreNums' in c])
+        initial_counts = [df_selection[f'Rep{rep + 1}_PreNums'].values for rep in range(n_reps)]
+
+        # --- Build eigenvector basis ---
+        embeddings = np.vstack(df_selection['Embedding'].tolist())  # (N, D)
+
+        if weight_by_initial_freq:
+            all_pre = np.stack(
+                [df_selection[f'Rep{rep + 1}_PreNums'].values for rep in range(n_reps)],
+                axis=1
+            ).astype(float)  # (N, n_reps)
+            weights = all_pre.mean(axis=1)
+            weights = np.maximum(weights, 0.0)
+            if weights.sum() == 0:
+                weights = np.ones(len(embeddings))
+            cov_matrix = np.cov(embeddings.T, aweights=weights)
+        else:
+            cov_matrix = np.cov(embeddings.T)
+
+        # eigh returns eigenvalues in ascending order for a symmetric matrix
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+
+        # Sort descending so the most-variance-explaining PC comes first
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]  # columns are eigenvectors, shape (D, D)
+
+        # Clip negative eigenvalues (numerical noise) to zero before computing variance fractions
+        eigenvalues_pos = np.maximum(eigenvalues, 0.0)
+        total_variance = eigenvalues_pos.sum()
+        cumulative_variance = np.cumsum(eigenvalues_pos) / total_variance
+
+        # Number of components needed to reach the cutoff
+        n_components = int(np.searchsorted(cumulative_variance, variance_explained_cutoff) + 1)
+        n_components = min(n_components, len(eigenvalues))
+
+        variance_explained = cumulative_variance[n_components - 1]
+        print(f"  Layer {layer}: keeping {n_components}/{len(eigenvalues)} eigenvectors "
+              f"({variance_explained * 100:.1f}% variance explained)")
+
+        projection_matrix = eigenvectors[:, :n_components]  # (D, k)
+        projected_embeddings = embeddings @ projection_matrix  # (N, k)
+
+        eigenvector_info[layer] = {
+            'eigenvalues': eigenvalues,
+            'eigenvectors': eigenvectors,
+            'n_components': n_components,
+            'variance_explained': variance_explained,
+            'projection_matrix': projection_matrix,
+        }
+
+        # Replace embeddings with projected coordinates
+        df_pca = df_selection.copy()
+        df_pca['Embedding'] = [projected_embeddings[i] for i in range(len(projected_embeddings))]
+
+        selection_coefficients = sel_func(n_components)
+        all_selection_coefficients[layer] = selection_coefficients
+
+        print("  Running simulation...")
+        generation_counts, layer_fits = run_simulation(
+            df_pca, selection_coefficients, initial_counts,
+            n_gens=n_gens, save_every=save_every, fitness=fitness
+        )
+        all_generation_counts[layer] = generation_counts
+        all_layer_fits[layer] = layer_fits
+
+        if inference:
+            print(f"  Running inference for layer {layer}...")
+            data = run_inference_calcs_sims(
+                df_pca, generation_counts,
+                calc_error_bars=calc_error_bars,
+                variance_cutoff=0.0,
+                infer_ignored_dims=infer_ignored_dims
+            )
+            detailed_selection_results[layer] = [
+                data[2],  # s
+                data[3],  # s_joint
+                data[7],  # s errors
+                data[8],  # s_joint errors
+            ]
+
+        if gamma_analysis:
+            gamma_data = run_gamma_analysis_sims(
+                df_pca, generation_counts,
+                variance_cutoff=0.0,
+                infer_ignored_dims=infer_ignored_dims
+            )
+            all_gamma_analysis[layer] = gamma_data
+
+    return (all_layer_fits, all_selection_coefficients, detailed_selection_results,
+            all_gamma_analysis, all_generation_counts, eigenvector_info)
+
 
 def calc_inferred_fits(sim_data, fitness='plus1', layer=0):
     """ Calculate the inferred fitness score of every individual in the population across layer and generation using the inferred selection coefficients and the embeddings"""
@@ -1661,5 +1825,376 @@ def load_final_df(layer, path=None):
 
 def load_embedding_df(layer, path="/net/dali/home/barton/dhw28/popDMS/esmDMS/data/inference_results"):
     return pd.read_pickle(f"{path}/layer{layer}/inference_df.pkl")
-    
+
+
+## ─────────────────────────────────────────────────────────────────────────────
+## EIGENVECTOR / PCA ANALYSIS
+## ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_embeddings_and_weights(layer_df: pd.DataFrame):
+    """
+    Return unique embeddings plus per-variant pre/post frequency weights.
+
+    Each unique protein variant appears once per (Generation, Replicate) in
+    layer_df.  We use Generation==1, first replicate as the canonical index of
+    unique variants (every variant always has a post-selection row).
+
+    Returns
+    -------
+    embeddings   : ndarray (n_variants, emb_dim)
+    pre_weights  : ndarray (n_variants,)  – total pre-selection count across reps
+    post_weights : ndarray (n_variants,)  – total post-selection count across reps
+    """
+    rep1 = layer_df['Replicate'].min()
+    base = layer_df[(layer_df['Generation'] == 1) & (layer_df['Replicate'] == rep1)].reset_index(drop=True)
+    embeddings = np.array(base['Embedding'].tolist())
+
+    # Hash embeddings for fast groupby (collision probability negligible for 640-dim float64)
+    layer_df = layer_df.copy()
+    layer_df['_h'] = layer_df['Embedding'].apply(lambda x: hash(x.tobytes()))
+    base['_h'] = base['Embedding'].apply(lambda x: hash(x.tobytes()))
+
+    pre_sums  = layer_df[layer_df['Generation'] == 0].groupby('_h')['Frequency'].sum()
+    post_sums = layer_df[layer_df['Generation'] == 1].groupby('_h')['Frequency'].sum()
+
+    pre_weights  = np.array([pre_sums.get(h, 0)  for h in base['_h']])
+    post_weights = np.array([post_sums.get(h, 0) for h in base['_h']])
+
+    return embeddings, pre_weights, post_weights
+
+
+def pca_from_embeddings(embeddings: np.ndarray, weights: np.ndarray = None):
+    """
+    Compute PCA on an (n_variants, emb_dim) embedding matrix.
+
+    If weights are given, they are used to form a weighted covariance matrix
+    (each point contributes proportionally to its frequency).
+
+    Returns
+    -------
+    eigenvalues          : ndarray (emb_dim,)  descending
+    eigenvectors         : ndarray (emb_dim, emb_dim)  rows = PCs
+    explained_var_ratio  : ndarray (emb_dim,)
+    mean                 : ndarray (emb_dim,)
+    """
+    if weights is not None:
+        w = weights.astype(float)
+        w_sum = w.sum()
+        if w_sum == 0:
+            weights = None
+        else:
+            w = w / w_sum
+
+    if weights is not None:
+        mean = np.average(embeddings, axis=0, weights=w)
+        centered = embeddings - mean
+        # Weighted covariance: C = X^T W X  where W = diag(w)
+        cov = (centered * w[:, None]).T @ centered
+    else:
+        mean = embeddings.mean(axis=0)
+        centered = embeddings - mean
+        cov = np.cov(centered.T)
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    # eigh returns ascending order; reverse to descending
+    idx = np.argsort(eigenvalues)[::-1]
+    eigenvalues  = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx].T   # rows = principal components
+
+    # Clip tiny negatives from numerical noise
+    eigenvalues = np.clip(eigenvalues, 0, None)
+    total = eigenvalues.sum()
+    explained_var_ratio = eigenvalues / total if total > 0 else eigenvalues
+
+    return eigenvalues, eigenvectors, explained_var_ratio, mean
+
+
+def _n_components_for_thresholds(cumvar: np.ndarray, thresholds):
+    """Return the number of PCs needed to exceed each variance threshold."""
+    return {t: int(np.searchsorted(cumvar, t) + 1) for t in thresholds}
+
+
+def _participation_ratio(eigenvalues: np.ndarray) -> float:
+    """
+    Effective dimensionality  PR = (Σλ)² / Σλ²
+    Equals emb_dim if all eigenvalues equal; equals 1 if one dominates.
+    """
+    s1 = eigenvalues.sum()
+    s2 = (eigenvalues ** 2).sum()
+    return float(s1 ** 2 / s2) if s2 > 0 else 0.0
+
+
+def analyze_eigenvectors(
+    data_path: str,
+    layers=None,
+    variance_thresholds=(0.50, 0.80, 0.90, 0.95, 0.99),
+    weight_by: str = 'pre',   # 'pre', 'post', 'uniform'
+    store_eigenvectors: bool = False,
+    verbose: bool = True,
+):
+    """
+    Full eigenvector / PCA analysis of ESM-2 embedding layers.
+
+    Loads inference_df.pkl for each layer from ``data_path/layer{i}/``,
+    computes PCA, and returns a dict with per-layer and cross-layer statistics.
+
+    Parameters
+    ----------
+    data_path          : root directory containing layer0/, layer1/, …
+    layers             : list of layer indices to analyse (default: all found)
+    variance_thresholds: variance fractions at which to report # of PCs
+    weight_by          : 'pre'  – weight by pre-selection frequency
+                         'post' – weight by post-selection frequency
+                         'uniform' – equal weight per variant
+    store_eigenvectors : if True, store full eigenvector matrices (memory-heavy)
+    verbose            : print progress
+
+    Returns
+    -------
+    results : dict with keys
+        'layers'                – list of layer indices analysed
+        'n_variants'            – list[int]
+        'embedding_dim'         – int
+        'eigenvalues'           – list[ndarray]  one per layer, descending
+        'explained_var_ratio'   – list[ndarray]  per-PC fraction
+        'cumulative_var'        – list[ndarray]  cumulative fraction
+        'n_components'          – list[dict]  threshold -> n_components per layer
+        'participation_ratio'   – list[float]
+        'mean_embeddings'       – list[ndarray]  per-layer mean
+        'eigenvectors'          – list[ndarray] or None
+        'cross_layer' : dict
+            'top1_cosine'       – ndarray (n_layers-1,)  |cos sim| of PC-1 between consecutive layers
+            'topk_subspace_overlap' – ndarray (n_layers-1,) k-dim subspace overlap
+    """
+    if layers is None:
+        found = sorted(
+            int(d[5:]) for d in os.listdir(data_path)
+            if d.startswith('layer') and os.path.isdir(os.path.join(data_path, d))
+        )
+        layers = found
+
+    variance_thresholds = list(variance_thresholds)
+
+    results = {
+        'layers': layers,
+        'embedding_dim': None,
+        'n_variants': [],
+        'eigenvalues': [],
+        'explained_var_ratio': [],
+        'cumulative_var': [],
+        'n_components': [],
+        'participation_ratio': [],
+        'mean_embeddings': [],
+        'eigenvectors': [] if store_eigenvectors else None,
+    }
+
+    for layer in layers:
+        if verbose:
+            print(f"  Layer {layer} ...", end=' ', flush=True)
+        df_path = os.path.join(data_path, f'layer{layer}', 'inference_df.pkl')
+        layer_df = pickle.load(open(df_path, 'rb'))
+
+        embeddings, pre_w, post_w = _extract_embeddings_and_weights(layer_df)
+
+        if results['embedding_dim'] is None:
+            results['embedding_dim'] = embeddings.shape[1]
+
+        if weight_by == 'pre':
+            weights = pre_w
+        elif weight_by == 'post':
+            weights = post_w
+        else:
+            weights = None
+
+        eigenvalues, eigenvectors, evr, mean = pca_from_embeddings(embeddings, weights)
+        cumvar = np.cumsum(evr)
+
+        results['n_variants'].append(len(embeddings))
+        results['eigenvalues'].append(eigenvalues)
+        results['explained_var_ratio'].append(evr)
+        results['cumulative_var'].append(cumvar)
+        results['n_components'].append(_n_components_for_thresholds(cumvar, variance_thresholds))
+        results['participation_ratio'].append(_participation_ratio(eigenvalues))
+        results['mean_embeddings'].append(mean)
+        if store_eigenvectors:
+            results['eigenvectors'].append(eigenvectors)
+
+        if verbose:
+            pr = results['participation_ratio'][-1]
+            nc90 = results['n_components'][-1].get(0.90, '?')
+            print(f"n={len(embeddings):,}  PR={pr:.1f}  #PC@90%={nc90}")
+
+    # ── Cross-layer statistics ────────────────────────────────────────────────
+    if store_eigenvectors and len(layers) > 1:
+        top1_cosine = []
+        topk_overlap = []
+        k = 10  # subspace size for overlap
+        for i in range(len(layers) - 1):
+            v1 = results['eigenvectors'][i][0]
+            v2 = results['eigenvectors'][i + 1][0]
+            top1_cosine.append(abs(float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))))
+
+            # k-dim subspace overlap: normalised sum of squared cosines between subspaces
+            U = results['eigenvectors'][i][:k]      # (k, d)
+            V = results['eigenvectors'][i + 1][:k]  # (k, d)
+            G = U @ V.T  # (k, k) Gram matrix
+            overlap = float(np.linalg.norm(G, 'fro') ** 2) / k
+            topk_overlap.append(overlap)
+
+        results['cross_layer'] = {
+            'top1_cosine':          np.array(top1_cosine),
+            'topk_subspace_overlap': np.array(topk_overlap),
+            'k_subspace':           k,
+        }
+    else:
+        results['cross_layer'] = None
+
+    return results
+
+
+def plot_eigenvector_analysis(results: dict,
+                              variance_thresholds=(0.50, 0.80, 0.90, 0.95, 0.99),
+                              figsize_base=(5, 4),
+                              cmap_name='viridis',
+                              save_path: str = None):
+    """
+    Comprehensive visualisation of the PCA/eigenvector analysis.
+
+    Panels
+    ------
+    1. Eigenvalue spectra (log scale) per layer – one line per layer, coloured by depth
+    2. Cumulative explained variance per layer
+    3. Number of PCs needed per threshold vs layer
+    4. Participation ratio (effective dimensionality) vs layer
+    5. Top-1 PC cosine similarity between consecutive layers  (if cross_layer available)
+    6. k-dim subspace overlap between consecutive layers       (if cross_layer available)
+    """
+    layers = results['layers']
+    n_layers = len(layers)
+    cmap = plt.get_cmap(cmap_name, n_layers)
+
+    has_cross = results['cross_layer'] is not None
+    n_panels = 4 + (2 if has_cross else 0)
+    ncols = 3
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(figsize_base[0] * ncols,
+                                                     figsize_base[1] * nrows))
+    axes = axes.flatten()
+
+    variance_thresholds = list(variance_thresholds)
+    emb_dim = results['embedding_dim']
+
+    # ── Panel 1: eigenvalue spectra ──────────────────────────────────────────
+    ax = axes[0]
+    top_k = min(100, emb_dim)
+    for idx, layer in enumerate(layers):
+        ev = results['eigenvalues'][idx][:top_k]
+        ax.plot(np.arange(1, top_k + 1), ev, color=cmap(idx), alpha=0.8, lw=1.2)
+    ax.set_yscale('log')
+    ax.set_xlabel('Principal component')
+    ax.set_ylabel('Eigenvalue (log scale)')
+    ax.set_title('Eigenvalue spectra (top 100 PCs)')
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(layers[0], layers[-1]))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label='Layer')
+
+    # ── Panel 2: cumulative variance ─────────────────────────────────────────
+    ax = axes[1]
+    top_k_var = min(200, emb_dim)
+    for idx, layer in enumerate(layers):
+        cv = results['cumulative_var'][idx][:top_k_var]
+        ax.plot(np.arange(1, len(cv) + 1), cv, color=cmap(idx), alpha=0.8, lw=1.2)
+    for t in variance_thresholds:
+        ax.axhline(t, color='grey', lw=0.8, ls='--', alpha=0.6)
+    ax.set_xlabel('Number of PCs')
+    ax.set_ylabel('Cumulative variance explained')
+    ax.set_title('Cumulative variance (first 200 PCs)')
+    ax.set_ylim(0, 1.02)
+    plt.colorbar(sm, ax=ax, label='Layer')
+
+    # ── Panel 3: #PCs for each threshold vs layer ────────────────────────────
+    ax = axes[2]
+    thresholds_to_plot = variance_thresholds
+    marker_styles = ['o', 's', '^', 'D', 'v', 'P', 'X']
+    for ti, t in enumerate(thresholds_to_plot):
+        n_pcs = [results['n_components'][i][t] for i in range(n_layers)]
+        ax.plot(layers, n_pcs, marker=marker_styles[ti % len(marker_styles)],
+                label=f'{int(t*100)}%', lw=1.5)
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('# PCs')
+    ax.set_title('PCs needed per variance threshold')
+    ax.legend(fontsize=8)
+
+    # ── Panel 4: participation ratio ─────────────────────────────────────────
+    ax = axes[3]
+    ax.plot(layers, results['participation_ratio'], 'o-', color='steelblue', lw=2)
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Participation ratio')
+    ax.set_title(f'Effective dimensionality  (max = {emb_dim})')
+    ax.axhline(emb_dim, color='grey', lw=0.8, ls='--', alpha=0.6)
+
+    if has_cross:
+        cl = results['cross_layer']
+
+        # ── Panel 5: top-1 cosine similarity ─────────────────────────────────
+        ax = axes[4]
+        pairs = [(layers[i], layers[i + 1]) for i in range(len(layers) - 1)]
+        pair_labels = [f'{a}→{b}' for a, b in pairs]
+        ax.bar(range(len(pair_labels)), cl['top1_cosine'], color='coral')
+        ax.set_xticks(range(len(pair_labels)))
+        ax.set_xticklabels(pair_labels, rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel('|cosine similarity|')
+        ax.set_title('PC-1 alignment between consecutive layers')
+        ax.set_ylim(0, 1.05)
+
+        # ── Panel 6: k-dim subspace overlap ──────────────────────────────────
+        ax = axes[5]
+        k = cl['k_subspace']
+        ax.bar(range(len(pair_labels)), cl['topk_subspace_overlap'], color='mediumseagreen')
+        ax.set_xticks(range(len(pair_labels)))
+        ax.set_xticklabels(pair_labels, rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel('Normalised subspace overlap')
+        ax.set_title(f'Top-{k} PC subspace overlap (1 = identical)')
+        ax.set_ylim(0, 1.05)
+
+    # hide unused axes
+    for ax in axes[n_panels:]:
+        ax.set_visible(False)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    return fig
+
+
+def print_eigenvector_summary(results: dict,
+                               variance_thresholds=(0.50, 0.80, 0.90, 0.95, 0.99)):
+    """
+    Print a concise summary table of the PCA analysis.
+    """
+    variance_thresholds = list(variance_thresholds)
+    header = ['Layer', 'N_variants', 'Eff.dim (PR)'] + [f'#PC@{int(t*100)}%' for t in variance_thresholds]
+    rows = []
+    for i, layer in enumerate(results['layers']):
+        row = [
+            layer,
+            results['n_variants'][i],
+            f"{results['participation_ratio'][i]:.1f}",
+        ] + [results['n_components'][i][t] for t in variance_thresholds]
+        rows.append(row)
+
+    col_widths = [max(len(str(r[c])) for r in rows + [header]) for c in range(len(header))]
+    fmt = '  '.join(f'{{:<{w}}}' for w in col_widths)
+    print(fmt.format(*header))
+    print('  '.join('-' * w for w in col_widths))
+    for row in rows:
+        print(fmt.format(*[str(v) for v in row]))
+    print()
+    print(f"Embedding dim : {results['embedding_dim']}")
+    print(f"Layers        : {results['layers'][0]} – {results['layers'][-1]}")
+    pr_vals = results['participation_ratio']
+    print(f"Eff.dim range : {min(pr_vals):.1f} – {max(pr_vals):.1f}  "
+          f"(peak at layer {results['layers'][int(np.argmax(pr_vals))]})")
+
 
