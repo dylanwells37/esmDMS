@@ -21,9 +21,9 @@ from matplotlib.font_manager import FontProperties
 import matplotlib.patches as mpatches
 import matplotlib.ticker as ticker
 
-from colorsys import hls_to_rgb
+#from colorsys import hls_to_rgb
 
-import mplot as mp
+#import mplot as mp
 
 
 # GLOBAL VARIABLES
@@ -194,7 +194,7 @@ def fig_dms(pop_file, fig_file):
     fig.savefig(fig_file, **FIGPROPS)
 
 
-def plot_selection(ax, df_pop, s_norm=1, legend=False):
+'''def plot_selection(ax, df_pop, s_norm=1, legend=False):
     """ Plot selection heatmap. """
 
     # process stored data
@@ -303,7 +303,7 @@ def plot_selection(ax, df_pop, s_norm=1, legend=False):
         ax.text(xloc + 1.5, yloc + 0.5, 'WT amino acid', clip_on=False, **txtprops)
         ax.text(xloc + 1.5, yloc + 0.5 + 4*legend_dy, 'Not observed', clip_on=False, **txtprops) # paper
     #    ax.text(xloc + 1.3, yloc + 0.5 + 6*legend_dy, 'Not observed', clip_on=False, **txtprops) # slides
-
+'''
 
 # FUNCTIONS
 
