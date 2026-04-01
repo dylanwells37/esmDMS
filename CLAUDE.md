@@ -2,7 +2,7 @@
 
 ## Jupyter Notebooks — Math Formatting
 
-Always write mathematical expressions in LaTeX when working on Jupyter notebooks (`.ipynb` files):
+When writing in Jupyter notebook markdown cells (`.ipynb` files), always write mathematical expressions in LaTeX:
 
 - **Inline math**: wrap in single dollar signs `$...$`
   - Example: `the selection coefficient $s_d$` or `frequency $f_\alpha(t) \in [0, 1]$`
@@ -11,7 +11,10 @@ Always write mathematical expressions in LaTeX when working on Jupyter notebooks
 
 Never use plain-text code blocks (` ``` `) to write equations in markdown cells. Reserve code blocks for actual Python/code syntax only.
 
+**Do not use LaTeX in regular chat responses.** — write math in plain text (e.g., "s_k = dx_k / ivar_k", "d-by-d matrix") instead.
+
 **Common symbols used in this project:**
+
 - Greek letters: `\alpha`, `\beta`, `\gamma`, `\phi`, `\Sigma`, `\sigma`, `\Delta`
 - Bold vectors/matrices: `\mathbf{x}`, `\boldsymbol{\phi}`
 - Fractions: `\frac{numerator}{denominator}`

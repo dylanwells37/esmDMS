@@ -10,7 +10,8 @@ import pickle
 from scipy.stats import pearsonr, rankdata, spearmanr
 import matplotlib.pyplot as plt
 
-from popDMS import mini_infer_independent_esm, infer_gamma_range
+from popDMS import (mini_infer_independent_esm, infer_gamma_range,
+                    mini_infer_diagonal_esm, mini_infer_fullcov_esm)
 
 #import torch
 #from transformers import AutoModel, AutoTokenizer
@@ -1005,29 +1006,45 @@ def simulation_df_transfer_vectorized(df_selection, generation_counts):
 
 def run_inference_calcs_sims(df_selection, generation_counts, output_path=None,
                              save_output=False, calc_error_bars=False, variance_cutoff=0.0,
-                             infer_ignored_dims=True):
+                             infer_ignored_dims=True, method='independent'):
     """Run the inference calculations:
     WHOLE PIPELINE FROM READING IN EMBEDDINGS DATAFRAME
+
+    Parameters
+    ----------
+    method : str
+        Which inference method to use:
+        'independent' - original allele-frequency covariance approximation
+        'diagonal'    - per-dimension population variance (Approach 1, no matrix inversion)
+        'fullcov'     - full per-sequence covariance matrix (Approach 2, guaranteed PSD)
     """
     print("Transferring simulation data to inference dataframe format...")
     inference_df = simulation_df_transfer(df_selection, generation_counts)
 
     if save_output:
-        # make directory
         if output_path is not None:
             if not os.path.exists(output_path):
                 os.makedirs(output_path)
-            # save inference_df
             inference_df.to_pickle(output_path + 'inference_df.pkl')
             print(f"SAVED INFERENCE DF TO {output_path}")
-    print("Running inference calculations on simulated data...")
+
+    print(f"Running inference calculations on simulated data (method='{method}')...")
     n_replicates = len(inference_df["Replicate"].unique())
-    data = mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
-                                            output_dir=output_path, verbose=False,
-                                            calc_error_bars=calc_error_bars,
-                                            variance_cutoff=variance_cutoff,
-                                            infer_ignored_dims=infer_ignored_dims)
-    return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
+
+    _infer_fns = {
+        'independent': mini_infer_independent_esm,
+        'diagonal':    mini_infer_diagonal_esm,
+        'fullcov':     mini_infer_fullcov_esm,
+    }
+    if method not in _infer_fns:
+        raise ValueError(f"Unknown inference method '{method}'. Choose from {list(_infer_fns)}")
+
+    data = _infer_fns[method](inference_df, n_replicates=n_replicates,
+                              output_dir=output_path, verbose=False,
+                              calc_error_bars=calc_error_bars,
+                              variance_cutoff=variance_cutoff,
+                              infer_ignored_dims=infer_ignored_dims)
+    return data  # [dx, icov/ivar, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
 
 
 def run_gamma_analysis_sims(df_selection, generation_counts, output_path=None,
@@ -1124,9 +1141,16 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
                            sel_func=generate_selection,
                            inference=True, gamma_analysis=True, fitness='plus1',
                            save_every=1, layers=[0], variance_cutoff=0.0,
-                           calc_error_bars=False, infer_ignored_dims=True):
+                           calc_error_bars=False, infer_ignored_dims=True,
+                           method='independent'):
     """Run the whole pipeline of reading in the embedding dataframe, generating selection coefficients,
-    running the simulation, and running inference calculations on the simulated data."""
+    running the simulation, and running inference calculations on the simulated data.
+
+    Parameters
+    ----------
+    method : str
+        Which inference method to use: 'independent', 'diagonal', or 'fullcov'.
+    """
     all_layer_fits = {}
     all_selection_coefficients = {}
     detailed_selection_results = {}
@@ -1182,7 +1206,7 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
             layer_results = []
             data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1],
                                             calc_error_bars=calc_error_bars, variance_cutoff=variance_cutoff,
-                                            infer_ignored_dims=infer_ignored_dims)
+                                            infer_ignored_dims=infer_ignored_dims, method=method)
             found_sel_coeffs = data[2]
             found_sel_coeffs_joint = data[3]
 
@@ -1215,7 +1239,8 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
                                        save_every=1, layers=[0],
                                        variance_explained_cutoff=0.95,
                                        weight_by_initial_freq=False,
-                                       calc_error_bars=False, infer_ignored_dims=True):
+                                       calc_error_bars=False, infer_ignored_dims=True,
+                                       method='independent'):
     """Run the simulation pipeline with embeddings projected into the eigenvector
     (PCA) basis of their covariance matrix.
 
@@ -1247,7 +1272,9 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
     calc_error_bars : bool
         Whether to calculate error bars on inferred selection coefficients.
     infer_ignored_dims : bool
-        Passed through to mini_infer_independent_esm.
+        Passed through to the inference function.
+    method : str
+        Which inference method to use: 'independent', 'diagonal', or 'fullcov'.
 
     Returns
     -------
@@ -1316,6 +1343,7 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
         # Number of components needed to reach the cutoff
         n_components = int(np.searchsorted(cumulative_variance, variance_explained_cutoff) + 1)
         n_components = min(n_components, len(eigenvalues))
+        n_components = max(n_components, 2)  # Ensure at least two components are kept
 
         variance_explained = cumulative_variance[n_components - 1]
         print(f"  Layer {layer}: keeping {n_components}/{len(eigenvalues)} eigenvectors "
@@ -1348,12 +1376,13 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
         all_layer_fits[layer] = layer_fits
 
         if inference:
-            print(f"  Running inference for layer {layer}...")
+            print(f"  Running inference for layer {layer} (method='{method}')...")
             data = run_inference_calcs_sims(
                 df_pca, generation_counts,
                 calc_error_bars=calc_error_bars,
                 variance_cutoff=0.0,
-                infer_ignored_dims=infer_ignored_dims
+                infer_ignored_dims=infer_ignored_dims,
+                method=method,
             )
             detailed_selection_results[layer] = [
                 data[2],  # s
@@ -1401,7 +1430,7 @@ def comp_inf_vs_real_fits(sim_data, layer, fitness='plus1'):
     """all_gen_counts = sim_data[3]
     embeddings = sim_data[4][layer]
     n_gens = len(all_gen_counts[0]) - 1"""
-    n_reps = len(sim_data[3][0][0])
+    n_reps = len(sim_data[2][0][0])
 
     # Print the shape of all these data
     #print(fitness)
