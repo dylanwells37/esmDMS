@@ -3,6 +3,7 @@ import os
 import time
 import sys
 import gc
+from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 import numpy as np
@@ -493,10 +494,28 @@ def get_df_selection(init_pop, random_seed=42,
     return df_selection, (start_counts1, start_counts2, start_counts3)
 
 
-def run_simulation(df_selection, selection_coefficients, initial_counts, 
-                   n_gens=30, embedding_clip=None, save_every=1, fitness='exp'):
+def run_simulation(df_selection, selection_coefficients, initial_counts,
+                   n_gens=30, embedding_clip=None, save_every=1, fitness='exp',
+                   plateau_window=3, plateau_rtol=1e-3):
+    """Run a Wright-Fisher multinomial simulation for up to n_gens generations.
+
+    Early stopping: after each generation the mean fitness is averaged across all
+    replicates.  Once the relative change in that mean is below plateau_rtol for
+    plateau_window consecutive saved time-points, the simulation halts early and
+    only the generations up to that point are returned.
+
+    Parameters
+    ----------
+    plateau_window : int
+        Number of consecutive saved generations whose mean-fitness change must
+        all fall below plateau_rtol before stopping.  Set to 0 to disable early
+        stopping entirely.
+    plateau_rtol : float
+        Relative-change threshold: |Δw̄| / w̄ < plateau_rtol triggers a plateau
+        count increment.
+    """
     embeddings = np.vstack(df_selection['Embedding'].values)
-    
+
     if fitness == 'exp':
         fitnesses = calc_all_fitness_exp(embeddings, selection_coefficients,
                                         embedding_clip=embedding_clip)
@@ -505,27 +524,43 @@ def run_simulation(df_selection, selection_coefficients, initial_counts,
                                         embedding_clip=embedding_clip)
     else:
         raise ValueError("Invalid fitness function specified.")
-    
-    #print("intial counts shape and type:", np.array(initial_counts).shape, type(initial_counts))
+
     generation_counts = [initial_counts]
     n_reps = len(initial_counts)
     last_counts = initial_counts
-    
-    #print(last_counts)
-    
+
+    # Track mean fitness of the most recently saved snapshot for plateau detection
+    prev_mean_fitness = None
+    plateau_streak = 0
+
     for gen in range(n_gens):
-        
         this_gen = []
+        gen_mean_fitness = 0.0
         for rep in range(n_reps):
             rep_counts = last_counts[rep]
             next_counts = simulate_generation_multinomial(rep_counts, fitnesses)
             this_gen.append(next_counts)
-        if (gen + 1) % save_every == 0:
-            #print(f"Completed generation {gen + 1}")
-            generation_counts.append(this_gen)
+            total = np.sum(next_counts)
+            if total > 0:
+                gen_mean_fitness += np.dot(next_counts, fitnesses) / total
+        gen_mean_fitness /= n_reps
+
         last_counts = this_gen
-    #print(f"generation_counts length: {len(generation_counts)}")
-    #print(f"generation_counts shape: {np.array(generation_counts).shape}")
+
+        if (gen + 1) % save_every == 0:
+            generation_counts.append(this_gen)
+
+            # Plateau detection
+            if plateau_window > 0 and prev_mean_fitness is not None:
+                rel_change = abs(gen_mean_fitness - prev_mean_fitness) / max(abs(prev_mean_fitness), 1e-12)
+                if rel_change < plateau_rtol:
+                    plateau_streak += 1
+                    if plateau_streak >= plateau_window:
+                        break
+                else:
+                    plateau_streak = 0
+            prev_mean_fitness = gen_mean_fitness
+
     return generation_counts, fitnesses
 
 
@@ -671,12 +706,65 @@ def generate_selection(embeddings_len):
 
 #########################################
 
+def _process_single_layer(args):
+    """Worker for get_simulation_results — processes one ESM layer end-to-end.
+
+    Must be a module-level function so it is picklable for ProcessPoolExecutor.
+    """
+    (layer, embedding_df_path, sel_func, n_gens, save_every, fitness,
+     inference, gamma_analysis, calc_error_bars, variance_cutoff,
+     infer_ignored_dims, method, plateau_window, plateau_rtol) = args
+
+    print(f"Running layer {layer}...")
+    df_selection = load_final_df(layer, embedding_df_path)
+    n_reps = len(df_selection.columns) // 2
+    initial_counts = []
+    for rep in range(n_reps):
+        pre_col = f'Rep{rep + 1}_PreNums'
+        if pre_col not in df_selection.columns:
+            raise ValueError(f"Expected column {pre_col} not found in df_selection: {df_selection.columns}")
+        initial_counts.append(df_selection[pre_col].values)
+
+    embeddings_len = df_selection['Embedding'].iloc[0].shape[0]
+    selection_coefficients = sel_func(embeddings_len)
+
+    print(f"  Layer {layer}: running simulation...")
+    generation_counts, layer_fits = run_simulation(
+        df_selection, selection_coefficients, initial_counts,
+        n_gens=n_gens, save_every=save_every, fitness=fitness,
+        plateau_window=plateau_window, plateau_rtol=plateau_rtol,
+    )
+    print(f"  Layer {layer}: simulation ran for {len(generation_counts) - 1} saved generations.")
+
+    layer_results = None
+    if inference:
+        print(f"  Layer {layer}: running inference...")
+        data = run_inference_calcs_sims(
+            df_selection, generation_counts,
+            calc_error_bars=calc_error_bars, variance_cutoff=variance_cutoff,
+            infer_ignored_dims=infer_ignored_dims, method=method,
+        )
+        # [dx, icov/ivar, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
+        #icov_sum = np.sum(data[1], axis=0)
+        layer_results = [data[2], data[3], data[7], data[8], data[1], data[5]]
+
+    gamma_data = None
+    if gamma_analysis:
+        gamma_data = run_gamma_analysis_sims(
+            df_selection, generation_counts,
+            variance_cutoff=variance_cutoff, infer_ignored_dims=infer_ignored_dims,
+        )
+
+    return layer, layer_fits, selection_coefficients, layer_results, gamma_data, generation_counts
+
+
 def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
                            sel_func=generate_selection,
                            inference=True, gamma_analysis=True, fitness='plus1',
                            save_every=1, layers=[0], variance_cutoff=0.0,
                            calc_error_bars=False, infer_ignored_dims=True,
-                           method='independent'):
+                           method='independent', n_jobs=1,
+                           plateau_window=0, plateau_rtol=1e-3):
     """Run the whole pipeline of reading in the embedding dataframe, generating selection coefficients,
     running the simulation, and running inference calculations on the simulated data.
 
@@ -684,94 +772,54 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
     ----------
     method : str
         Which inference method to use: 'independent', 'diagonal', or 'fullcov'.
+    n_jobs : int
+        Number of parallel worker processes for layer processing.
+        1 = sequential (default).  -1 = all available CPUs.
+        sel_func must be a module-level (picklable) function when n_jobs != 1.
+    plateau_window : int
+        Passed to run_simulation.  Number of consecutive saved generations with
+        relative mean-fitness change below plateau_rtol before early stopping.
+        Set to 0 to disable.
+    plateau_rtol : float
+        Relative-change threshold for plateau detection.
     """
+    n_layers = 31
+
+    valid_layers = [l for l in layers if l < n_layers]
+    for l in layers:
+        if l >= n_layers:
+            print(f"Layer {l} is out of bounds (only {n_layers} layers available). Skipping.")
+
+    args_list = [
+        (layer, embedding_df_path, sel_func, n_gens, save_every, fitness,
+         inference, gamma_analysis, calc_error_bars, variance_cutoff,
+         infer_ignored_dims, method, plateau_window, plateau_rtol)
+        for layer in valid_layers
+    ]
+
+    if n_jobs == 1:
+        results = [_process_single_layer(a) for a in args_list]
+    else:
+        max_workers = None if n_jobs == -1 else n_jobs
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_process_single_layer, args_list))
+
     all_layer_fits = {}
     all_selection_coefficients = {}
     detailed_selection_results = {}
-    all_generation_counts = {}
     all_gamma_analysis = {}
-    all_sel_coeffs_errors = {}
-    all_sel_coeffs_joint = {}
-    all_sel_coeffs_joint_errors = {}
-    #whole_embedding_matrix = {}
-    
-    """whole_df = get_unique_df(embedding_df_path)
-    n_layers = whole_df["Embeddings"][0].shape[0]"""
-    n_layers = 31 # hardcoding this for now, but can be changed to the above line if needed
+    all_generation_counts = {}
 
-    for layer in layers:
-        if layer >= n_layers:
-            print(f"Layer {layer} is out of bounds for the embeddings (only {n_layers} layers available). Skipping.")
-            continue
-        print(f"Running layer {layer}...")
-        #df_selection, initial_counts = get_df_selection(whole_df, random_seed=42, 
-        #                                                selected_layer=layer,
-        #                                                normalize_embeddings=False)
-        #print(df_selection.head())
-        
-        df_selection = load_final_df(layer, embedding_df_path)
-        n_reps = len(df_selection.columns) // 2  # Assuming each replicate has PreNums and PostNums
-        initial_counts = []
-        
-        for rep in range(n_reps):
-            pre_col = f'Rep{rep + 1}_PreNums'
-            if pre_col not in df_selection.columns:
-                raise ValueError(f"Expected column {pre_col} not found in df_selection: {df_selection.columns}")
-            initial_counts.append(df_selection[pre_col].values)
-
-        # Generate selection coefficients using the provided function
-        #embedding_matrix = np.vstack(df_selection['Embedding'].tolist())
-        #whole_embedding_matrix[layer] = embedding_matrix
-        
-        embeddings_len = df_selection['Embedding'].iloc[0].shape[0]
-        selection_coefficients = sel_func(embeddings_len)
-        all_selection_coefficients[layer] = selection_coefficients
-        
-        print("Running simulation...")
-        generation_counts, layer_fits = run_simulation(df_selection, selection_coefficients, 
-                                           initial_counts, n_gens=n_gens, save_every=save_every,
-                                           fitness=fitness)
-        all_generation_counts[layer] = generation_counts
+    for layer, layer_fits, sel_coeffs, layer_results, gamma_data, gen_counts in results:
         all_layer_fits[layer] = layer_fits
-
-        if inference:
-            gen=n_gens
-            print(f"  Analyzing generation {gen}...")
-            layer_results = []
-            data = run_inference_calcs_sims(df_selection, generation_counts[:gen + 1],
-                                            calc_error_bars=calc_error_bars, variance_cutoff=variance_cutoff,
-                                            infer_ignored_dims=infer_ignored_dims, method=method)
-            found_sel_coeffs = data[2]
-            found_sel_coeffs_joint = data[3]
-
-            found_sel_coeffs_errors = data[7]
-
-            found_sel_coeffs_joint_errors = data[8]
-
-            icov_list = data[1]
-            gamma_opt = data[5]
-            icov_sum = np.sum(icov_list, axis=0)  # shape (d, d), summed over replicates
-
-            layer_results.append(found_sel_coeffs)
-            layer_results.append(found_sel_coeffs_joint)
-            layer_results.append(found_sel_coeffs_errors)
-            layer_results.append(found_sel_coeffs_joint_errors)
-            layer_results.append(icov_sum)   # index 4
-            layer_results.append(gamma_opt)  # index 5
+        all_selection_coefficients[layer] = sel_coeffs
+        all_generation_counts[layer] = gen_counts
+        if layer_results is not None:
             detailed_selection_results[layer] = layer_results
-            
-        if gamma_analysis:
-            gamma_data = run_gamma_analysis_sims(df_selection, generation_counts,
-                                                 variance_cutoff=variance_cutoff,
-                                                 infer_ignored_dims=infer_ignored_dims)
+        if gamma_data is not None:
             all_gamma_analysis[layer] = gamma_data
-            
-        for name, obj in list(globals().items()):
-            size = sys.getsizeof(obj)
-            if size > 100_000:  # only show objects > 1 MB
-                print(f"{name}: {size / 1024**2:.1f} MB")
 
-    return all_layer_fits, all_selection_coefficients, detailed_selection_results, all_gamma_analysis, all_generation_counts#, whole_embedding_matrix
+    return all_layer_fits, all_selection_coefficients, detailed_selection_results, all_gamma_analysis, all_generation_counts
 
 
 def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_path,
@@ -781,7 +829,8 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
                                        variance_explained_cutoff=0.95,
                                        weight_by_initial_freq=False,
                                        calc_error_bars=False, infer_ignored_dims=True,
-                                       method='independent'):
+                                       method='independent',
+                                       plateau_window=3, plateau_rtol=1e-3):
     """Run the simulation pipeline with embeddings projected into the eigenvector
     (PCA) basis of their covariance matrix.
 
@@ -816,6 +865,12 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
         Passed through to the inference function.
     method : str
         Which inference method to use: 'independent', 'diagonal', or 'fullcov'.
+    plateau_window : int
+        Passed to run_simulation.  Number of consecutive saved generations with
+        relative mean-fitness change below plateau_rtol before early stopping.
+        Set to 0 to disable.
+    plateau_rtol : float
+        Relative-change threshold for plateau detection.
 
     Returns
     -------
@@ -824,7 +879,7 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
     all_selection_coefficients : dict
         layer -> true selection coefficients used (in eigenvector space).
     detailed_selection_results : dict
-        layer -> [s, s_joint, s_errors, s_joint_errors] from inference.
+        layer -> [s, s_joint, s_errors, s_joint_errors, icov_sum, gamma_opt] from inference.
     all_gamma_analysis : dict
         layer -> gamma analysis results.
     all_generation_counts : dict
@@ -911,8 +966,10 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
         print("  Running simulation...")
         generation_counts, layer_fits = run_simulation(
             df_pca, selection_coefficients, initial_counts,
-            n_gens=n_gens, save_every=save_every, fitness=fitness
+            n_gens=n_gens, save_every=save_every, fitness=fitness,
+            plateau_window=plateau_window, plateau_rtol=plateau_rtol,
         )
+        print(f"  Layer {layer}: simulation ran for {len(generation_counts) - 1} saved generations.")
         all_generation_counts[layer] = generation_counts
         all_layer_fits[layer] = layer_fits
 
@@ -925,11 +982,14 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
                 infer_ignored_dims=infer_ignored_dims,
                 method=method,
             )
+            icov_sum = np.sum(data[1], axis=0)  # (k, k) summed over replicates
             detailed_selection_results[layer] = [
-                data[2],  # s
-                data[3],  # s_joint
-                data[7],  # s errors
-                data[8],  # s_joint errors
+                data[2],   # s
+                data[3],   # s_joint
+                data[7],   # s errors
+                data[8],   # s_joint errors
+                icov_sum,  # index 4: covariance matrix at optimal gamma
+                data[5],   # index 5: gamma_opt
             ]
 
         if gamma_analysis:

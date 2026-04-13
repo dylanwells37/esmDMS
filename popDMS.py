@@ -149,6 +149,15 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         dx_sub = np.array([dx[r][active_dims] for r in range(n_replicates)])
         icov_sub = [icov[r][np.ix_(active_dims, active_dims)] for r in range(n_replicates)]
 
+        # Precompute eigendecompositions once per replicate: icov = V diag(lam) V.T
+        # Then (icov + gI)^{-1} b = V @ ((V.T b) / (lam + g)) — no per-gamma inversions.
+        eig_lam = [None] * n_replicates
+        eig_vec = [None] * n_replicates
+        vt_dx   = [None] * n_replicates
+        for r in range(n_replicates):
+            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov_sub[r])
+            vt_dx[r] = eig_vec[r].T @ dx_sub[r]
+
         # Compute optimal regularization value
         gamma_sub = 1
         if gamma is not None:
@@ -164,7 +173,7 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
             for g in gamma_vals:
                 s_temp = np.zeros((n_replicates, L_sub))
                 for r_idx in range(n_replicates):
-                    s_temp[r_idx] = np.inner(np.linalg.inv(icov_sub[r_idx] + g*np.eye(L_sub)), dx_sub[r_idx])
+                    s_temp[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
                 corrs.append(np.mean([st.pearsonr(s_temp[i].flatten(), s_temp[j].flatten()).statistic
                                       for i in range(n_replicates) for j in range(i+1, n_replicates)]))
                 temp_list = []
@@ -182,21 +191,23 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
 
             gamma_sub = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
 
-        # Compute selection coefficients at optimal gamma
+        # Compute selection coefficients at optimal gamma using eigendecomposition
         s_sub = np.zeros((n_replicates, L_sub))
         err_sub = np.zeros((n_replicates, L_sub))
         for r_idx in range(n_replicates):
-            reg = icov_sub[r_idx] + gamma_sub * np.eye(L_sub)
-            s_sub[r_idx] = np.inner(np.linalg.inv(reg), dx_sub[r_idx])
+            inv_denom = 1.0 / (eig_lam[r_idx] + gamma_sub)
+            s_sub[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
             if calc_error_bars:
-                err_sub[r_idx] = np.sqrt(np.diag(np.linalg.inv(reg)))
+                # diag((A+gI)^{-1}) = sum_k V[:,k]^2 / (lam_k + g)
+                err_sub[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
 
         icov_sub_sum = np.sum(icov_sub, axis=0)
         dx_sub_sum = np.sum(dx_sub, axis=0)
-        reg_joint = icov_sub_sum + n_replicates * gamma_sub * np.eye(L_sub)
-        s_joint_sub = np.inner(np.linalg.inv(reg_joint), dx_sub_sum)
+        lam_j, V_j = np.linalg.eigh(icov_sub_sum)
+        inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_sub)
+        s_joint_sub = V_j @ ((V_j.T @ dx_sub_sum) * inv_denom_j)
         if calc_error_bars:
-            s_joint_err_sub = np.sqrt(np.diag(np.linalg.inv(reg_joint)))
+            s_joint_err_sub = np.sqrt(V_j ** 2 @ inv_denom_j)
         else:
             s_joint_err_sub = None
 
@@ -286,14 +297,23 @@ def infer_gamma_range(embedding_df, n_replicates=1,
         icov_sub_sum = np.sum(icov_sub, axis=0)
         dx_sub_sum = np.sum(dx_sub, axis=0)
 
+        # Precompute eigendecompositions once; sweep over gamma with O(d^2) per step
+        eig_lam = [None] * n_replicates
+        eig_vec = [None] * n_replicates
+        vt_dx   = [None] * n_replicates
+        for r in range(n_replicates):
+            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov_sub[r])
+            vt_dx[r] = eig_vec[r].T @ dx_sub[r]
+        lam_j, V_j = np.linalg.eigh(icov_sub_sum)
+        vt_dx_j = V_j.T @ dx_sub_sum
+
         s_sub = np.zeros((n_gamma, n_replicates, L_sub))
         s_joint_sub = np.zeros((n_gamma, L_sub))
 
         for g_idx, g in enumerate(gamma_values):
-            reg = g * np.eye(L_sub)
             for r_idx in range(n_replicates):
-                s_sub[g_idx, r_idx] = np.inner(np.linalg.inv(icov_sub[r_idx] + reg), dx_sub[r_idx])
-            s_joint_sub[g_idx] = np.inner(np.linalg.inv(icov_sub_sum + reg), dx_sub_sum)
+                s_sub[g_idx, r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
+            s_joint_sub[g_idx] = V_j @ (vt_dx_j / (lam_j + g))
 
         return s_sub, s_joint_sub
 
@@ -335,20 +355,17 @@ def compute_dx_covariance_independent_esm(embedding_df):
     x_array = []
     
     for r_idx in range(reps):
-        # Get times
-        times = np.sort(np.unique(embedding_df[embedding_df['Replicate']==r_idx+1]['Generation']))
-        times.sort()
+        df_rep = embedding_df[embedding_df['Replicate'] == r_idx + 1]
+        times = np.sort(np.unique(df_rep['Generation']))
         dtsum = np.array([times[1]-times[0]] + [times[i+1]-times[i-1] for i in range(1, len(times)-1)] + [times[-1]-times[-2]])
-        
-        # Compute dense frequency vector to speed calculations
-        x = np.array([np.zeros(d) for i in range(len(times))])
-        for i in range(len(times)):
-            t = times[i]
-            df_t = embedding_df[(embedding_df['Replicate']==r_idx+1) & (embedding_df['Generation']==t)]
-            for df_iter, row in df_t.iterrows():
-                x[i] += np.array(row['Embedding']) * row['Frequency']
-            x[i] = x[i] / np.sum(df_t['Frequency'])  # Normalize to ensure it's a frequency vector
-        
+
+        x = np.zeros((len(times), d))
+        for i, t in enumerate(times):
+            df_t = df_rep[df_rep['Generation'] == t]
+            z_mat = np.vstack(df_t['Embedding'].values)
+            w = df_t['Frequency'].values / df_t['Frequency'].values.sum()
+            x[i] = w @ z_mat
+
         x_array.append(x)
         # Compute dx (final - initial frequency)
         dx[r_idx] = x[-1] - x[0]
@@ -378,7 +395,7 @@ def compute_dx_covariance_independent_esm(embedding_df):
 # Approach 2: full per-sequence covariance matrix
 # ==============================================================================
 
-def compute_dx_covariance_fullcov_esm(embedding_df):
+def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
     """Compute the mean change (dx) and time-integrated full covariance matrix
     (icov) from an embedding dataframe.
 
@@ -404,9 +421,9 @@ def compute_dx_covariance_fullcov_esm(embedding_df):
     reps = len(np.unique(embedding_df['Replicate']))
     d    = len(embedding_df.iloc[0]['Embedding'])
 
-    dx      = [np.zeros(d)       for _ in range(reps)]
-    icov    = [np.zeros((d, d))  for _ in range(reps)]
-    x_array = []
+    dx      = [np.zeros(d)       for _ in range(reps)] # MEAN change in embedding
+    icov    = [np.zeros((d, d))  for _ in range(reps)] # INTEGRATED covariance matrix
+    x_array = [] 
 
     for r_idx in range(reps):
         df_rep  = embedding_df[embedding_df['Replicate'] == r_idx + 1]
@@ -428,16 +445,43 @@ def compute_dx_covariance_fullcov_esm(embedding_df):
             total_freq = df_t['Frequency'].sum()
             z_mat      = np.vstack(df_t['Embedding'].values)   # (n_seqs, d)
             w          = df_t['Frequency'].values / total_freq  # (n_seqs,)
-            x[i]       = w @ z_mat                              # weighted mean
-            M[i]       = (z_mat.T * w) @ z_mat                 # weighted second-moment matrix
+            x[i]       = w @ z_mat                              # weighted mean embedding (dot product of (1, n_seqs) and (n_seqs, d) -> (d,))
+            M[i]       = (z_mat.T * w) @ z_mat                 # weighted second-moment matrix (dot product of (d, n_seqs) and (n_seqs, d) -> (d, d))
 
         x_array.append(x)
         dx[r_idx] = x[-1] - x[0]
 
-        # Integrate population covariance C(t) = M(t) - mean(t) mean(t)^T
+        # Compute C(t) for all time points and accumulate icov
+        C_all = np.zeros((n_times, d, d))
         for i in range(n_times):
-            C_t          = M[i] - np.outer(x[i], x[i])
-            icov[r_idx] += trap_weights[i] * C_t
+            C_all[i]     = M[i] - np.outer(x[i], x[i])
+            icov[r_idx] += trap_weights[i] * C_all[i]
+
+        if plot_icov:
+            # trace(C(t)): instantaneous total variance across all embedding dims
+            trace_C = np.array([np.trace(C_all[i]) for i in range(n_times)])
+
+            # Frobenius norm of cumulative integral up to each time point
+            cumulative_icov = np.zeros((n_times, d, d))
+            for i in range(n_times):
+                cumulative_icov[i] = cumulative_icov[i - 1] + trap_weights[i] * C_all[i] if i > 0 else trap_weights[i] * C_all[i]
+            frob_cumicov = np.array([np.linalg.norm(cumulative_icov[i], 'fro') for i in range(n_times)])
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            fig.suptitle(f'Replicate {r_idx + 1}')
+
+            axes[0].plot(times, trace_C, marker='o', ms=4)
+            axes[0].set_xlabel('Generation')
+            axes[0].set_ylabel('tr(C(t))')
+            axes[0].set_title('Instantaneous total variance')
+
+            axes[1].plot(times, frob_cumicov, marker='o', ms=4)
+            axes[1].set_xlabel('Generation')
+            axes[1].set_ylabel(r'$\|\int_0^t C\, dt\|_F$')
+            axes[1].set_title('Cumulative ||icov(t)||  (should plateau)')
+
+            plt.tight_layout()
+            plt.show()
 
     return dx, icov, x_array
 
@@ -481,6 +525,15 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
         dx_sub   = np.array([dx[r][active_dims]                   for r in range(n_replicates)])
         icov_sub = [icov[r][np.ix_(active_dims, active_dims)]     for r in range(n_replicates)]
 
+        # Precompute eigendecompositions once per replicate: icov = V diag(lam) V.T
+        # Then (icov + gI)^{-1} b = V @ ((V.T b) / (lam + g)) — no per-gamma inversions.
+        eig_lam = [None] * n_replicates
+        eig_vec = [None] * n_replicates
+        vt_dx   = [None] * n_replicates
+        for r in range(n_replicates):
+            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov_sub[r])
+            vt_dx[r] = eig_vec[r].T @ dx_sub[r]
+
         if gamma is not None:
             gamma_sub = gamma
         elif n_replicates == 1:
@@ -493,7 +546,7 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
             for g in gamma_vals:
                 s_temp = np.zeros((n_replicates, L_sub))
                 for r_idx in range(n_replicates):
-                    s_temp[r_idx] = np.linalg.solve(icov_sub[r_idx] + g * np.eye(L_sub), dx_sub[r_idx])
+                    s_temp[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
                 corrs.append(np.mean([
                     st.pearsonr(s_temp[i], s_temp[j]).statistic
                     for i in range(n_replicates)
@@ -507,18 +560,18 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
         s_sub   = np.zeros((n_replicates, L_sub))
         err_sub = np.zeros((n_replicates, L_sub))
         for r_idx in range(n_replicates):
-            reg     = icov_sub[r_idx] + gamma_sub * np.eye(L_sub)
-            inv_reg = np.linalg.inv(reg)
-            s_sub[r_idx] = inv_reg @ dx_sub[r_idx]
+            inv_denom = 1.0 / (eig_lam[r_idx] + gamma_sub)
+            s_sub[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
             if calc_error_bars:
-                err_sub[r_idx] = np.sqrt(np.diag(inv_reg))
+                #err_sub[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
+                err_sub[r_idx] = np.sqrt(eig_vec[r_idx] **2 @ inv_denom**2)
 
-        icov_sum        = np.sum(icov_sub, axis=0)
-        dx_sum          = np.sum(dx_sub,   axis=0)
-        reg_joint       = icov_sum + n_replicates * gamma_sub * np.eye(L_sub)
-        inv_joint       = np.linalg.inv(reg_joint)
-        s_joint_sub     = inv_joint @ dx_sum
-        s_joint_err_sub = np.sqrt(np.diag(inv_joint)) if calc_error_bars else None
+        icov_sum    = np.sum(icov_sub, axis=0)
+        dx_sum      = np.sum(dx_sub,   axis=0)
+        lam_j, V_j  = np.linalg.eigh(icov_sum)
+        inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_sub)
+        s_joint_sub = V_j @ ((V_j.T @ dx_sum) * inv_denom_j)
+        s_joint_err_sub = np.sqrt(V_j ** 2 @ inv_denom_j**2) if calc_error_bars else None
 
         return s_sub, s_joint_sub, err_sub, s_joint_err_sub, gamma_sub
 
@@ -547,3 +600,4 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
     sel_data = [[dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]] for dim in range(L)]
 
     return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
+
