@@ -26,11 +26,13 @@ OUTPUT_FILE=${2:-"embeddings.pkl"}
 N_CHUNKS=${3:-10}
 EXTRA_ARGS="${@:4}"
 
-source ~/popDMS/esmDMS/.venv/bin/activate
-cd ~/popDMS/esmDMS
 
 SCRDIR=/scr/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}
 mkdir -p $SCRDIR
+export TMPDIR=$SCRDIR
+
+source ~/popDMS/esmDMS/.venv/bin/activate
+cd ~/popDMS/esmDMS
 
 python embedding_scripts/embed_sequences.py \
     "$CONFIG" \

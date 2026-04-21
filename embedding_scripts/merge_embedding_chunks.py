@@ -7,8 +7,8 @@ Usage:
 Example:
     python embedding_scripts/merge_embedding_chunks.py BF520_embeddings.pkl 10
 
-Reads  data/sequence_data/BF520_embeddings_chunk{0..9}.pkl
-Writes data/sequence_data/BF520_embeddings.pkl  (merged, sorted by ProteinSequence)
+Reads  data/sequence_data/BF520_embeddings.pkl.chunk_{0..9}
+Writes data/sequence_data/BF520_embeddings.pkl  (merged in original order)
 """
 
 import os
@@ -22,8 +22,7 @@ HOME_SEQ_FOLDER = os.path.join(PROJECT_DIR, "data", "sequence_data")
 
 
 def chunk_output_name(output_file, chunk_idx):
-    stem, ext = os.path.splitext(output_file)
-    return f"{stem}_chunk{chunk_idx}{ext}"
+    return f"{output_file}.chunk_{chunk_idx}"
 
 
 def main():
@@ -48,9 +47,6 @@ def main():
     print(f"Loading {args.n_chunks} chunks...")
     chunks = [pd.read_pickle(p) for p in chunk_paths]
     merged = pd.concat(chunks, ignore_index=True)
-
-    # Re-sort to match the original sequence order (chunks used strided indexing)
-    merged = merged.sort_values("ProteinSequence").reset_index(drop=True)
 
     out_path = os.path.join(HOME_SEQ_FOLDER, args.output_file)
     merged.to_pickle(out_path)

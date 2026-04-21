@@ -18,8 +18,8 @@ from transformers import AutoModel, AutoTokenizer
 import psutil
 
 # Project directory
-#PROJECT_DIR = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
-PROJECT_DIR = "/Users/dylanwells/popDMS/esmDMS"
+PROJECT_DIR = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
+#PROJECT_DIR = "/Users/dylanwells/popDMS/esmDMS"
 sys.path.insert(0, PROJECT_DIR)
 
 from esmdmsfunctions import CODON2AA
@@ -377,6 +377,10 @@ def main():
                         help="Embed sequences with zero pre-selection counts")
     parser.add_argument("--esm_model", default=None,
                         help="Override ESM model (e.g. facebook/esm2_t6_8M_UR50D)")
+    parser.add_argument("--chunk_idx", type=int, default=0,
+                        help="Index of this chunk (0-based, used in array jobs)")
+    parser.add_argument("--n_chunks", type=int, default=1,
+                        help="Total number of chunks (must match --array size)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -442,23 +446,39 @@ def main():
 
     print(f"Unique mutant sequences: {len(seq_df)}")
 
-    seq_scratch_path = os.path.join(SCRATCH_EMBED_FOLDER, f"{cfg['protein']}_sequences.pkl")
-    seq_df.to_pickle(seq_scratch_path)
-    print(f"Sequences saved to {seq_scratch_path}")
+    # Save full sequence dataframe only from chunk 0 (or when not chunking)
+    if args.chunk_idx == 0:
+        seq_scratch_path = os.path.join(SCRATCH_EMBED_FOLDER, f"{cfg['protein']}_sequences.pkl")
+        seq_df.to_pickle(seq_scratch_path)
+        print(f"Sequences saved to {seq_scratch_path}")
 
-    seq_home_path = os.path.join(HOME_SEQ_FOLDER, f"{cfg['protein']}_sequences.pkl")
-    shutil.copy2(seq_scratch_path, seq_home_path)
-    print(f"Sequences copied to {seq_home_path}")
+        seq_home_path = os.path.join(HOME_SEQ_FOLDER, f"{cfg['protein']}_sequences.pkl")
+        shutil.copy2(seq_scratch_path, seq_home_path)
+        print(f"Sequences copied to {seq_home_path}")
+
+    # --- Chunking ---
+    if args.n_chunks > 1:
+        chunk_indices = np.array_split(np.arange(len(seq_df)), args.n_chunks)
+        idx = chunk_indices[args.chunk_idx]
+        seq_df = seq_df.iloc[idx].reset_index(drop=True)
+        print(f"\nChunk {args.chunk_idx}/{args.n_chunks - 1}: "
+              f"{len(seq_df)} sequences (rows {idx[0]}–{idx[-1]})")
 
     # --- Step 2: compute embeddings ---
     print("\n=== Step 2: Computing ESM embeddings ===")
     seq_df = embed_dataframe(seq_df, cfg["esm_model"], embed_zeroes=cfg["embed_zeroes"])
 
-    embed_scratch_path = os.path.join(SCRATCH_EMBED_FOLDER, args.output_file)
+    # Append chunk suffix to output filename when running in array mode
+    if args.n_chunks > 1:
+        output_filename = f"{args.output_file}.chunk_{args.chunk_idx}"
+    else:
+        output_filename = args.output_file
+
+    embed_scratch_path = os.path.join(SCRATCH_EMBED_FOLDER, output_filename)
     seq_df.to_pickle(embed_scratch_path)
     print(f"Embeddings saved to {embed_scratch_path}")
 
-    embed_home_path = os.path.join(HOME_SEQ_FOLDER, args.output_file)
+    embed_home_path = os.path.join(HOME_SEQ_FOLDER, output_filename)
     shutil.copy2(embed_scratch_path, embed_home_path)
     print(f"Embeddings copied to {embed_home_path}")
 
