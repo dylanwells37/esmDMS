@@ -14,6 +14,9 @@ import pandas as pd
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+
+import psutil
+
 # Project directory
 #PROJECT_DIR = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
 PROJECT_DIR = "/Users/dylanwells/popDMS/esmDMS"
@@ -231,31 +234,27 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
         raise ValueError(
             "No replicate count columns found. Expected names like 'Replicate_A_c_0'."
         )
-    #ref_aa_seq = translate_nuc_sequence(ref_nuc_seq)
+    ref_aa_seq = translate_nuc_sequence(ref_nuc_seq)
 
     records = []
     for _, row in df.iterrows():
-        substitutions = parse_hgvs_nt(row.get("hgvs_nt"))
-        if not substitutions:
-            continue
+        hgvs_nt = row.get("hgvs_nt")
 
-        mut_nuc_seq = apply_substitutions(ref_nuc_seq, substitutions)
-        if mut_nuc_seq is None:
-            continue
-
-        mut_aa_seq = translate_nuc_sequence(mut_nuc_seq)
-
-        #diffs = [i for i in range(min(len(ref_aa_seq), len(mut_aa_seq)))
-        #         if ref_aa_seq[i] != mut_aa_seq[i]]
-        #if len(diffs) != 1:
-        #    continue
-        #if skip_stop_codons and mut_aa_seq[diffs[0]] == "*":
-        #    continue
+        if hgvs_nt == "_wt":
+            aa_seq = ref_aa_seq
+        else:
+            substitutions = parse_hgvs_nt(hgvs_nt)
+            if not substitutions:
+                continue
+            mut_nuc_seq = apply_substitutions(ref_nuc_seq, substitutions)
+            if mut_nuc_seq is None:
+                continue
+            aa_seq = translate_nuc_sequence(mut_nuc_seq)
 
         records.append({
             "PreNums":  [int(row[c]) if pd.notna(row[c]) else 0 for c in pre_cols],
             "PostNums": [int(row[c]) if pd.notna(row[c]) else 0 for c in post_cols],
-            "ProteinSequence": mut_aa_seq,
+            "ProteinSequence": aa_seq,
         })
 
     result = pd.DataFrame(records, columns=["PreNums", "PostNums", "ProteinSequence"])
@@ -320,13 +319,14 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False):
             emb = None
         embeddings.append(emb)
 
-        if i % 100 == 0 and i > 0:
+        if i % 5 == 0 and i > 0:
             elapsed = time.time() - start
             remaining = elapsed / i * (len(sequences) - i)
             print(
                 f"  [{i}/{len(sequences)}] elapsed {elapsed/60:.1f} min, "
                 f"est. remaining {remaining/60:.1f} min"
             )
+            print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
 
     seq_df["Embeddings"] = embeddings
     return seq_df
