@@ -132,6 +132,8 @@ def run_inference_calcs(layer_df, output_path, verbose=False, pre_processed=Fals
         inference_df = layer_df
     else:
         inference_df = embedding_df_transfer_optimized(layer_df)  
+
+        
     data = mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
                                             output_dir=output_path, verbose=verbose)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]

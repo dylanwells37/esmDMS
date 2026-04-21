@@ -70,9 +70,16 @@ def get_best_regularization(corrs, gamma_values, corr_cutoff_pct=0.5):
                 gamma_set = True
                 break
         # if the loop completes without finding a gamma, set gamma_opt to the value that gives 1% of the drop in R
+         # if the loop completes without finding a gamma
         if not gamma_set:
-            i_before_below10percent = find_last_below_threshold(delta_cor_set)
-            gamma_opt = gamma_values[i_set[i_before_below10percent]]
+            if not i_set:
+                # Fallback: if loop never ran, use the argmax or the first gamma
+                gamma_opt = gamma_values[np.argmax(corrs)]
+            else:
+                i_before_below10percent = find_last_below_threshold(delta_cor_set)
+                # Ensure the index is valid for i_set
+                idx = min(i_before_below10percent, len(i_set) - 1)
+                gamma_opt = gamma_values[i_set[idx]]
     
     return gamma_opt
 
@@ -121,7 +128,7 @@ def safe_error_bars(mat):
 
 
 def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
-                               max_reads=1e2, output_dir=None, name='esm_inference', plot_gamma=True,
+                               max_reads=1e3, output_dir=None, name='esm_inference', plot_gamma=True,
                                verbose=False, calc_error_bars=False,
                                variance_cutoff=0.0, infer_ignored_dims=True):
     """function to just infer to modularize the code for esm"""

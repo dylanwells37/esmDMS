@@ -1,0 +1,16 @@
+{
+    "protein": "all_reps_A549",
+    "pre_selection_files": [
+        "A549_mutDNA-1_codoncounts.csv",
+        "A549_mutDNA-2_codoncounts.csv",
+        "A549_mutDNA-3_codoncounts.csv"
+    ],
+    "post_selection_files": [
+        "A549_mutvirus-1_codoncounts.csv",
+        "A549_mutvirus-2_codoncounts.csv",
+        "A549_mutvirus-3_codoncounts.csv"
+    ],
+    "reference_sequence_file": "A549_Reference_sequence.txt",
+    "esm_model": "facebook/esm2_t30_150M_UR50D",
+    "embed_zeroes": false
+}

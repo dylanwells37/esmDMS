@@ -63,7 +63,7 @@ def plot_true_vs_inferred_s(all_results, layers, max_cols=3):
 def plot_cross_replicate_consistency(all_results, layers, max_cols=3):
     """Cross-replicate consistency of inferred selection coefficients."""
     for path_name, results in all_results.items():
-        all_layer_fits, all_sel_coeffs, detailed_results, gamma_results, all_gen_counts, eig_info = results
+        all_layer_fits, all_sel_coeffs, detailed_results, gamma_results, all_gen_counts = results
 
         for layer in layers:
             if layer not in detailed_results:
@@ -99,7 +99,7 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=3):
                 row, col = divmod(idx, n_cols)
                 axes[row][col].set_visible(False)
 
-            fig.suptitle(f'[{path_name}]  Layer {layer} — Cross-replicate consistency  ({eig_info[layer]["n_components"]} eigenvectors)', fontsize=13)
+            fig.suptitle(f'[{path_name}]  Layer {layer} — Cross-replicate consistency', fontsize=13)
             plt.tight_layout()
             plt.show()
 
