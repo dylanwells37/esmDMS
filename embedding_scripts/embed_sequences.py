@@ -222,18 +222,22 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
         content = "".join(line for line in f if not line.startswith("#"))
     df = pd.read_csv(io.StringIO(content))
 
-    # Detect replicate pre/post column pairs (Replicate_A_c_0 / Replicate_A_c_1)
+    # Detect all *_c_N columns and group by prefix (replicate name)
+    _COL_RE = re.compile(r"^(.+)_c_(\d+)$")
     seen = {}
     for col in df.columns:
-        m = re.match(r"^(Replicate_\w+)_c_(\d+)$", col)
+        m = _COL_RE.match(col)
         if m:
             seen.setdefault(m.group(1), {})[int(m.group(2))] = col
-    pre_cols  = [tp[0] for tp in seen.values() if 0 in tp and 1 in tp]
-    post_cols = [tp[1] for tp in seen.values() if 0 in tp and 1 in tp]
-    if not pre_cols:
+    if not seen:
         raise ValueError(
-            "No replicate count columns found. Expected names like 'Replicate_A_c_0'."
+            "No count columns found. Expected names ending in '_c_N' (e.g. 'Replicate_A_c_0')."
         )
+
+    # Assign stable 1-based integer indices to replicates (sorted alphabetically)
+    sorted_rep_names = sorted(seen.keys())
+    rep_name_to_idx = {name: idx + 1 for idx, name in enumerate(sorted_rep_names)}
+
     ref_aa_seq = translate_nuc_sequence(ref_nuc_seq)
 
     records = []
@@ -251,19 +255,23 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
                 continue
             aa_seq = translate_nuc_sequence(mut_nuc_seq)
 
-        records.append({
-            "PreNums":  [int(row[c]) if pd.notna(row[c]) else 0 for c in pre_cols],
-            "PostNums": [int(row[c]) if pd.notna(row[c]) else 0 for c in post_cols],
-            "ProteinSequence": aa_seq,
-        })
+        for rep_name, gen_dict in seen.items():
+            rep_idx = rep_name_to_idx[rep_name]
+            for gen_idx, col_name in sorted(gen_dict.items()):
+                freq = int(row[col_name]) if pd.notna(row.get(col_name)) else 0
+                records.append({
+                    "ProteinSequence": aa_seq,
+                    "Replicate": rep_idx,
+                    "Generation": gen_idx,
+                    "Frequency": freq,
+                })
 
-    result = pd.DataFrame(records, columns=["PreNums", "PostNums", "ProteinSequence"])
+    result = pd.DataFrame(records, columns=["ProteinSequence", "Replicate", "Generation", "Frequency"])
 
     if not result.empty:
-        result = result.groupby("ProteinSequence", as_index=False).agg({
-            "PreNums":  lambda x: [sum(v) for v in zip(*x)],
-            "PostNums": lambda x: [sum(v) for v in zip(*x)],
-        })
+        result = result.groupby(
+            ["ProteinSequence", "Replicate", "Generation"], as_index=False
+        ).agg({"Frequency": "sum"})
 
     return result
 
@@ -296,40 +304,80 @@ def embed_sequence(sequence, tokenizer, model):
     return np.vstack(layer_embeddings)  # (num_layers, embedding_dim)
 
 
-def embed_dataframe(seq_df, esm_model, embed_zeroes=False):
+def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
     """
-    Add an Embeddings column to seq_df in-place.
-    Sequences whose pre-selection counts are all zero get None unless
-    embed_zeroes=True.
+    Embed protein sequences and return an annotated DataFrame.
+
+    Codon-count format (columns PreNums / PostNums / ProteinSequence):
+        Adds an Embeddings column; returns the same wide-format DataFrame.
+
+    MaveDB long format (columns ProteinSequence / Replicate / Generation / Frequency):
+        Embeds each unique sequence once, joins the embedding back, and returns
+        a long-format DataFrame with columns:
+            ProteinSequence, Generation, Embedding, Frequency, Replicate
     """
     tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
     model = AutoModel.from_pretrained(esm_model)
     model.eval()
 
-    pre_counts = seq_df["PreNums"].tolist()
-    sequences = seq_df["ProteinSequence"].tolist()
-    embeddings = []
-    start = time.time()
+    is_long_format = "Replicate" in seq_df.columns and "Generation" in seq_df.columns
 
-    for i, seq in enumerate(sequences):
-        has_observations = any(x > 0 for x in pre_counts[i])
-        if embed_zeroes or has_observations:
-            emb = embed_sequence(seq, tokenizer, model)
+    if n_test is not None:
+        if is_long_format:
+            keep = seq_df["ProteinSequence"].unique()[:n_test]
+            seq_df = seq_df[seq_df["ProteinSequence"].isin(keep)].reset_index(drop=True)
         else:
-            emb = None
-        embeddings.append(emb)
+            seq_df = seq_df.iloc[:n_test].reset_index(drop=True)
+        print(f"n_test={n_test}: embedding {len(seq_df['ProteinSequence'].unique()) if is_long_format else len(seq_df)} sequences")
 
-        if i % 5 == 0 and i > 0:
-            elapsed = time.time() - start
-            remaining = elapsed / i * (len(sequences) - i)
-            print(
-                f"  [{i}/{len(sequences)}] elapsed {elapsed/60:.1f} min, "
-                f"est. remaining {remaining/60:.1f} min"
-            )
-            print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
+    if is_long_format:
+        unique_seqs = seq_df["ProteinSequence"].unique()
+        total_freq = seq_df.groupby("ProteinSequence")["Frequency"].sum()
+        seq_to_emb = {}
+        start = time.time()
 
-    seq_df["Embeddings"] = embeddings
-    return seq_df
+        for i, seq in enumerate(unique_seqs):
+            has_observations = embed_zeroes or total_freq.get(seq, 0) > 0
+            seq_to_emb[seq] = embed_sequence(seq, tokenizer, model) if has_observations else None
+
+            if i % 5 == 0 and i > 0:
+                elapsed = time.time() - start
+                remaining = elapsed / i * (len(unique_seqs) - i)
+                print(
+                    f"  [{i}/{len(unique_seqs)}] elapsed {elapsed/60:.1f} min, "
+                    f"est. remaining {remaining/60:.1f} min"
+                )
+                print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
+
+        out = seq_df.copy()
+        out["Embedding"] = out["ProteinSequence"].map(seq_to_emb)
+        return out[["ProteinSequence", "Generation", "Embedding", "Frequency", "Replicate"]]
+
+    else:
+        pre_counts = seq_df["PreNums"].tolist()
+        sequences = seq_df["ProteinSequence"].tolist()
+        embeddings = []
+        start = time.time()
+
+        for i, seq in enumerate(sequences):
+            has_observations = any(x > 0 for x in pre_counts[i])
+            if embed_zeroes or has_observations:
+                emb = embed_sequence(seq, tokenizer, model)
+            else:
+                emb = None
+            embeddings.append(emb)
+
+            if i % 5 == 0 and i > 0:
+                elapsed = time.time() - start
+                remaining = elapsed / i * (len(sequences) - i)
+                print(
+                    f"  [{i}/{len(sequences)}] elapsed {elapsed/60:.1f} min, "
+                    f"est. remaining {remaining/60:.1f} min"
+                )
+                print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
+
+        seq_df["Embeddings"] = embeddings
+        return seq_df
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +425,8 @@ def main():
                         help="Embed sequences with zero pre-selection counts")
     parser.add_argument("--esm_model", default=None,
                         help="Override ESM model (e.g. facebook/esm2_t6_8M_UR50D)")
+    parser.add_argument("--n_test", type=int, default=None,
+                        help="Only embed the first N sequences (for testing)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -452,7 +502,8 @@ def main():
 
     # --- Step 2: compute embeddings ---
     print("\n=== Step 2: Computing ESM embeddings ===")
-    seq_df = embed_dataframe(seq_df, cfg["esm_model"], embed_zeroes=cfg["embed_zeroes"])
+    seq_df = embed_dataframe(seq_df, cfg["esm_model"], embed_zeroes=cfg["embed_zeroes"],
+                             n_test=args.n_test)
 
     embed_scratch_path = os.path.join(SCRATCH_EMBED_FOLDER, args.output_file)
     seq_df.to_pickle(embed_scratch_path)
