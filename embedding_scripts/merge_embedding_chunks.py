@@ -18,6 +18,10 @@ import argparse
 import pandas as pd
 
 PROJECT_DIR = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
+# check if the new path exists, otherwise fallback to local path
+if not os.path.exists(PROJECT_DIR):
+    local_path = "/Users/dylanwells/popDMS/esmDMS"
+    PROJECT_DIR = local_path
 HOME_SEQ_FOLDER = os.path.join(PROJECT_DIR, "data", "sequence_data")
 
 
@@ -47,6 +51,23 @@ def main():
     print(f"Loading {args.n_chunks} chunks...")
     chunks = [pd.read_pickle(p) for p in chunk_paths]
     merged = pd.concat(chunks, ignore_index=True)
+
+
+    # Build a lookup from ProteinSequence -> Embedding using only non-None rows
+    seq_to_embedding = (
+        merged[merged["Embedding"].notna()]
+        .drop_duplicates(subset="ProteinSequence")
+        .set_index("ProteinSequence")["Embedding"]
+    )
+
+    # Replace None embeddings using the lookup
+    none_mask = merged["Embedding"].isnull()
+    merged.loc[none_mask, "Embedding"] = (
+        merged.loc[none_mask, "ProteinSequence"].map(seq_to_embedding)
+    )
+
+    still_none = merged["Embedding"].isnull().sum()
+    print(f"None embeddings remaining after fix: {still_none}")
 
     out_path = os.path.join(HOME_SEQ_FOLDER, args.output_file)
     merged.to_pickle(out_path)

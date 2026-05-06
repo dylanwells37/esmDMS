@@ -138,7 +138,8 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
     # Determine which dimensions to use based on variance_cutoff
     if variance_cutoff > 0.0:
         all_embeddings = np.vstack(embedding_df['Embedding'].values)
-        dim_variances = np.var(all_embeddings, axis=0)
+        unique_embeddings = np.unique(all_embeddings, axis=0)
+        dim_variances = np.var(unique_embeddings, axis=0)
         sorted_dims = np.argsort(dim_variances)[::-1]
         cumulative_variance = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
         n_keep = int(np.searchsorted(cumulative_variance, variance_cutoff)) + 1
@@ -603,7 +604,7 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
         if calc_error_bars and s_joint_err_ign is not None:
             s_joint_error_bars[ignored_dims] = s_joint_err_ign
 
-    sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates + 1)] + ['joint']
+    #sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates + 1)] + ['joint']
     sel_data = [[dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]] for dim in range(L)]
 
     return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]

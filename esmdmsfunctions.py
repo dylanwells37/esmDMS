@@ -1024,11 +1024,11 @@ def load_sim_data(filename):
 def load_final_df(layer, path=None):
     if path is None:
         path = "/net/dali/home/barton/dhw28/popDMS/esmDMS/data/bg_bf_comb_data"
-    return pd.read_pickle(f"{path}/layer{layer}/final_df.pkl")
+    return pd.read_pickle(f"{path}/layer{layer}_sim_df.pkl")
 
 
-def load_embedding_df(layer, path="/net/dali/home/barton/dhw28/popDMS/esmDMS/data/inference_results"):
-    return pd.read_pickle(f"{path}/layer{layer}/inference_df.pkl")
+def load_inference_df(layer, path="/net/dali/home/barton/dhw28/popDMS/esmDMS/data/inference_results"):
+    return pd.read_pickle(f"{path}/layer{layer}_inference_df.pkl")
 
 
 ## ─────────────────────────────────────────────────────────────────────────────

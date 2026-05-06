@@ -494,7 +494,7 @@ def main():
         print(f"Reference length: {len(reference_seq)} aa")
         seq_df = build_sequence_dataframe(pre_files, post_files, reference_seq)
 
-    print(f"Unique mutant sequences: {len(seq_df)}")
+    print(f"Unique mutant sequences: {len(seq_df['ProteinSequence'].unique())}")
 
     # Save full sequence dataframe only from chunk 0 (or when not chunking)
     if args.chunk_idx == 0:
