@@ -149,7 +149,7 @@ def run_inference(embedding_path, inference_cfg, save_results=True, force_recomp
 
     if save_results:
         with open(cache_path, "wb") as f:
-            pickle.dump(result_tuple, f)
+            pickle.dump(result_tuple, f, protocol=4)
         print(f"Inference results saved to {cache_path}")
 
     return result_tuple
