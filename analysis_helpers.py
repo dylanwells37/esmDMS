@@ -207,7 +207,7 @@ def plot_true_vs_inferred_sel_coeffs(all_results, paths, cfg, output_dir, n_cols
         plt.close()
 
 
-def plot_cross_replicate_consistency(all_results, layers, max_cols=3, output_dir=None, corr='pearson'):
+def plot_cross_replicate_consistency(all_results, layers, max_cols=3, output_dir=None, corr='pearson', normalize="none"):
     """Cross-replicate consistency of inferred selection coefficients.
 
     corr : 'pearson' or 'spearman'
@@ -259,9 +259,13 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=3, output_dir
 
             fig.suptitle(f'[{path_name}]  Layer {layer} — Cross-replicate consistency', fontsize=13)
             plt.tight_layout()
+            if normalize != "none":
+                fig.text(0.5, -0.01, f"Normalization: {normalize}", ha='center',
+                         fontsize=9, style='italic', color='gray')
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-                plt.savefig(os.path.join(output_dir, f"{path_name}_layer{layer}_cross_replicate.png"))
+                plt.savefig(os.path.join(output_dir, f"{path_name}_layer{layer}_cross_replicate.png"),
+                            bbox_inches="tight")
             plt.show()
 
 

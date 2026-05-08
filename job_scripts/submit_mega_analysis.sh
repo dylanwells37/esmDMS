@@ -12,7 +12,7 @@
 #
 # Examples:
 #   sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --sim_config configs/simulation_config.json --fitness
-#   sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --embedding_config configs/inference_config.json --cross_replicate_consistency
+#   sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --embedding_config configs/inference_config.json --cross_replicate_consistency --normalize by_layer_dim --force_recompute --shuffled_frequencies
 #   sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --sim_config configs/simulation_config.json --embedding_config configs/inference_config.json --all
 #
 # Analysis flags (pass one or more, or --all):
@@ -21,6 +21,10 @@
 #   --cross_replicate_consistency  cross-replicate consistency of inferred sel coeffs
 #   --shuffled_frequencies         cross-replicate consistency with shuffled frequencies
 #   --all                          run all implemented analyses
+#
+# Optional flags:
+#   --normalize none|by_layer|by_layer_dim   z-normalize embeddings before inference (default: none)
+#   --force_recompute                        ignore cached inference_results.pkl
 
 EMBEDDING_PATH=${1:?"Usage: sbatch submit_mega_analysis.sh <embedding_path> <output_dir> [extra args]"}
 OUTPUT_DIR=${2:?"Usage: sbatch submit_mega_analysis.sh <embedding_path> <output_dir> [extra args]"}
@@ -41,3 +45,8 @@ python mega_analysis.py \
     "$EMBEDDING_PATH" \
     "$OUTPUT_DIR" \
     $EXTRA_ARGS
+
+
+# echo time taken and max memory used
+echo "Job completed in $(($SECONDS / 3600)) hours $((($SECONDS % 3600) / 60)) minutes and $(($SECONDS % 60)) seconds."
+echo "Max memory used: $(sacct -j ${SLURM_JOB_ID} --format=MaxRSS --noheader | awk '{print $1}')"
