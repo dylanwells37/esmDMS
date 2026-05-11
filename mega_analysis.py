@@ -40,6 +40,10 @@ from analysis_helpers import (
     plot_true_vs_inferred_sel_coeffs,
     plot_cross_replicate_consistency,
     plot_fitness_trajectories,
+    get_individual_fitness_values,
+    get_esm_individual_fitness_values,
+    get_enrichment_ratios,
+    plot_baseline_vs_esm_comparison,
 )
 
 from popDMS import mini_infer_independent_esm
@@ -237,6 +241,57 @@ def plot_shuffled_frequencies_analysis(all_results, paths, cfg, output_dir):
     plot_cross_replicate_consistency(shuffled_all_results, layers, output_dir=shuffled_output_dir)
 
 
+def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
+    """Compare the inferred fitness of every individual within
+    the embedding-based inference to the fitness inferred by popDMS on the same data.
+    """
+    pop_inference_path    = cfg.get("pop_inference_path", None)
+    reference_sequence_file = cfg.get("reference_sequence_file", None)
+    haplotype_counts_file = cfg.get("haplotype_counts_file", None)
+    fitness_fn            = cfg.get("fitness_fn", "plus1")
+
+    if not pop_inference_path or not os.path.exists(pop_inference_path):
+        print(f"popDMS inference file not found at {pop_inference_path}. "
+              "Run popDMS inference first (e.g. via the data_analysis notebook).")
+        return
+
+    with open(reference_sequence_file) as f:
+        reference_sequence = f.read().strip()
+
+    # Part 1: load per-haplotype popDMS fitness values
+    popdms_fits = get_individual_fitness_values(
+        pop_inference_path, haplotype_counts_file, reference_sequence
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for path_name, results in all_results.items():
+        detailed_results = results[2]
+        embedding_path   = paths[path_name]
+        layers           = sorted(detailed_results.keys())
+
+        # Part 2: for each layer, compute ESM-DMS inferred fitness per sequence
+        esm_fits_by_layer = {}
+        for layer in layers:
+            s_joint = detailed_results[layer][1]
+            esm_fits_by_layer[layer] = get_esm_individual_fitness_values(
+                embedding_path, layer, s_joint, fitness_fn=fitness_fn
+            )
+
+        # Part 3: plot comparisons
+        plot_baseline_vs_esm_comparison(
+            popdms_fits, esm_fits_by_layer, layers, output_dir, path_name,
+            baseline_label="popDMS Fitness",
+        )
+        enrichment_ratios = get_enrichment_ratios(embedding_path)
+        plot_baseline_vs_esm_comparison(
+            enrichment_ratios, esm_fits_by_layer, layers, output_dir, path_name,
+            baseline_label="Enrichment Ratio",
+        )
+
+
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -272,7 +327,10 @@ ANALYSES = {
         plot_shuffled_frequencies_analysis,
         "Run cross-replicate consistency analysis on data with shuffled post-selection frequencies",
     ),
-
+    "popDMS_comparison": (
+        popDMS_esmDMS_comparison_analysis,
+        "Compare per-individual ESM-DMS inferred fitness to popDMS fitness",
+    ),
 }
 
 # Now categorize the analyses by which need simulation results vs just embeddings

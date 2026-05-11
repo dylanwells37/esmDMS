@@ -1,12 +1,23 @@
 import os
+import pandas as pd
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
 
 from esmdmsfunctions import (
+    CODON2AA,
     load_final_df,
     z_normalize
+)
+
+from paperPop import (
+    MAVEDB_NT,
+    MAVEDB_WT,
+    MAVEDB_ACC,
+    MAVEDB_SPLICE,
+    read_fancy_comments,
+    get_variant_sites_nucs
 )
 
 NCOLS = 6
@@ -311,3 +322,229 @@ def plot_fitness_trajectories(all_results, n_cols=6, output_dir=None):
             os.makedirs(output_dir, exist_ok=True)
             plt.savefig(os.path.join(output_dir, f"{path_name}_fitness_trajectories.png"))
         plt.show()
+
+
+def get_esm_individual_fitness_values(embedding_path, layer, s_joint, fitness_fn='plus1'):
+    """Compute ESM-DMS inferred fitness for every sequence in the embedding df.
+
+    Returns:
+        pd.Series with protein sequence as index and inferred fitness as values.
+    """
+    directory_name = os.path.basename(embedding_path.rstrip("/"))
+    emb_path = os.path.join(embedding_path, f"{directory_name}_embeddings.pkl")
+    emb_full = pd.read_pickle(emb_path).drop_duplicates(subset="ProteinSequence")
+    protein_seqs = emb_full["ProteinSequence"].values
+    emb_matrix   = np.vstack([np.array(e[layer]) for e in emb_full["Embedding"]])
+    fits = inferred_fitness(emb_matrix, s_joint, fitness_fn)
+    return pd.Series(fits, index=protein_seqs)
+
+
+def get_enrichment_ratios(embedding_path, agg='mean'):
+    """Compute log enrichment ratio (post/pre frequency) per protein sequence.
+
+    Loads the original embedding pickle (which has Replicate, Generation, Frequency,
+    ProteinSequence columns), averages frequencies across replicates at the first and
+    last observed generation, then returns log(freq_post / freq_pre).
+
+    Returns:
+        pd.Series indexed by protein_seq, NaN-dropped.
+    """
+    directory_name = os.path.basename(embedding_path.rstrip("/"))
+    emb_path = os.path.join(embedding_path, f"{directory_name}_embeddings.pkl")
+    emb_full = pd.read_pickle(emb_path)
+
+    gen_min = emb_full["Generation"].min()
+    gen_max = emb_full["Generation"].max()
+
+    groupby_fn = "mean" if agg == "mean" else "sum"
+    pre  = getattr(emb_full[emb_full["Generation"] == gen_min]
+                   .groupby("ProteinSequence")["Frequency"], groupby_fn)()
+    post = getattr(emb_full[emb_full["Generation"] == gen_max]
+                   .groupby("ProteinSequence")["Frequency"], groupby_fn)()
+
+    pre, post = pre.align(post, join="inner")
+    enrichment = np.log(post / pre.replace(0.0, np.nan))
+    return enrichment.dropna()
+
+
+def _align_pair(baseline, esm):
+    """Inner-join two Series on index, drop any remaining NaN, return matched arrays."""
+    b, e = baseline.align(esm, join="inner")
+    b = b.dropna()
+    e = e[b.index].dropna()
+    b = b[e.index]
+    return b.values, e.values
+
+
+def plot_baseline_vs_esm_comparison(baseline_fits, esm_fits_by_layer, layers,
+                                    output_dir, path_name, baseline_label="popDMS Fitness"):
+    """Plot a baseline fitness measure vs ESM-DMS inferred fitness.
+
+    Produces:
+      1. Pearson r and Spearman rho vs ESM layer (line plot).
+      2. Scatter plots for the best-Pearson-r layer plus layers 0, 15, 30.
+
+    baseline_label controls axis labels and output filenames.
+    """
+    file_tag = baseline_label.lower().replace(" ", "_")
+
+    pearson_rs, spearman_rs, valid_layers = [], [], []
+    for layer in layers:
+        esm = esm_fits_by_layer.get(layer)
+        if esm is None:
+            continue
+        x, y = _align_pair(baseline_fits, esm)
+        if len(x) < 3:
+            continue
+        pr, _ = pearsonr(x, y)
+        sr, _ = spearmanr(x, y)
+        pearson_rs.append(pr)
+        spearman_rs.append(sr)
+        valid_layers.append(layer)
+
+    if not valid_layers:
+        print(f"[{path_name}] No valid layers for {baseline_label} vs ESM comparison.")
+        return
+
+    layers_arr   = np.array(valid_layers)
+    pearson_arr  = np.array(pearson_rs)
+    spearman_arr = np.array(spearman_rs)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(layers_arr, pearson_arr,  color="steelblue",  marker="o", markersize=4,
+            linewidth=2, label="Pearson r")
+    ax.plot(layers_arr, spearman_arr, color="darkorange", marker="s", markersize=4,
+            linewidth=2, label="Spearman ρ")
+    ax.set_xlabel("ESM-2 Layer", fontsize=12)
+    ax.set_ylabel("Correlation", fontsize=12)
+    ax.set_title(f"{baseline_label} vs ESM-DMS Correlation — {path_name}", fontsize=13)
+    ax.set_ylim(-0.15, 1.05)
+    ax.axhline(0, color="gray", linestyle=":", linewidth=0.8)
+    ax.set_xticks(layers_arr[::5])
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{file_tag}_vs_esm_correlation_{path_name}.png"),
+                dpi=100, bbox_inches="tight")
+    plt.close()
+
+    best_layer    = valid_layers[int(np.argmax(pearson_arr))]
+    select_layers = [l for l in [0, 15, 30] if l in esm_fits_by_layer]
+    scatter_layers = sorted(set([best_layer] + select_layers))
+
+    n_plots = len(scatter_layers)
+    n_cols  = min(n_plots, 3)
+    n_rows  = int(np.ceil(n_plots / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows), squeeze=False)
+    for idx, layer in enumerate(scatter_layers):
+        row, col = divmod(idx, n_cols)
+        ax  = axes[row][col]
+        x, y = _align_pair(baseline_fits, esm_fits_by_layer[layer])
+        pr, _ = pearsonr(x, y)
+        sr, _ = spearmanr(x, y)
+        color = "seagreen" if layer == best_layer else "steelblue"
+        label = f"Layer {layer}" + (" (best)" if layer == best_layer else "")
+        ax.scatter(x, y, alpha=0.4, s=8, color=color, rasterized=True)
+        lo = min(x.min(), y.min()) - 0.05
+        hi = max(x.max(), y.max()) + 0.05
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_title(label, fontsize=10)
+        ax.set_xlabel(baseline_label, fontsize=8)
+        ax.set_ylabel("ESM-DMS Fitness", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.annotate(f"r = {pr:.3f}\nρ = {sr:.3f}", xy=(0.05, 0.93),
+                    xycoords="axes fraction", ha="left", va="top", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.85))
+    for idx in range(n_plots, n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].set_visible(False)
+    fig.suptitle(f"{baseline_label} vs ESM-DMS Fitness — {path_name}", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{file_tag}_vs_esm_scatter_{path_name}.png"),
+                dpi=80, bbox_inches="tight")
+    plt.close()
+
+
+def get_individual_fitness_values(selection_file, haplotype_counts_file, reference_sequence, rep='joint', comment_char=None):
+    '''
+    Compute fitness for every individual haplotype in the population.
+    
+    Fitness is defined as:
+        w = 1 + sum_i(x_i * s_i)
+    where x_i = 1 if the individual carries mutation i, 0 otherwise,
+    and s_i is the selection coefficient for mutation i.
+    
+    Arguments:
+        - selection_file:        Path to selection coefficients .csv.gz from infer_correlated
+        - haplotype_counts_file: Path to the MaveDB format haplotype counts file
+        - reference_sequence:    Reference nucleotide sequence string
+        - rep:                   Which replicate to use for selection coefficients (default: 'joint')
+        - comment_char:          Comment character in haplotype counts file (default: None)
+    
+    Returns:
+        - fitness: np.array of shape (n_haplotypes,) with one fitness value per individual,
+                   weighted by haplotype count
+    '''
+    
+    # Load selection coefficients (excluding WT, as they contribute 0)
+    df_sel = pd.read_csv(selection_file, compression='gzip')
+    df_sel = df_sel[df_sel['WT_indicator'] == False]
+    
+    if rep not in df_sel.columns:
+        raise ValueError(f"Column '{rep}' not found. Available: {list(df_sel.columns)}")
+    
+    # Build lookup: (site, aa) -> selection coefficient
+    sel_lookup = {(row['site'], row['amino_acid']): row[rep]
+                  for _, row in df_sel.iterrows()}
+    
+    # Load haplotype counts, drop unneeded columns, remove ambiguous nucleotides
+    df_data = read_fancy_comments(haplotype_counts_file, comment_char=comment_char)
+    df_data = df_data.replace('NA', np.nan).fillna(0).drop([MAVEDB_ACC], axis=1)
+    if MAVEDB_SPLICE in df_data.columns:
+        df_data = df_data.drop([MAVEDB_SPLICE], axis=1)
+    df_data = df_data[~df_data[MAVEDB_NT].astype('str').str.contains('X', regex=False)]
+    df_data.reset_index(drop=True, inplace=True)
+    
+    # Precompute reference codons and amino acids
+    codon_length = 3
+    ref_codons = np.array([''.join(reference_sequence[i:i+codon_length])
+                           for i in range(0, len(reference_sequence), codon_length)])
+    ref_aas = np.array([CODON2AA[c] for c in ref_codons])
+    reference_sequence = list(reference_sequence)
+    
+    ref_protein = ''.join(ref_aas)
+
+    # Compute fitness for each haplotype
+    fitness_values = []
+    protein_seqs   = []
+    for _, row in df_data.iterrows():
+
+        # WT individual carries no mutations, fitness = 1
+        if row[MAVEDB_NT] == MAVEDB_WT:
+            fitness_values.append(1.0)
+            protein_seqs.append(ref_protein)
+            continue
+
+        # Reconstruct variant sequence and amino acids
+        variant_sites, variant_nucs = get_variant_sites_nucs(row[MAVEDB_NT], shift_by_one=True)
+        variant_sequence = reference_sequence.copy()
+        for v_site, v_nuc in zip(variant_sites, variant_nucs):
+            variant_sequence[v_site] = v_nuc
+        variant_codons = np.array([''.join(variant_sequence[i:i+codon_length])
+                                   for i in range(0, len(variant_sequence), codon_length)])
+        variant_aas = np.array([CODON2AA[c] for c in variant_codons])
+
+        # Sum selection coefficients over all mutated sites
+        s_sum = 0.0
+        for i, (var_aa, ref_aa) in enumerate(zip(variant_aas, ref_aas)):
+            if var_aa != ref_aa:
+                site = i + 1  # 1-indexed sites, consistent with infer_correlated
+                s_sum += sel_lookup.get((site, var_aa), 0.0)
+
+        fitness_values.append(1.0 + s_sum)
+        protein_seqs.append(''.join(variant_aas))
+
+    return pd.Series(fitness_values, index=protein_seqs)
