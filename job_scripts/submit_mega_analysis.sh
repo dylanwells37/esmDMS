@@ -15,6 +15,8 @@
 #   sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --embedding_config configs/inference_config.json --cross_replicate_consistency --normalize by_layer_dim --force_recompute --shuffled_frequencies
 #   sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --sim_config configs/simulation_config.json --embedding_config configs/inference_config.json --all
 #
+# sbatch job_scripts/submit_mega_analysis.sh ~/popDMS/esmDMS/data/sequence_data/BRCA1 plots/ --embedding_config configs/inference_config.json --cross_replicate_consistency --normalize by_layer_dim --force_recompute --shuffled_frequencies
+#
 # Analysis flags (pass one or more, or --all):
 #   --fitness                      true vs inferred fitness
 #   --sel_coeffs                   true vs inferred selection coefficients
@@ -35,6 +37,8 @@ cd ~/popDMS/esmDMS
 
 SCRDIR=/scr/${SLURM_JOB_ID}
 mkdir -p $SCRDIR
+
+export PYTHONUNBUFFERED=1
 
 echo "Running mega_analysis with the following parameters:"
 echo "EMBEDDING_PATH: $EMBEDDING_PATH"

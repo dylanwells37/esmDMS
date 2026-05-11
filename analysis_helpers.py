@@ -207,17 +207,31 @@ def plot_true_vs_inferred_sel_coeffs(all_results, paths, cfg, output_dir, n_cols
         plt.close()
 
 
-def plot_cross_replicate_consistency(all_results, layers, max_cols=3, output_dir=None, corr='pearson', normalize="none"):
+def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir=None, corr='pearson', normalize="none"):
     """Cross-replicate consistency of inferred selection coefficients.
+
+    Produces two complementary plots per layer:
+      *_heatmap.png  — symmetric n_reps × n_reps correlation matrix (compact overview)
+      *_scatter.png  — individual scatter plot for every replicate pair (detailed view)
 
     corr : 'pearson' or 'spearman'
     """
     if corr == 'spearman':
-        corr_fn  = spearmanr
-        corr_sym = 'ρ'
+        corr_fn, corr_sym = spearmanr, 'ρ'
     else:
-        corr_fn  = pearsonr
-        corr_sym = 'r'
+        corr_fn, corr_sym = pearsonr, 'r'
+
+    def _norm_annotation(fig):
+        if normalize != "none":
+            fig.text(0.5, -0.01, f"Normalization: {normalize}", ha="center",
+                     fontsize=9, style="italic", color="gray")
+
+    def _save(fig, path):
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            fig.savefig(os.path.join(output_dir, path), bbox_inches="tight", dpi=100)
+        plt.show()
+        plt.close(fig)
 
     for path_name, results in all_results.items():
         detailed_results = results[2]
@@ -227,46 +241,86 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=3, output_dir
                 print(f"[{path_name}]  Layer {layer}: no inference results")
                 continue
 
-            s_reps    = detailed_results[layer][0]
-            n_reps    = len(s_reps)
+            s_reps = detailed_results[layer][0]
+            n_reps = len(s_reps)
             print(f"n_reps for {path_name} layer {layer}: {n_reps}")
+
+            # Compute all pairwise correlations once; reused by both plots
+            corr_matrix   = np.eye(n_reps)
+            pair_vals     = {}   # (i, j) -> (val, pval)
+            off_diag_vals = []
+            for i in range(n_reps):
+                for j in range(i + 1, n_reps):
+                    val, pval = corr_fn(s_reps[i], s_reps[j])
+                    corr_matrix[i, j] = corr_matrix[j, i] = val
+                    pair_vals[(i, j)] = (val, pval)
+                    off_diag_vals.append(val)
+
+            mean_r = np.mean(off_diag_vals)
+            std_r  = np.std(off_diag_vals)
+            suptitle_base = f"[{path_name}]  Layer {layer} — Cross-replicate consistency"
+
+            # ── Heatmap ──────────────────────────────────────────────────────
+            cell_in = np.clip(5.5 / n_reps, 0.45, 0.85)
+            fig_w   = n_reps * cell_in + 1.8
+            fig, ax = plt.subplots(figsize=(fig_w, fig_w * 0.88))
+
+            im = ax.imshow(corr_matrix, vmin=-1, vmax=1, cmap="RdBu_r", aspect="equal")
+            plt.colorbar(im, ax=ax, label=corr_sym, fraction=0.046, pad=0.04)
+
+            fs = int(np.clip(54 / n_reps, 6, 11))
+            for i in range(n_reps):
+                for j in range(n_reps):
+                    v = corr_matrix[i, j]
+                    ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                            fontsize=fs, color="white" if abs(v) > 0.6 else "black")
+
+            tick_labels = [f"Rep {i + 1}" for i in range(n_reps)]
+            ax.set_xticks(range(n_reps))
+            ax.set_yticks(range(n_reps))
+            ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=fs)
+            ax.set_yticklabels(tick_labels, fontsize=fs)
+            ax.set_title(
+                f"{suptitle_base}\nmean {corr_sym} = {mean_r:.3f} ± {std_r:.3f}"
+                f"  ({len(off_diag_vals)} pairs)",
+                fontsize=10,
+            )
+            plt.tight_layout()
+            _norm_annotation(fig)
+            _save(fig, f"{path_name}_layer{layer}_cross_replicate_heatmap.png")
+
+            # ── Scatter grid ─────────────────────────────────────────────────
             rep_pairs = [(i, j) for i in range(n_reps) for j in range(i + 1, n_reps)]
             n_plots   = len(rep_pairs)
+            n_cols    = min(n_plots, max_cols)
+            n_rows    = int(np.ceil(n_plots / n_cols))
 
-            n_cols = min(n_plots, max_cols)
-            n_rows = int(np.ceil(n_plots / n_cols))
-
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows), squeeze=False)
+            fig, axes = plt.subplots(n_rows, n_cols,
+                                     figsize=(4 * n_cols, 4 * n_rows), squeeze=False)
+            fig.suptitle(suptitle_base, fontsize=12)
 
             for idx, (ri, rj) in enumerate(rep_pairs):
                 row, col = divmod(idx, n_cols)
                 ax = axes[row][col]
-
                 si = z_normalize(s_reps[ri])
                 sj = z_normalize(s_reps[rj])
-                ax.scatter(si, sj, alpha=0.6, edgecolors='k', linewidths=0.3)
+                val, pval = pair_vals[(ri, rj)]
+                ax.scatter(si, sj, alpha=0.5, s=6, rasterized=True)
                 lim = max(np.abs(si).max(), np.abs(sj).max()) + 0.5
-                ax.plot([-lim, lim], [-lim, lim], 'r--')
-                ax.set_xlabel(f'Rep {ri + 1} s (normalized)')
-                ax.set_ylabel(f'Rep {rj + 1} s (normalized)')
-                val, pval = corr_fn(si, sj)
-                ax.set_title(f'{corr_sym} = {val:.3f}  (p = {pval:.2e})')
-                ax.axis('equal')
+                ax.plot([-lim, lim], [-lim, lim], "r--", linewidth=0.8)
+                ax.set_xlabel(f"Rep {ri + 1}", fontsize=7)
+                ax.set_ylabel(f"Rep {rj + 1}", fontsize=7)
+                ax.set_title(f"{corr_sym} = {val:.3f}", fontsize=8)
+                ax.tick_params(labelsize=6)
+                ax.axis("equal")
 
             for idx in range(n_plots, n_rows * n_cols):
                 row, col = divmod(idx, n_cols)
                 axes[row][col].set_visible(False)
 
-            fig.suptitle(f'[{path_name}]  Layer {layer} — Cross-replicate consistency', fontsize=13)
             plt.tight_layout()
-            if normalize != "none":
-                fig.text(0.5, -0.01, f"Normalization: {normalize}", ha='center',
-                         fontsize=9, style='italic', color='gray')
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                plt.savefig(os.path.join(output_dir, f"{path_name}_layer{layer}_cross_replicate.png"),
-                            bbox_inches="tight")
-            plt.show()
+            _norm_annotation(fig)
+            _save(fig, f"{path_name}_layer{layer}_cross_replicate_scatter.png")
 
 
 def plot_fitness_trajectories(all_results, n_cols=6, output_dir=None):

@@ -1021,11 +1021,17 @@ def load_final_df(layer, path=None):
 
 
 def load_inference_df(layer, path="/net/dali/home/barton/dhw28/popDMS/esmDMS/data/inference_results",
-                      normalize="none"):
+                      normalize="none", replicates=None):
     # Prefer the shared metadata file (written by new saves); fall back to per-layer file.
     shared_meta = f"{path}/inference_metadata.pkl"
     layer_meta = f"{path}/layer{layer}_inference_df.pkl"
     df = pd.read_pickle(shared_meta if os.path.exists(shared_meta) else layer_meta)
+
+    # Filter to requested replicates before expanding — avoids loading embeddings for
+    # excluded replicates and keeps memory proportional to the selected subset.
+    if replicates is not None:
+        df = df[df["Replicate"].isin(replicates)].reset_index(drop=True)
+
     if "seq_id" in df.columns:
         # Compact format: normalize the unique-sequence array before expanding to all rows.
         # This keeps peak memory at O(n_unique × emb_dim) during normalization rather than
