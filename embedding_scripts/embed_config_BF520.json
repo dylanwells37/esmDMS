@@ -1,5 +1,5 @@
 {
-    "protein": "all_reps_BF520",
+    "protein": "BF520",
     "pre_selection_files": [
         "BF520_mutDNA-1_codoncounts.csv",
         "BF520_mutDNA-2_codoncounts.csv",

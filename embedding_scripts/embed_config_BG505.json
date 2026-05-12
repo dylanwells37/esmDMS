@@ -1,5 +1,5 @@
 {
-    "protein": "all_reps_BG505",
+    "protein": "BG505",
     "pre_selection_files": [
         "BG505_mutDNA-1_codoncounts.csv",
         "BG505_mutDNA-2_codoncounts.csv",
