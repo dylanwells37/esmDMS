@@ -102,15 +102,11 @@ def plot_regularization_all(corrs_list, gamma_values):
     '''    
     fig = plt.figure()
     
-    corrs_list = np.array(corrs_list)
-    # transpose to get each replicate pair
-    corrs_list = corrs_list.T
-    label_num = corrs_list.shape[0]
-    
-    
+    corrs_list = np.array(corrs_list).T  # rows = replicate pairs, cols = gamma values
+
     for i in range(corrs_list.shape[0]):
-        plt.plot(gamma_values, corrs_list[i])#, label=labels[i])
-    
+        plt.plot(gamma_values, corrs_list[i], label=f"Pair {i + 1}")
+
     plt.xscale('log')
     plt.xlabel('Regularization strength (gamma)')
     plt.ylabel('Correlation between replicates')
@@ -354,16 +350,17 @@ def compute_dx_covariance_independent_esm(embedding_df):
     
     #print(f"EMBEDDINGS DF HEAD:\n{embedding_df.head()}")
     
-    reps = len(np.unique(embedding_df['Replicate']))
+    rep_vals = sorted(embedding_df['Replicate'].unique())
+    reps = len(rep_vals)
     d = len(embedding_df.iloc[0]['Embedding'])
-    
+
     # Shape dx vector (reps x [d]) and covariance matrix (reps x [d, d]), compute for each replicate
     dx  = [np.zeros(d) for i in range(reps)]
     icov = [np.zeros((d, d)) for i in range(reps)]
     x_array = []
-    
-    for r_idx in range(reps):
-        df_rep = embedding_df[embedding_df['Replicate'] == r_idx + 1]
+
+    for r_idx, rep_val in enumerate(rep_vals):
+        df_rep = embedding_df[embedding_df['Replicate'] == rep_val]
         times = np.sort(np.unique(df_rep['Generation']))
         dtsum = np.array([times[1]-times[0]] + [times[i+1]-times[i-1] for i in range(1, len(times)-1)] + [times[-1]-times[-2]])
 
@@ -426,15 +423,16 @@ def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
     icov    : list of ndarray, length n_replicates, each shape (d, d)
     x_array : list of ndarray, length n_replicates, each shape (n_times, d)
     """
-    reps = len(np.unique(embedding_df['Replicate']))
+    rep_vals = sorted(embedding_df['Replicate'].unique())
+    reps = len(rep_vals)
     d    = len(embedding_df.iloc[0]['Embedding'])
 
     dx      = [np.zeros(d)       for _ in range(reps)] # MEAN change in embedding
     icov    = [np.zeros((d, d))  for _ in range(reps)] # INTEGRATED covariance matrix
-    x_array = [] 
+    x_array = []
 
-    for r_idx in range(reps):
-        df_rep  = embedding_df[embedding_df['Replicate'] == r_idx + 1]
+    for r_idx, rep_val in enumerate(rep_vals):
+        df_rep  = embedding_df[embedding_df['Replicate'] == rep_val]
         times   = np.sort(np.unique(df_rep['Generation']))
         n_times = len(times)
 
@@ -572,7 +570,7 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
             s_sub[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
             if calc_error_bars:
                 #err_sub[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
-                err_sub[r_idx] = np.sqrt(eig_vec[r_idx] **2 @ inv_denom**2)
+                err_sub[r_idx] = np.sqrt(eig_vec[r_idx] **2 @ inv_denom)
 
         icov_sum    = np.sum(icov_sub, axis=0)
         dx_sum      = np.sum(dx_sub,   axis=0)

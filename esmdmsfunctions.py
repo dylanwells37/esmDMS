@@ -126,16 +126,18 @@ def embedding_df_transfer_optimized(embed_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_inference_calcs(layer_df, output_path, verbose=False, pre_processed=False,
-                        n_replicates=3):
+                        n_replicates=None):
     """Run the inference calculations for the layer-specific dataframe"""
     if pre_processed:
         inference_df = layer_df
     else:
-        inference_df = embedding_df_transfer_optimized(layer_df)  
+        inference_df = embedding_df_transfer_optimized(layer_df)
 
-        
+    if n_replicates is None:
+        n_replicates = inference_df["Replicate"].nunique()
+
     data = mini_infer_independent_esm(inference_df, n_replicates=n_replicates,
-                                            output_dir=output_path, verbose=verbose)
+                                      output_dir=output_path, verbose=verbose)
     return data # data = [dx, icov, s, s_joint, sel_data, gamma_opt, x_array]
     
     
@@ -302,10 +304,11 @@ def get_layer_df_processed(names, layer, in_paths=None):
         else:
             if in_path == in_paths[0]:
                 combined_df = layer_df.copy()
+                n_reps_base = len(combined_df["Replicate"].unique())
             else:
+                path_idx = in_paths.index(in_path)
                 df_to_add = layer_df.copy()
-                num_reps = len(df_to_add["Replicate"].unique())
-                df_to_add["Replicate"] = df_to_add["Replicate"] + num_reps
+                df_to_add["Replicate"] = df_to_add["Replicate"] + path_idx * n_reps_base
                 combined_df = pd.concat([combined_df, df_to_add], ignore_index=True)
                 del df_to_add
                 gc.collect()
@@ -355,7 +358,7 @@ def analyze_layers_cross_variant(whole_df=None, in_paths=None, output_path=None,
             for dim in range(dimensions):
                 embeddings[:, dim] = z_normalize(embeddings[:, dim])
             layer_df["Embedding"] = [embeddings[i] for i in range(embeddings.shape[0])]
-            layer_dfs.append(layer_df)
+        layer_dfs.append(layer_df)
     
     layer_results = []
     for layer in range(layer_count):
@@ -719,7 +722,7 @@ def _process_single_layer(args):
 
     print(f"Running layer {layer}...")
     df_selection = load_final_df(layer, embedding_df_path)
-    n_reps = len(df_selection.columns) // 2
+    n_reps = sum(1 for c in df_selection.columns if c.endswith('_PreNums'))
     initial_counts = []
     for rep in range(n_reps):
         pre_col = f'Rep{rep + 1}_PreNums'
@@ -785,12 +788,7 @@ def get_simulation_results(n_gens, embedding_df_path=default_emb_path,
     plateau_rtol : float
         Relative-change threshold for plateau detection.
     """
-    n_layers = 31
-
-    valid_layers = [l for l in layers if l < n_layers]
-    for l in layers:
-        if l >= n_layers:
-            print(f"Layer {l} is out of bounds (only {n_layers} layers available). Skipping.")
+    valid_layers = layers
 
     args_list = [
         (layer, embedding_df_path, sel_func, n_gens, save_every, fitness,
@@ -897,12 +895,7 @@ def get_eigenvector_simulation_results(n_gens, embedding_df_path=default_emb_pat
     all_gamma_analysis = {}
     eigenvector_info = {}
 
-    n_layers = 31
-
     for layer in layers:
-        if layer >= n_layers:
-            print(f"Layer {layer} is out of bounds for the embeddings (only {n_layers} layers available). Skipping.")
-            continue
         print(f"Running layer {layer}...")
 
         df_selection = load_final_df(layer, embedding_df_path)
@@ -1027,8 +1020,36 @@ def load_final_df(layer, path=None):
     return pd.read_pickle(f"{path}/layer{layer}_sim_df.pkl")
 
 
-def load_inference_df(layer, path="/net/dali/home/barton/dhw28/popDMS/esmDMS/data/inference_results"):
-    return pd.read_pickle(f"{path}/layer{layer}_inference_df.pkl")
+def load_inference_df(layer, path="/net/dali/home/barton/dhw28/popDMS/esmDMS/data/inference_results",
+                      normalize="none", replicates=None):
+    # Prefer the shared metadata file (written by new saves); fall back to per-layer file.
+    shared_meta = f"{path}/inference_metadata.pkl"
+    layer_meta = f"{path}/layer{layer}_inference_df.pkl"
+    df = pd.read_pickle(shared_meta if os.path.exists(shared_meta) else layer_meta)
+
+    # Filter to requested replicates before expanding — avoids loading embeddings for
+    # excluded replicates and keeps memory proportional to the selected subset.
+    if replicates is not None:
+        df = df[df["Replicate"].isin(replicates)].reset_index(drop=True)
+
+    if "seq_id" in df.columns:
+        # Compact format: normalize the unique-sequence array before expanding to all rows.
+        # This keeps peak memory at O(n_unique × emb_dim) during normalization rather than
+        # O(n_rows × emb_dim), which matters when n_rows >> n_unique (e.g. many replicates).
+        with open(f"{path}/layer{layer}_seq_to_emb.pkl", "rb") as f:
+            layer_embs = pickle.load(f)  # (n_unique_seqs, emb_dim)
+        if normalize == "by_layer":
+            mean = np.mean(layer_embs)
+            std = np.std(layer_embs)
+            layer_embs = (layer_embs - mean) / (std if std > 0 else 1.0)
+        elif normalize == "by_layer_dim":
+            means = np.mean(layer_embs, axis=0)
+            stds = np.std(layer_embs, axis=0)
+            stds[stds == 0] = 1.0
+            layer_embs = (layer_embs - means) / stds
+        df["Embedding"] = list(layer_embs[df["seq_id"].values])
+        df = df.drop(columns=["seq_id"])
+    return df
 
 
 ## ─────────────────────────────────────────────────────────────────────────────

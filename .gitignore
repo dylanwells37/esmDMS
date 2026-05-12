@@ -21,6 +21,8 @@ job_outs
 CLAUDE.md
 data
 testing
+plots/
+plots/*
 
 
 # Mac hidden files
