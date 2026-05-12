@@ -1,5 +1,5 @@
 {
-    "dataset_name": "BRCA1",
+    "dataset_name": "Ube4b",
     "layers": [0, 12, 30],
     "n_gens": 30,
     "save_every": 1,
