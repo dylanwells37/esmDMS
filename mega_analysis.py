@@ -1,14 +1,14 @@
 """
 # Simulation-based analyses (fitness, sel_coeffs)
-python mega_analysis.py data/embeddings plots/ --sim_config configs/simulation_config.json --fitness
-python mega_analysis.py data/embeddings plots/ --sim_config configs/simulation_config.json --sel_coeffs
-python mega_analysis.py data/embeddings plots/ --sim_config configs/simulation_config.json --fitness --sel_coeffs
+python mega_analysis.py Ube4b plots/ --sim_config configs/simulation_config.json --fitness
+python mega_analysis.py Ube4b plots/ --sim_config configs/simulation_config.json --sel_coeffs
+python mega_analysis.py Ube4b plots/ --sim_config configs/simulation_config.json --fitness --sel_coeffs
 
 # Embedding-only analyses (cross_replicate_consistency, shuffled_frequencies)
-python mega_analysis.py data/embeddings plots/ --embedding_config configs/inference_config.json --cross_replicate_consistency
+python mega_analysis.py Ube4b plots/ --embedding_config configs/inference_config.json --cross_replicate_consistency
 
 # Run all analyses (both configs required)
-python mega_analysis.py data/embeddings plots/ --sim_config configs/simulation_config.json --embedding_config configs/inference_config.json --all
+python mega_analysis.py Ube4b plots/ --sim_config configs/simulation_config.json --embedding_config configs/inference_config.json --all
 """
 
 import os
@@ -44,6 +44,7 @@ from analysis_helpers import (
     get_esm_individual_fitness_values,
     get_enrichment_ratios,
     plot_baseline_vs_esm_comparison,
+    plot_scatter_comparison,
 )
 
 from popDMS import mini_infer_independent_esm
@@ -61,9 +62,13 @@ NCOLS = 6
 # Config + simulation
 # ---------------------------------------------------------------------------
 
-def load_config(config_path):
+def load_config(config_path, dataset=None):
     with open(config_path) as f:
-        return json.load(f)
+        cfg = json.load(f)
+    if dataset is not None:
+        cfg = {k: os.path.expanduser(v.replace("{dataset}", dataset)) if isinstance(v, str) else v
+               for k, v in cfg.items()}
+    return cfg
 
 
 def _detect_layers(embedding_path, suffix=None):
@@ -237,7 +242,6 @@ def run_inference(embedding_path, inference_cfg, save_results=True, force_recomp
         with open(cache_path, "wb") as f:
             pickle.dump(result_tuple, f, protocol=4)
         print(f"Inference results saved to {cache_path}")
-
     return result_tuple
 
 
@@ -330,19 +334,6 @@ def plot_shuffled_frequencies_analysis(all_results, paths, cfg, output_dir):
                                      normalize=normalize)
 
 
-def plot_popDMS_comparison_analysis(all_results, paths, cfg, output_dir):
-    """Compare ESM-based inference results to popDMS results on the same dataset.
-    """
-    print("popDMS comparison analysis is not yet implemented.")
-
-
-    # First, we need to run the popDMS inference on the same data. Let's see how this is done
-    
-
-
-
-
-
 def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
     """Compare the inferred fitness of every individual within
     the embedding-based inference to the fitness inferred by popDMS on the same data.
@@ -351,6 +342,7 @@ def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
     reference_sequence_file = cfg.get("reference_sequence_file", None)
     haplotype_counts_file = cfg.get("haplotype_counts_file", None)
     fitness_fn            = cfg.get("fitness_fn", "plus1")
+    comment_char          = cfg.get("comment_char", None)
 
     if not pop_inference_path or not os.path.exists(pop_inference_path):
         print(f"popDMS inference file not found at {pop_inference_path}. "
@@ -360,9 +352,12 @@ def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
     with open(reference_sequence_file) as f:
         reference_sequence = f.read().strip()
 
-    # Part 1: load per-haplotype popDMS fitness values
+    normalize = cfg.get("normalize", "none")
+
+    # Part 1: load per-haplotype popDMS fitness values (same model as ESM-DMS)
     popdms_fits = get_individual_fitness_values(
-        pop_inference_path, haplotype_counts_file, reference_sequence
+        pop_inference_path, haplotype_counts_file, reference_sequence,
+        fitness_fn=fitness_fn, comment_char=comment_char,
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -372,12 +367,15 @@ def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
         embedding_path   = paths[path_name]
         layers           = sorted(detailed_results.keys())
 
-        # Part 2: for each layer, compute ESM-DMS inferred fitness per sequence
+        # Part 2: for each layer, compute ESM-DMS inferred fitness per sequence.
+        # normalize must match what was used during inference so embeddings are
+        # in the same space as s_joint.
         esm_fits_by_layer = {}
         for layer in layers:
             s_joint = detailed_results[layer][1]
             esm_fits_by_layer[layer] = get_esm_individual_fitness_values(
-                embedding_path, layer, s_joint, fitness_fn=fitness_fn
+                embedding_path, layer, s_joint, fitness_fn=fitness_fn,
+                normalize=normalize,
             )
 
         # Part 3: plot comparisons
@@ -389,6 +387,38 @@ def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
         plot_baseline_vs_esm_comparison(
             enrichment_ratios, esm_fits_by_layer, layers, output_dir, path_name,
             baseline_label="Enrichment Ratio",
+        )
+
+
+def popDMS_enrichment_comparison_analysis(all_results, paths, cfg, output_dir):
+    """Scatter plot comparing popDMS inferred fitness directly to log enrichment ratio."""
+    pop_inference_path    = cfg.get("pop_inference_path", None)
+    reference_sequence_file = cfg.get("reference_sequence_file", None)
+    haplotype_counts_file = cfg.get("haplotype_counts_file", None)
+    fitness_fn            = cfg.get("fitness_fn", "plus1")
+    comment_char          = cfg.get("comment_char", None)
+
+    if not pop_inference_path or not os.path.exists(pop_inference_path):
+        print(f"popDMS inference file not found at {pop_inference_path}. "
+              "Run popDMS inference first (e.g. via the data_analysis notebook).")
+        return
+
+    with open(reference_sequence_file) as f:
+        reference_sequence = f.read().strip()
+
+    popdms_fits = get_individual_fitness_values(
+        pop_inference_path, haplotype_counts_file, reference_sequence,
+        fitness_fn=fitness_fn, comment_char=comment_char,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for path_name, _ in all_results.items():
+        embedding_path = paths[path_name]
+        enrichment_ratios = get_enrichment_ratios(embedding_path)
+        plot_scatter_comparison(
+            popdms_fits, enrichment_ratios, output_dir, path_name,
+            x_label="popDMS Fitness", y_label="Enrichment Ratio",
         )
 
 
@@ -431,6 +461,10 @@ ANALYSES = {
         popDMS_esmDMS_comparison_analysis,
         "Compare per-individual ESM-DMS inferred fitness to popDMS fitness",
     ),
+    "popDMS_enrichment_comparison": (
+        popDMS_enrichment_comparison_analysis,
+        "Scatter plot comparing popDMS inferred fitness directly to log enrichment ratio",
+    ),
 }
 
 # Now categorize the analyses by which need simulation results vs just embeddings
@@ -447,8 +481,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run simulation and modular analyses on an embedding dataframe."
     )
-    parser.add_argument("embedding_path",
-                        help="Path to embedding data directory (containing layer0/, layer1/, … subdirs)")
+    parser.add_argument("dataset",
+                        help="Dataset name (e.g. Ube4b); substituted for {dataset} in all config paths")
     parser.add_argument("--sim_config", help="Path to JSON config file (simulation parameters, optional)")
     parser.add_argument("--embedding_config", help="Path to JSON config file (embedding parameters, optional)")
     parser.add_argument("output_dir", help="Directory to write output plots")
@@ -469,8 +503,7 @@ def main():
 
     args = parser.parse_args()
 
-    name  = os.path.basename(args.embedding_path.rstrip("/"))
-    paths = {name: args.embedding_path}
+    dataset = args.dataset
 
     selected = {flag for flag in ANALYSES if args.run_all or getattr(args, flag, False)}
     if not selected:
@@ -484,22 +517,28 @@ def main():
     if needs_emb and not args.embedding_config:
         parser.error(f"--embedding_config is required for: {', '.join(needs_emb)}")
 
-    sim_cfg = load_config(args.sim_config) if args.sim_config else {}
-    emb_cfg = load_config(args.embedding_config) if args.embedding_config else {}
+    sim_cfg = load_config(args.sim_config, dataset) if args.sim_config else {}
+    emb_cfg = load_config(args.embedding_config, dataset) if args.embedding_config else {}
     emb_cfg["normalize"]   = args.normalize
     emb_cfg["replicates"]  = args.replicates
+
+    # embedding_path comes from whichever config is loaded; both carry {dataset} → resolved path
+    embedding_path = emb_cfg.get("embedding_path") or sim_cfg.get("embedding_path")
+    if not embedding_path:
+        parser.error("embedding_path not found in any config file.")
+    paths = {dataset: embedding_path}
 
     all_results_sim = None
     all_results_emb = None
 
     if needs_sim:
-        print(f"Running simulation on: {args.embedding_path}")
-        all_results_sim = {name: run_simulation(args.embedding_path, sim_cfg)}
+        print(f"Running simulation on: {embedding_path}")
+        all_results_sim = {dataset: run_simulation(embedding_path, sim_cfg)}
 
     if needs_emb:
-        print(f"Running embedding inference on: {args.embedding_path}")
-        all_results_emb = {name: run_inference(args.embedding_path, emb_cfg,
-                                               force_recompute=args.force_recompute)}
+        print(f"Running embedding inference on: {embedding_path}")
+        all_results_emb = {dataset: run_inference(embedding_path, emb_cfg,
+                                                  force_recompute=args.force_recompute)}
 
     ran_any = False
     for flag, (fn, description) in ANALYSES.items():
@@ -512,10 +551,10 @@ def main():
         is_sim = flag in ANALYSES_REQUIRING_SIM
         all_results = all_results_sim if is_sim else all_results_emb
         if is_sim:
-            out_subdir = name
+            out_subdir = dataset
         else:
             rep_label  = ("reps" + "_".join(map(str, sorted(args.replicates)))) if args.replicates else None
-            out_subdir = os.path.join(name, args.normalize, *([rep_label] if rep_label else []))
+            out_subdir = os.path.join(dataset, args.normalize, *([rep_label] if rep_label else []))
         fn(all_results, paths, sim_cfg if is_sim else emb_cfg,
            output_dir=os.path.join(args.output_dir, out_subdir))
         ran_any = True

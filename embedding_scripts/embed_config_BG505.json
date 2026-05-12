@@ -11,6 +11,6 @@
         "BG505_mutvirus-3_codoncounts.csv"
     ],
     "reference_sequence_file": "BG505_Reference_sequence.txt",
-    "esm_model": "facebook/esm2_t30_150M_UR50D",
+    "esm_model": "facebook/esm2_t33_650M_UR50D",
     "embed_zeroes": false
 }

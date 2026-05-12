@@ -14,8 +14,7 @@
 # It is passed to the Python script so each job knows the total chunk count.
 #
 # Examples — embed BF520 sequences across 10 jobs:
-#   sbatch --array=0-9 embedding_scripts/submit_embed_array.sh \
-#       embedding_scripts/embed_config_BF520.json BF520_embeddings.pkl 10
+#   sbatch --array=0-9 embedding_scripts/submit_embed_array.sh embedding_scripts/embed_config_BF520.json BF520_embeddings.pkl 10
 #
 # Optional flags forwarded to embed_sequences.py:
 #   --embed_zeroes      embed sequences with zero pre-selection counts
