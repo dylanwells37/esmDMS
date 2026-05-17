@@ -187,11 +187,11 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
                             temp_list.append(st.pearsonr(s_temp[i], s_temp[j]).statistic)
                 corrs_list.append(temp_list)
 
-            if plot_gamma and verbose:
+            """if plot_gamma and verbose:
                 print(f"corrs_list: {corrs_list}")
                 print(f"gamma_values: {gamma_vals}")
                 print(f"corrs: {corrs}")
-                plot_regularization_all(corrs_list, gamma_vals)
+                plot_regularization_all(corrs_list, gamma_vals)"""
 
             gamma_sub = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
 

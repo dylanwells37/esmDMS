@@ -22,6 +22,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
 
 pwd = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
 if not os.path.exists(pwd):
@@ -39,6 +40,7 @@ from analysis_helpers import (
     plot_true_vs_inferred_fitness,
     plot_true_vs_inferred_sel_coeffs,
     plot_cross_replicate_consistency,
+    plot_shuffled_consistency,
     plot_fitness_trajectories,
     get_individual_fitness_values,
     get_esm_individual_fitness_values,
@@ -216,6 +218,7 @@ def run_inference(embedding_path, inference_cfg, save_results=True, force_recomp
             if os.path.exists(emb_path):
                 print(f"Layer {layer} data missing — regenerating from {emb_path}", file=sys.stderr)
                 embedding_df = pd.read_pickle(emb_path)
+                embedding_df = embedding_df[embedding_df["Embedding"].notna()]
                 emb_df_to_inference_dfs(embedding_df, embedding_path)
                 break
             else:
@@ -251,12 +254,16 @@ def run_simulation(embedding_path, simulation_cfg):
     for layer in layers:
         df_path = os.path.join(embedding_path, f"layer{layer}_sim_df.pkl")
         if not os.path.exists(df_path):
-            print(f"ERROR: Missing final_df.pkl for layer {layer} at {df_path}", file=sys.stderr)
+            print(f"ERROR: Missing sim_df.pkl for layer {layer} at {df_path}", file=sys.stderr)
             # Check if the embedding_df exists, if so, make the simulation layer dfs
             directory_name = os.path.basename(embedding_path.rstrip("/"))
             emb_path = os.path.join(embedding_path, f"{directory_name}_embeddings.pkl")
             if os.path.exists(emb_path):
                 embedding_df = pd.read_pickle(emb_path)
+
+                # Drop None embeddings if they exist
+                embedding_df = embedding_df[embedding_df["Embedding"].notna()]
+
                 emb_df_to_sim_dfs(embedding_df, embedding_path)
                 break
             else:
@@ -287,7 +294,8 @@ def plot_cross_replicate_consistency_analysis(all_results, paths, cfg, output_di
     embedding_path = next(iter(paths.values()))
     layers = cfg.get("layers") or _detect_layers(embedding_path)
     plot_cross_replicate_consistency(all_results, layers, output_dir=output_dir,
-                                     normalize=cfg.get("normalize", "none"))
+                                     normalize=cfg.get("normalize", "none"),
+                                     every_n=cfg.get("every_n", 1))
 
 
 
@@ -303,6 +311,8 @@ def plot_shuffled_frequencies_analysis(all_results, paths, cfg, output_dir):
     replicates = cfg.get("replicates")
     rng = np.random.default_rng()
     shuffled_all_results = {}
+
+    layers = None
 
     for name, embedding_path in paths.items():
         layers = cfg.get("layers") or _detect_layers(embedding_path)
@@ -331,7 +341,59 @@ def plot_shuffled_frequencies_analysis(all_results, paths, cfg, output_dir):
 
     shuffled_output_dir = os.path.join(output_dir, "shuffled")
     plot_cross_replicate_consistency(shuffled_all_results, layers, output_dir=shuffled_output_dir,
-                                     normalize=normalize)
+                                     normalize=normalize, every_n=cfg.get("every_n", 1))
+
+
+def plot_shuffled_consistency_analysis(all_results, paths, cfg, output_dir):
+    """For each dataset, run shuffled-frequency inference and collect per-layer
+    mean cross-replicate correlations. Then plot whether the same layers show
+    consistently high correlations across datasets.
+
+    A high cross-dataset profile correlation means the spurious signal is
+    structural (e.g. count depth or embedding geometry); low correlation means
+    it is noise that varies independently per experiment.
+    """
+    normalize  = cfg.get("normalize", "none")
+    replicates = cfg.get("replicates")
+    rng = np.random.default_rng()
+
+    # {dataset_name: {layer: (mean_r, std_r)}}
+    layer_stats = {}
+
+    for name, embedding_path in paths.items():
+        layers = cfg.get("layers") or _detect_layers(embedding_path)
+        stats_this = {}
+
+        for layer in layers:
+            layer_df = load_inference_df(layer, embedding_path, normalize=normalize, replicates=replicates)
+
+            for _, group_idx in layer_df.groupby(["Replicate", "Generation"]).groups.items():
+                freqs = layer_df.loc[group_idx, "Frequency"].values.copy()
+                rng.shuffle(freqs)
+                layer_df.loc[group_idx, "Frequency"] = freqs
+
+            n_reps = layer_df["Replicate"].nunique()
+            data = mini_infer_independent_esm(
+                layer_df, n_replicates=n_reps, gamma=None, corr_cutoff_pct=0.5,
+                max_reads=1e3, output_dir=None, name="esm_inference_shuffled",
+                plot_gamma=False, verbose=False, calc_error_bars=False,
+                variance_cutoff=0.0, infer_ignored_dims=True,
+            )
+            s_reps = data[2]
+            del layer_df, data
+
+            off_diag = [
+                pearsonr(s_reps[i], s_reps[j])[0]
+                for i in range(len(s_reps))
+                for j in range(i + 1, len(s_reps))
+            ]
+            stats_this[layer] = (float(np.mean(off_diag)), float(np.std(off_diag)))
+
+        layer_stats[name] = stats_this
+        print(f"[{name}] shuffled consistency computed for {len(stats_this)} layers")
+
+    all_layers = sorted(set().union(*(s.keys() for s in layer_stats.values())))
+    plot_shuffled_consistency(layer_stats, all_layers, output_dir=output_dir, normalize=normalize)
 
 
 def popDMS_esmDMS_comparison_analysis(all_results, paths, cfg, output_dir):
@@ -457,6 +519,10 @@ ANALYSES = {
         plot_shuffled_frequencies_analysis,
         "Run cross-replicate consistency analysis on data with shuffled post-selection frequencies",
     ),
+    "shuffled_consistency": (
+        plot_shuffled_consistency_analysis,
+        "Compare per-layer shuffled correlations across multiple datasets to identify structural artifacts",
+    ),
     "popDMS_comparison": (
         popDMS_esmDMS_comparison_analysis,
         "Compare per-individual ESM-DMS inferred fitness to popDMS fitness",
@@ -481,8 +547,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run simulation and modular analyses on an embedding dataframe."
     )
-    parser.add_argument("dataset",
-                        help="Dataset name (e.g. Ube4b); substituted for {dataset} in all config paths")
+    parser.add_argument("dataset", nargs="+",
+                        help="Dataset name(s) (e.g. Ube4b); substituted for {dataset} in all config paths. "
+                             "Pass multiple names for multi-dataset analyses like --shuffled_consistency.")
     parser.add_argument("--sim_config", help="Path to JSON config file (simulation parameters, optional)")
     parser.add_argument("--embedding_config", help="Path to JSON config file (embedding parameters, optional)")
     parser.add_argument("output_dir", help="Directory to write output plots")
@@ -500,10 +567,12 @@ def main():
                         help="Normalize embeddings before inference: none (default), by_layer (global z-score per layer), by_layer_dim (per-dimension z-score per layer)")
     parser.add_argument("--replicates", nargs="+", type=int, default=None, metavar="REP",
                         help="Restrict inference to a subset of replicate IDs, e.g. --replicates 1 2 3 6 7 8")
+    parser.add_argument("--every_n", type=int, default=None, metavar="N",
+                        help="Only produce per-layer plots every N layers (default: 1, i.e. every layer)")
 
     args = parser.parse_args()
 
-    dataset = args.dataset
+    datasets = args.dataset  # list of one or more dataset names
 
     selected = {flag for flag in ANALYSES if args.run_all or getattr(args, flag, False)}
     if not selected:
@@ -517,28 +586,43 @@ def main():
     if needs_emb and not args.embedding_config:
         parser.error(f"--embedding_config is required for: {', '.join(needs_emb)}")
 
-    sim_cfg = load_config(args.sim_config, dataset) if args.sim_config else {}
-    emb_cfg = load_config(args.embedding_config, dataset) if args.embedding_config else {}
-    emb_cfg["normalize"]   = args.normalize
-    emb_cfg["replicates"]  = args.replicates
+    # Simulation analyses only support a single dataset; use the first one.
+    primary_dataset = datasets[0]
+    sim_cfg = load_config(args.sim_config, primary_dataset) if args.sim_config else {}
 
-    # embedding_path comes from whichever config is loaded; both carry {dataset} → resolved path
-    embedding_path = emb_cfg.get("embedding_path") or sim_cfg.get("embedding_path")
-    if not embedding_path:
+    # Base emb config (normalize/layers/etc.) from first dataset; path overridden per dataset below.
+    emb_cfg = load_config(args.embedding_config, primary_dataset) if args.embedding_config else {}
+    emb_cfg["normalize"]  = args.normalize
+    emb_cfg["replicates"] = args.replicates
+    if args.every_n is not None:
+        emb_cfg["every_n"] = args.every_n
+
+    # Build paths dict: resolve embedding_path for every dataset.
+    paths = {}
+    for ds in datasets:
+        cfg_ds = load_config(args.embedding_config, ds) if args.embedding_config else {}
+        emb_path = cfg_ds.get("embedding_path") or sim_cfg.get("embedding_path")
+        if emb_path:
+            paths[ds] = emb_path
+    if not paths:
         parser.error("embedding_path not found in any config file.")
-    paths = {dataset: embedding_path}
 
     all_results_sim = None
     all_results_emb = None
 
     if needs_sim:
-        print(f"Running simulation on: {embedding_path}")
-        all_results_sim = {dataset: run_simulation(embedding_path, sim_cfg)}
+        primary_path = paths[primary_dataset]
+        print(f"Running simulation on: {primary_path}")
+        all_results_sim = {primary_dataset: run_simulation(primary_path, sim_cfg)}
 
     if needs_emb:
-        print(f"Running embedding inference on: {embedding_path}")
-        all_results_emb = {dataset: run_inference(embedding_path, emb_cfg,
-                                                  force_recompute=args.force_recompute)}
+        all_results_emb = {}
+        for ds, emb_path in paths.items():
+            print(f"Running embedding inference on: {emb_path}")
+            all_results_emb[ds] = run_inference(emb_path, emb_cfg,
+                                                force_recompute=args.force_recompute)
+
+    rep_label = ("reps" + "_".join(map(str, sorted(args.replicates)))) if args.replicates else None
 
     ran_any = False
     for flag, (fn, description) in ANALYSES.items():
@@ -551,10 +635,12 @@ def main():
         is_sim = flag in ANALYSES_REQUIRING_SIM
         all_results = all_results_sim if is_sim else all_results_emb
         if is_sim:
-            out_subdir = dataset
+            out_subdir = primary_dataset
+        elif len(datasets) == 1:
+            out_subdir = os.path.join(primary_dataset, args.normalize, *([rep_label] if rep_label else []))
         else:
-            rep_label  = ("reps" + "_".join(map(str, sorted(args.replicates)))) if args.replicates else None
-            out_subdir = os.path.join(dataset, args.normalize, *([rep_label] if rep_label else []))
+            # Multiple datasets: omit per-dataset prefix; analyses write per-dataset filenames themselves.
+            out_subdir = os.path.join(args.normalize, *([rep_label] if rep_label else []))
         fn(all_results, paths, sim_cfg if is_sim else emb_cfg,
            output_dir=os.path.join(args.output_dir, out_subdir))
         ran_any = True

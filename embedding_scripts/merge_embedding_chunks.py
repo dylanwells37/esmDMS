@@ -52,7 +52,7 @@ def main():
     chunks = [pd.read_pickle(p) for p in chunk_paths]
     merged = pd.concat(chunks, ignore_index=True)
 
-
+    print(f"head:\n{merged.head()}")
     # Build a lookup from ProteinSequence -> Embedding using only non-None rows
     seq_to_embedding = (
         merged[merged["Embedding"].notna()]

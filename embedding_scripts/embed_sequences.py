@@ -61,14 +61,16 @@ def get_reference_sequence_from_wildtypes(codoncounts_filepath):
 def build_sequence_dataframe(pre_files, post_files, reference_seq):
     """
     Reconstruct single-mutant protein sequences from codon-count files.
-    Returns a DataFrame with columns PreNums, PostNums, ProteinSequence.
+    Returns a long-format DataFrame with columns:
+        ProteinSequence, Replicate, Generation, Frequency
 
-    Sequences that appear in multiple replicates are aggregated (counts summed).
+    Generation 0 = pre-selection, Generation 1 = post-selection.
+    Replicate is 1-indexed. Sequences appearing at multiple codons have their
+    counts summed.
     """
     assert len(pre_files) == len(post_files), \
         "Number of pre- and post-selection files must match."
 
-    # Load all arrays, verify consistency across replicates
     pre_arrays, post_arrays = [], []
     wildtypes_master, columns_master = None, None
 
@@ -97,30 +99,33 @@ def build_sequence_dataframe(pre_files, post_files, reference_seq):
     records = []
     n_sites = pre_arrays[0].shape[0]
     n_variants = pre_arrays[0].shape[1]
+    n_reps = len(pre_arrays)
 
     for i in range(n_sites):
-        rows_pre = [a[i] for a in pre_arrays]
-        rows_post = [a[i] for a in post_arrays]
         for j in range(n_variants):
             if col_aa[j] == wt_aa[i]:
                 continue
-            pre_nums = [int(r[j]) for r in rows_pre]
-            post_nums = [int(r[j]) for r in rows_post]
             mut_seq = reference_seq[:i] + col_aa[j] + reference_seq[i + 1:]
-            records.append({
-                "PreNums": pre_nums,
-                "PostNums": post_nums,
-                "ProteinSequence": mut_seq,
-            })
+            for rep_idx in range(n_reps):
+                records.append({
+                    "ProteinSequence": mut_seq,
+                    "Replicate": rep_idx + 1,
+                    "Generation": 0,
+                    "Frequency": int(pre_arrays[rep_idx][i, j]),
+                })
+                records.append({
+                    "ProteinSequence": mut_seq,
+                    "Replicate": rep_idx + 1,
+                    "Generation": 1,
+                    "Frequency": int(post_arrays[rep_idx][i, j]),
+                })
 
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(records, columns=["ProteinSequence", "Replicate", "Generation", "Frequency"])
 
-    # Aggregate duplicate sequences (same mutation observed at multiple codons is rare
-    # but possible; also ensures the output is deduplicated)
-    df = df.groupby("ProteinSequence", as_index=False).agg({
-        "PreNums": lambda x: [sum(v) for v in zip(*x)],
-        "PostNums": lambda x: [sum(v) for v in zip(*x)],
-    })
+    if not df.empty:
+        df = df.groupby(
+            ["ProteinSequence", "Replicate", "Generation"], as_index=False
+        ).agg({"Frequency": "sum"})
 
     return df
 

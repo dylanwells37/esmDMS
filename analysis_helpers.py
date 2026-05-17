@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, spearmanr, rankdata
 
 sns.set_theme(style="darkgrid")
 
@@ -221,12 +221,15 @@ def plot_true_vs_inferred_sel_coeffs(all_results, paths, cfg, output_dir, n_cols
         plt.close()
 
 
-def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir=None, corr='pearson', normalize="none"):
+def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir=None, corr='pearson', normalize="none", every_n=1):
     """Cross-replicate consistency of inferred selection coefficients.
 
-    Produces two complementary plots per layer:
+    Produces per-layer plots (heatmap + scatter) for every ``every_n``-th layer
+    (index 0, n, 2n, …) and a summary line plot of mean correlation across all layers.
+
       *_heatmap.png  — symmetric n_reps × n_reps correlation matrix (compact overview)
       *_scatter.png  — individual scatter plot for every replicate pair (detailed view)
+      *_summary.png  — mean ± std correlation vs layer across all layers
 
     corr : 'pearson' or 'spearman'
     """
@@ -250,7 +253,10 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir
     for path_name, results in all_results.items():
         detailed_results = results[2]
 
-        for layer in layers:
+        # summary data: layer -> (mean_r, std_r)
+        summary_stats = {}
+
+        for layer_idx, layer in enumerate(layers):
             if layer not in detailed_results:
                 print(f"[{path_name}]  Layer {layer}: no inference results")
                 continue
@@ -259,7 +265,7 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir
             n_reps = len(s_reps)
             print(f"n_reps for {path_name} layer {layer}: {n_reps}")
 
-            # Compute all pairwise correlations once; reused by both plots
+            # Compute all pairwise correlations once; reused by both plots + summary
             corr_matrix   = np.eye(n_reps)
             pair_vals     = {}   # (i, j) -> (val, pval)
             off_diag_vals = []
@@ -272,7 +278,12 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir
 
             mean_r = np.mean(off_diag_vals)
             std_r  = np.std(off_diag_vals)
+            summary_stats[layer] = (mean_r, std_r)
             suptitle_base = f"[{path_name}]  Layer {layer} — Cross-replicate consistency"
+
+            # Only produce per-layer plots for every n-th layer
+            if layer_idx % every_n != 0:
+                continue
 
             # ── Heatmap ──────────────────────────────────────────────────────
             cell_in = np.clip(5.5 / n_reps, 0.45, 0.85)
@@ -335,6 +346,116 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir
             plt.tight_layout()
             _norm_annotation(fig)
             _save(fig, f"{path_name}_layer{layer}_cross_replicate_scatter.png")
+
+        # ── Summary: mean correlation across layers ───────────────────────
+        if summary_stats:
+            summ_layers = sorted(summary_stats.keys())
+            mean_rs = [summary_stats[l][0] for l in summ_layers]
+            std_rs  = [summary_stats[l][1] for l in summ_layers]
+
+            fig, ax = plt.subplots(figsize=(max(6, len(summ_layers) * 0.35), 4))
+            ax.plot(summ_layers, mean_rs, marker="o", linewidth=1.5, markersize=4)
+            ax.fill_between(summ_layers,
+                            [m - s for m, s in zip(mean_rs, std_rs)],
+                            [m + s for m, s in zip(mean_rs, std_rs)],
+                            alpha=0.25)
+            ax.set_xlabel("Layer")
+            ax.set_ylabel(f"Mean pairwise {corr_sym}")
+            ax.set_title(f"[{path_name}]  Cross-replicate consistency across layers")
+            ax.set_ylim(-1, 1)
+            ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+            plt.tight_layout()
+            _norm_annotation(fig)
+            _save(fig, f"{path_name}_cross_replicate_summary.png")
+
+
+def plot_shuffled_consistency(layer_stats_by_dataset, layers, output_dir=None, normalize="none"):
+    """Compare per-layer shuffled cross-replicate correlations across multiple datasets.
+
+    layer_stats_by_dataset : {dataset_name: {layer: (mean_r, std_r)}}
+
+    Produces two plots:
+      shuffled_consistency_overlay.png          — overlaid mean r vs layer, one line per dataset
+      shuffled_consistency_profile_correlation.png — heatmap of how correlated the r-per-layer
+                                                     profiles are across datasets (only if ≥2)
+    """
+    def _save(fig, path):
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            fig.savefig(os.path.join(output_dir, path), bbox_inches="tight", dpi=100)
+        plt.show()
+        plt.close(fig)
+
+    def _norm_annotation(fig):
+        if normalize != "none":
+            fig.text(0.5, -0.01, f"Normalization: {normalize}", ha="center",
+                     fontsize=9, style="italic", color="gray")
+
+    all_datasets = list(layer_stats_by_dataset.keys())
+
+    # ── Overlay: mean r vs layer, one line per dataset ────────────────────
+    fig, ax = plt.subplots(figsize=(max(6, len(layers) * 0.35), 4))
+    for name, stats in layer_stats_by_dataset.items():
+        present = sorted(l for l in layers if l in stats)
+        mean_rs = [stats[l][0] for l in present]
+        std_rs  = [stats[l][1] for l in present]
+        line, = ax.plot(present, mean_rs, marker="o", linewidth=1.5, markersize=4, label=name)
+        ax.fill_between(present,
+                        [m - s for m, s in zip(mean_rs, std_rs)],
+                        [m + s for m, s in zip(mean_rs, std_rs)],
+                        alpha=0.15, color=line.get_color())
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Mean pairwise r (shuffled data)")
+    ax.set_title("Cross-replicate consistency on shuffled frequencies — by dataset")
+    ax.set_ylim(-1, 1)
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    if len(all_datasets) > 1:
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    _norm_annotation(fig)
+    _save(fig, "shuffled_consistency_overlay.png")
+
+    # ── Profile correlation heatmap (only meaningful with ≥2 datasets) ───
+    if len(all_datasets) < 2:
+        return
+
+    profile_matrix = np.array([
+        [layer_stats_by_dataset[name].get(l, (np.nan, np.nan))[0] for l in layers]
+        for name in all_datasets
+    ])
+    n_ds = len(all_datasets)
+    corr_mat = np.full((n_ds, n_ds), np.nan)
+    np.fill_diagonal(corr_mat, 1.0)
+    for i in range(n_ds):
+        for j in range(i + 1, n_ds):
+            mask = ~(np.isnan(profile_matrix[i]) | np.isnan(profile_matrix[j]))
+            if mask.sum() >= 3:
+                val, _ = pearsonr(profile_matrix[i][mask], profile_matrix[j][mask])
+            else:
+                val = np.nan
+            corr_mat[i, j] = corr_mat[j, i] = val
+
+    cell_in = np.clip(5.5 / n_ds, 0.45, 0.85)
+    fig_w = n_ds * cell_in + 1.8
+    fig, ax = plt.subplots(figsize=(fig_w, fig_w * 0.88))
+    im = ax.imshow(corr_mat, vmin=-1, vmax=1, cmap="RdBu_r", aspect="equal")
+    plt.colorbar(im, ax=ax, label="r", fraction=0.046, pad=0.04)
+    fs = int(np.clip(54 / n_ds, 6, 11))
+    for i in range(n_ds):
+        for j in range(n_ds):
+            v = corr_mat[i, j]
+            txt = f"{v:.2f}" if not np.isnan(v) else "n/a"
+            ax.text(j, i, txt, ha="center", va="center",
+                    fontsize=fs, color="white" if (not np.isnan(v) and abs(v) > 0.6) else "black")
+    ax.set_xticks(range(n_ds))
+    ax.set_yticks(range(n_ds))
+    ax.set_xticklabels(all_datasets, rotation=45, ha="right", fontsize=fs)
+    ax.set_yticklabels(all_datasets, fontsize=fs)
+    ax.set_title("Correlation of shuffled-r profiles across datasets\n"
+                 "(high r → same layers are spuriously correlated)")
+    plt.tight_layout()
+    _norm_annotation(fig)
+    _save(fig, "shuffled_consistency_profile_correlation.png")
 
 
 def plot_fitness_trajectories(all_results, n_cols=6, output_dir=None):
@@ -480,8 +601,7 @@ def plot_scatter_comparison(x_fits, y_fits, output_dir, path_name,
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(x, y, alpha=0.4, s=8, color="steelblue", rasterized=True)
-    lo = min(x.min(), y.min()) - 0.05
-    hi = max(x.max(), y.max()) + 0.05
+    lo, hi = _ax_limits(x, y)
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
@@ -499,9 +619,63 @@ def plot_scatter_comparison(x_fits, y_fits, output_dir, path_name,
     plt.close()
 
 
+def _ax_limits(x, y, pad_frac=0.05):
+    """Axis limits with range-proportional padding, safe for negative values."""
+    lo_raw = min(x.min(), y.min())
+    hi_raw = max(x.max(), y.max())
+    pad = max(hi_raw - lo_raw, 1e-6) * pad_frac
+    return lo_raw - pad, hi_raw + pad
+
+
+def _plot_top_bottom_panel(ax, x, y, top_n, x_label, y_label, title, highlight_axis="x"):
+    """Scatter all points; highlight top-N and bottom-N by the chosen axis.
+
+    highlight_axis : 'x' ranks by x (baseline), 'y' ranks by y (ESM-DMS).
+    """
+    ref = x if highlight_axis == "x" else y
+    order = np.argsort(ref)
+    idx_bot = order[:top_n]
+    idx_top = order[-top_n:]
+    idx_mid = order[top_n:-top_n] if len(order) > 2 * top_n else np.array([], dtype=int)
+
+    lo, hi = _ax_limits(x, y)
+
+    ax.scatter(x[idx_mid], y[idx_mid], alpha=0.25, s=6,  color="gray",        rasterized=True, label="rest")
+    ax.scatter(x[idx_bot], y[idx_bot], alpha=0.85, s=30, color="tab:purple",   rasterized=True, label=f"bottom {top_n}")
+    ax.scatter(x[idx_top], y[idx_top], alpha=0.85, s=30, color="tab:orange",   rasterized=True, label=f"top {top_n}")
+    ax.plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel(x_label, fontsize=8)
+    ax.set_ylabel(y_label, fontsize=8)
+    ax.set_title(title, fontsize=9)
+    ax.tick_params(labelsize=7)
+    ax.legend(fontsize=7, markerscale=1.4, loc="upper left")
+
+
+def _plot_rank_panel(ax, x, y, x_label, y_label, title):
+    """Scatter rank(x) vs rank(y); annotate with Spearman ρ."""
+    rx = rankdata(x).astype(float)
+    ry = rankdata(y).astype(float)
+    sr, _ = spearmanr(x, y)
+
+    ax.scatter(rx, ry, alpha=0.35, s=6, color="steelblue", rasterized=True)
+    n = len(rx)
+    ax.plot([1, n], [1, n], "r--", linewidth=0.8)
+    ax.set_xlim(0, n + 1)
+    ax.set_ylim(0, n + 1)
+    ax.set_xlabel(f"Rank: {x_label}", fontsize=8)
+    ax.set_ylabel(f"Rank: {y_label}", fontsize=8)
+    ax.set_title(title, fontsize=9)
+    ax.tick_params(labelsize=7)
+    ax.annotate(f"ρ = {sr:.3f}", xy=(0.05, 0.93), xycoords="axes fraction",
+                ha="left", va="top", fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.85))
+
+
 def plot_baseline_vs_esm_comparison(baseline_fits, esm_fits_by_layer, layers,
                                     output_dir, path_name, baseline_label="popDMS Fitness",
-                                    z_norm_fits=False):
+                                    z_norm_fits=False, top_n=10):
     """Plot a baseline fitness measure vs ESM-DMS inferred fitness.
 
     Produces:
@@ -580,8 +754,7 @@ def plot_baseline_vs_esm_comparison(baseline_fits, esm_fits_by_layer, layers,
         color = "seagreen" if layer == best_layer else "steelblue"
         label = f"Layer {layer}" + (" (best)" if layer == best_layer else "")
         ax.scatter(x, y, alpha=0.4, s=8, color=color, rasterized=True)
-        lo = min(x.min(), y.min()) - 0.05
-        hi = max(x.max(), y.max()) + 0.05
+        lo, hi = _ax_limits(x, y)
         ax.plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
@@ -599,6 +772,44 @@ def plot_baseline_vs_esm_comparison(baseline_fits, esm_fits_by_layer, layers,
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{file_tag}_vs_esm_scatter_{path_name}{title_suffix}.png"),
                 dpi=80, bbox_inches="tight")
+    plt.close()
+
+    # ── Top / bottom-N highlight plots (best layer only) ─────────────────────
+    x_best, y_best = _align_pair(baseline_fits, esm_fits_by_layer[best_layer])
+    if z_norm_fits:
+        x_best = (x_best - np.mean(x_best)) / (np.std(x_best) if np.std(x_best) > 0 else 1.0)
+        y_best = (y_best - np.mean(y_best)) / (np.std(y_best) if np.std(y_best) > 0 else 1.0)
+    eff_n = min(top_n, len(x_best) // 4)  # guard against tiny datasets
+
+    if eff_n >= 1:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        _plot_top_bottom_panel(axes[0], x_best, y_best, eff_n,
+                               x_label=baseline_label, y_label="ESM-DMS Fitness",
+                               title=f"Highlighted by {baseline_label} rank",
+                               highlight_axis="x")
+        _plot_top_bottom_panel(axes[1], x_best, y_best, eff_n,
+                               x_label=baseline_label, y_label="ESM-DMS Fitness",
+                               title="Highlighted by ESM-DMS rank",
+                               highlight_axis="y")
+        fig.suptitle(
+            f"Top/bottom {eff_n} — {baseline_label} vs ESM-DMS (layer {best_layer}) — {path_name}",
+            fontsize=12,
+        )
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir,
+                                 f"{file_tag}_vs_esm_top_bottom_{path_name}{title_suffix}.png"),
+                    dpi=100, bbox_inches="tight")
+        plt.close()
+
+    # ── Rank scatter (best layer) ─────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(5, 5))
+    _plot_rank_panel(ax, x_best, y_best,
+                     x_label=baseline_label, y_label="ESM-DMS Fitness",
+                     title=f"Rank comparison — layer {best_layer} — {path_name}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir,
+                             f"{file_tag}_vs_esm_ranks_{path_name}{title_suffix}.png"),
+                dpi=100, bbox_inches="tight")
     plt.close()
 
 

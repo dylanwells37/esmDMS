@@ -5,5 +5,6 @@
     "reference_sequence_file": "~/popDMS/esmDMS/data/raw_data/{dataset}_reference_sequence.dat",
     "haplotype_counts_file": "~/popDMS/esmDMS/data/raw_data/{dataset}_nucleotide_counts.csv",
     "fitness_fn": "plus1",
-    "comment_char": "#"
+    "comment_char": "#",
+    "every_n": 1
 }
