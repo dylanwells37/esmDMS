@@ -7,5 +7,7 @@
         "/Users/dylanwells/popDMS/esmDMS/data/raw_data/BF520_mutvirus-1_codoncounts.csv"
     ],
     "esm_model": "facebook/esm2_t6_8M_UR50D",
-    "embed_zeroes": false
+    "embed_zeroes": false,
+    "embedding_method": "mean_pool",
+    "pool_mutations": false
 }

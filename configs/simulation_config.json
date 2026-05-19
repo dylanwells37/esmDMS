@@ -1,6 +1,10 @@
 {
-    "embedding_path": "~/popDMS/esmDMS/data/{dataset}",
-    "layers": [0, 12, 30],
+    "embedding_path": "~/popDMS/esmDMS/data/sequence_data/{dataset}_{embedding_method}",
+    "layers": [
+        0,
+        12,
+        30
+    ],
     "n_gens": 30,
     "save_every": 1,
     "fitness_fn": "exp",
@@ -10,5 +14,6 @@
     "run_inference": true,
     "run_gamma": false,
     "calc_error_bars": false,
-    "infer_ignored": true
+    "infer_ignored": true,
+    "embedding_method": "mean_pool"
 }

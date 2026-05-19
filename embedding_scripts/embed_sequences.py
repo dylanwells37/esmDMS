@@ -109,23 +109,25 @@ def build_sequence_dataframe(pre_files, post_files, reference_seq):
             for rep_idx in range(n_reps):
                 records.append({
                     "ProteinSequence": mut_seq,
+                    "MutationSites": [i],
                     "Replicate": rep_idx + 1,
                     "Generation": 0,
                     "Frequency": int(pre_arrays[rep_idx][i, j]),
                 })
                 records.append({
                     "ProteinSequence": mut_seq,
+                    "MutationSites": [i],
                     "Replicate": rep_idx + 1,
                     "Generation": 1,
                     "Frequency": int(post_arrays[rep_idx][i, j]),
                 })
 
-    df = pd.DataFrame(records, columns=["ProteinSequence", "Replicate", "Generation", "Frequency"])
+    df = pd.DataFrame(records, columns=["ProteinSequence", "MutationSites", "Replicate", "Generation", "Frequency"])
 
     if not df.empty:
         df = df.groupby(
             ["ProteinSequence", "Replicate", "Generation"], as_index=False
-        ).agg({"Frequency": "sum"})
+        ).agg({"MutationSites": "first", "Frequency": "sum"})
 
     return df
 
@@ -251,6 +253,7 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
 
         if hgvs_nt == "_wt":
             aa_seq = ref_aa_seq
+            mutation_sites = []
         else:
             substitutions = parse_hgvs_nt(hgvs_nt)
             if not substitutions:
@@ -259,6 +262,14 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
             if mut_nuc_seq is None:
                 continue
             aa_seq = translate_nuc_sequence(mut_nuc_seq)
+            if skip_stop_codons and "*" in aa_seq:
+                continue
+            mutation_sites = [
+                i for i, (ref_aa, alt_aa) in enumerate(zip(ref_aa_seq, aa_seq))
+                if ref_aa != alt_aa
+            ]
+            if not mutation_sites and aa_seq != ref_aa_seq:
+                continue
 
         for rep_name, gen_dict in seen.items():
             rep_idx = rep_name_to_idx[rep_name]
@@ -266,17 +277,18 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
                 freq = int(row[col_name]) if pd.notna(row.get(col_name)) else 0
                 records.append({
                     "ProteinSequence": aa_seq,
+                    "MutationSites": mutation_sites,
                     "Replicate": rep_idx,
                     "Generation": gen_idx,
                     "Frequency": freq,
                 })
 
-    result = pd.DataFrame(records, columns=["ProteinSequence", "Replicate", "Generation", "Frequency"])
+    result = pd.DataFrame(records, columns=["ProteinSequence", "MutationSites", "Replicate", "Generation", "Frequency"])
 
     if not result.empty:
         result = result.groupby(
             ["ProteinSequence", "Replicate", "Generation"], as_index=False
-        ).agg({"Frequency": "sum"})
+        ).agg({"MutationSites": "first", "Frequency": "sum"})
 
     return result
 
@@ -285,31 +297,138 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
 # ESM embedding
 # ---------------------------------------------------------------------------
 
+def _residue_token_mask(inputs):
+    """Mask real residue tokens, excluding CLS/EOS/padding special tokens."""
+    attention_mask = inputs["attention_mask"].bool()
+    special_mask = inputs.get("special_tokens_mask")
+    if special_mask is None:
+        return attention_mask
+    return attention_mask & ~special_mask.bool()
+
+
 def pool_sequence_representation(token_representations, inputs):
-    """Mean-pool token representations over non-padding positions."""
-    attention_mask = inputs["attention_mask"]
-    masked = token_representations * attention_mask.unsqueeze(-1)
+    """Mean-pool token representations over real residue positions."""
+    residue_mask = _residue_token_mask(inputs)
+    masked = token_representations * residue_mask.unsqueeze(-1)
     summed = masked.sum(dim=1)
-    counts = attention_mask.sum(dim=1).unsqueeze(-1)
+    counts = residue_mask.sum(dim=1).clamp(min=1).unsqueeze(-1)
     return (summed / counts).squeeze(0).cpu().numpy()  # (embedding_dim,)
 
 
-def embed_sequence(sequence, tokenizer, model):
+def cls_sequence_representation(token_representations):
+    """Return the CLS token representation."""
+    return token_representations[:, 0, :].squeeze(0).cpu().numpy()
+
+
+def mutation_site_representation(token_representations, mutation_sites, pool_mutations=False):
+    """Return residue embeddings at mutated positions.
+
+    mutation_sites are 0-indexed amino-acid positions. With special tokens
+    enabled for ESM models, residue i is token position i + 1.
     """
-    Return a (num_layers, embedding_dim) array of mean-pooled hidden states
-    for all transformer layers including the embedding layer.
+    if not mutation_sites:
+        return None
+    token_positions = [site + 1 for site in mutation_sites]
+    per_site = token_representations[:, token_positions, :].squeeze(0).cpu().numpy()
+    if pool_mutations:
+        return per_site.mean(axis=0)
+    return per_site
+
+
+def embed_sequence(sequence, tokenizer, model, embedding_method="mean_pool",
+                   mutation_sites=None, pool_mutations=False):
     """
-    inputs = tokenizer(sequence, return_tensors="pt", add_special_tokens=True)
+    Return hidden-state embeddings for all transformer layers.
+
+    embedding_method:
+      - mean_pool: (num_layers, embedding_dim)
+      - cls: (num_layers, embedding_dim)
+      - mutation_site with pool_mutations=True: (num_layers, embedding_dim)
+      - mutation_site with pool_mutations=False: (num_mutations, num_layers, embedding_dim)
+    """
+    inputs = tokenizer(
+        sequence,
+        return_tensors="pt",
+        add_special_tokens=True,
+        return_special_tokens_mask=True,
+    )
     with torch.no_grad():
         outputs = model(**inputs, output_hidden_states=True)
-    layer_embeddings = [
-        pool_sequence_representation(layer, inputs)
-        for layer in outputs.hidden_states
-    ]
-    return np.vstack(layer_embeddings)  # (num_layers, embedding_dim)
+    if embedding_method == "mean_pool":
+        layer_embeddings = [pool_sequence_representation(layer, inputs) for layer in outputs.hidden_states]
+        return np.vstack(layer_embeddings)
+    if embedding_method == "cls":
+        layer_embeddings = [cls_sequence_representation(layer) for layer in outputs.hidden_states]
+        return np.vstack(layer_embeddings)
+    if embedding_method == "mutation_site":
+        layer_embeddings = [
+            mutation_site_representation(layer, mutation_sites or [], pool_mutations=pool_mutations)
+            for layer in outputs.hidden_states
+        ]
+        if any(emb is None for emb in layer_embeddings):
+            return None
+        if pool_mutations:
+            return np.vstack(layer_embeddings)
+        return np.stack(layer_embeddings, axis=1)
+    raise ValueError(f"Unknown embedding_method: {embedding_method}")
 
 
-def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
+def _normalise_mutation_sites(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return []
+    if isinstance(value, (int, np.integer)):
+        return [int(value)]
+    return [int(v) for v in value]
+
+
+def _expand_unpooled_mutation_embeddings(seq_df, seq_to_emb):
+    rows = []
+    for _, row in seq_df.iterrows():
+        sites = _normalise_mutation_sites(row.get("MutationSites"))
+        emb = seq_to_emb.get(row["ProteinSequence"])
+        if emb is None:
+            base = row.to_dict()
+            base["Embedding"] = None
+            base["MutationSite"] = np.nan
+            base["MutationSiteIndex"] = np.nan
+            rows.append(base)
+            continue
+        for site_idx, site in enumerate(sites):
+            base = row.to_dict()
+            base["Embedding"] = emb[site_idx]
+            base["MutationSite"] = site
+            base["MutationSiteIndex"] = site_idx
+            rows.append(base)
+    return pd.DataFrame(rows)
+
+
+def _expand_unpooled_mutation_embeddings_wide(seq_df, embeddings):
+    rows = []
+    for (_, row), emb in zip(seq_df.iterrows(), embeddings):
+        sites = _normalise_mutation_sites(row.get("MutationSites"))
+        if emb is None:
+            base = row.to_dict()
+            base["Embeddings"] = None
+            base["MutationSite"] = np.nan
+            base["MutationSiteIndex"] = np.nan
+            rows.append(base)
+            continue
+        for site_idx, site in enumerate(sites):
+            base = row.to_dict()
+            base["Embeddings"] = emb[site_idx]
+            base["MutationSite"] = site
+            base["MutationSiteIndex"] = site_idx
+            rows.append(base)
+    return pd.DataFrame(rows)
+
+
+def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None,
+                    embedding_method="mean_pool", pool_mutations=False):
     """
     Embed protein sequences and return an annotated DataFrame.
 
@@ -343,7 +462,19 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
 
         for i, seq in enumerate(unique_seqs):
             has_observations = embed_zeroes or total_freq.get(seq, 0) > 0
-            seq_to_emb[seq] = embed_sequence(seq, tokenizer, model) if has_observations else None
+            if has_observations:
+                sites = _normalise_mutation_sites(
+                    seq_df.loc[seq_df["ProteinSequence"] == seq, "MutationSites"].iloc[0]
+                    if "MutationSites" in seq_df.columns else []
+                )
+                seq_to_emb[seq] = embed_sequence(
+                    seq, tokenizer, model,
+                    embedding_method=embedding_method,
+                    mutation_sites=sites,
+                    pool_mutations=pool_mutations,
+                )
+            else:
+                seq_to_emb[seq] = None
 
             if i % 5 == 0 and i > 0:
                 elapsed = time.time() - start
@@ -354,9 +485,21 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
                 )
                 print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
 
-        out = seq_df.copy()
-        out["Embedding"] = out["ProteinSequence"].map(seq_to_emb)
-        return out[["ProteinSequence", "Generation", "Embedding", "Frequency", "Replicate"]]
+        if embedding_method == "mutation_site" and not pool_mutations:
+            out = _expand_unpooled_mutation_embeddings(seq_df, seq_to_emb)
+        else:
+            out = seq_df.copy()
+            out["Embedding"] = out["ProteinSequence"].map(seq_to_emb)
+            if embedding_method == "mutation_site":
+                out["MutationSite"] = out["MutationSites"].apply(
+                    lambda sites: tuple(_normalise_mutation_sites(sites))
+                )
+                out["MutationSiteIndex"] = 0
+        out["EmbeddingMethod"] = embedding_method
+        out["PoolMutations"] = pool_mutations
+        extra_cols = [c for c in ["MutationSites", "MutationSite", "MutationSiteIndex"] if c in out.columns]
+        return out[["ProteinSequence", *extra_cols, "EmbeddingMethod", "PoolMutations",
+                    "Generation", "Embedding", "Frequency", "Replicate"]]
 
     else:
         pre_counts = seq_df["PreNums"].tolist()
@@ -367,7 +510,13 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
         for i, seq in enumerate(sequences):
             has_observations = any(x > 0 for x in pre_counts[i])
             if embed_zeroes or has_observations:
-                emb = embed_sequence(seq, tokenizer, model)
+                sites = _normalise_mutation_sites(seq_df.iloc[i].get("MutationSites"))
+                emb = embed_sequence(
+                    seq, tokenizer, model,
+                    embedding_method=embedding_method,
+                    mutation_sites=sites,
+                    pool_mutations=pool_mutations,
+                )
             else:
                 emb = None
             embeddings.append(emb)
@@ -381,7 +530,17 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
                 )
                 print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
 
-        seq_df["Embeddings"] = embeddings
+        if embedding_method == "mutation_site" and not pool_mutations:
+            seq_df = _expand_unpooled_mutation_embeddings_wide(seq_df, embeddings)
+        else:
+            seq_df["Embeddings"] = embeddings
+            if embedding_method == "mutation_site":
+                seq_df["MutationSite"] = seq_df["MutationSites"].apply(
+                    lambda sites: tuple(_normalise_mutation_sites(sites))
+                )
+                seq_df["MutationSiteIndex"] = 0
+        seq_df["EmbeddingMethod"] = embedding_method
+        seq_df["PoolMutations"] = pool_mutations
         return seq_df
 
 
@@ -411,6 +570,10 @@ def load_config(config_path):
 
     cfg.setdefault("esm_model", "facebook/esm2_t30_150M_UR50D")
     cfg.setdefault("embed_zeroes", False)
+    cfg.setdefault("embedding_method", "mean_pool")
+    cfg.setdefault("pool_mutations", False)
+    if cfg["embedding_method"] not in {"mean_pool", "cls", "mutation_site"}:
+        raise ValueError("embedding_method must be one of: mean_pool, cls, mutation_site")
 
     return cfg
 
@@ -432,6 +595,11 @@ def main():
                         help="Override ESM model (e.g. facebook/esm2_t6_8M_UR50D)")
     parser.add_argument("--n_test", type=int, default=None,
                         help="Only embed the first N sequences (for testing)")
+    parser.add_argument("--embedding_method", choices=["mean_pool", "cls", "mutation_site"],
+                        default=None,
+                        help="Embedding extraction method: mean_pool, cls, or mutation_site")
+    parser.add_argument("--pool_mutations", action="store_true",
+                        help="For mutation_site embeddings, average multiple mutated residue embeddings into one vector")
     parser.add_argument("--chunk_idx", type=int, default=0,
                         help="Index of this chunk (0-based, used in array jobs)")
     parser.add_argument("--n_chunks", type=int, default=1,
@@ -444,6 +612,10 @@ def main():
         cfg["embed_zeroes"] = True
     if args.esm_model is not None:
         cfg["esm_model"] = args.esm_model
+    if args.embedding_method is not None:
+        cfg["embedding_method"] = args.embedding_method
+    if args.pool_mutations:
+        cfg["pool_mutations"] = True
 
     # Resolve file paths relative to DATA_DIR if not absolute
     def resolve(p):
@@ -463,6 +635,8 @@ def main():
     print(f"Scratch folder  : {SCRATCH_EMBED_FOLDER}")
     print(f"Protein         : {cfg['protein']}")
     print(f"ESM model       : {cfg['esm_model']}")
+    print(f"embedding_method: {cfg['embedding_method']}")
+    print(f"pool_mutations  : {cfg['pool_mutations']}")
     print(f"embed_zeroes    : {cfg['embed_zeroes']}")
 
     if mavedb_mode:
@@ -522,7 +696,9 @@ def main():
     # --- Step 2: compute embeddings ---
     print("\n=== Step 2: Computing ESM embeddings ===")
     seq_df = embed_dataframe(seq_df, cfg["esm_model"], embed_zeroes=cfg["embed_zeroes"],
-                             n_test=args.n_test)
+                             n_test=args.n_test,
+                             embedding_method=cfg["embedding_method"],
+                             pool_mutations=cfg["pool_mutations"])
 
     # Append chunk suffix to output filename when running in array mode
     if args.n_chunks > 1:

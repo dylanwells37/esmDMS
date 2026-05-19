@@ -90,14 +90,13 @@ def plot_true_vs_inferred_fitness(all_results, paths, cfg, output_dir, n_cols=NC
     fitness_fn = cfg.get("fitness_fn", "exp") if cfg else "exp"
     os.makedirs(output_dir, exist_ok=True)
 
-    for path_name, results in all_results.items():
-        all_layer_fits   = results[0]
-        detailed_results = results[2]
-        embedding_path   = paths[path_name]
+    for path_name, run_result in all_results.items():
+        all_layer_fits = run_result.layer_fits
+        embedding_path = paths[path_name]
 
-        layers   = sorted(detailed_results.keys())
+        layers   = sorted(run_result.layers.keys())
         n_layers = len(layers)
-        n_reps   = len(detailed_results[layers[0]][0])
+        n_reps   = len(run_result.layers[layers[0]].s)
         nrows    = (n_layers + n_cols - 1) // n_cols
 
         for rep in range(n_reps):
@@ -106,7 +105,7 @@ def plot_true_vs_inferred_fitness(all_results, paths, cfg, output_dir, n_cols=NC
             for idx, layer in enumerate(layers):
                 row, col = divmod(idx, n_cols)
                 true_z = z_normalize(np.array(all_layer_fits[layer]))
-                s      = detailed_results[layer][0]
+                s      = run_result.layers[layer].s
                 emb    = get_embeddings(embedding_path, layer)
                 inf_z  = z_normalize(inferred_fitness(emb, s[rep], fitness_fn))
                 _scatter_panel(axes[row, col], true_z, inf_z, title=f"Layer {layer}")
@@ -123,7 +122,7 @@ def plot_true_vs_inferred_fitness(all_results, paths, cfg, output_dir, n_cols=NC
         for idx, layer in enumerate(layers):
             row, col = divmod(idx, n_cols)
             true_z  = z_normalize(np.array(all_layer_fits[layer]))
-            s_joint = detailed_results[layer][1]
+            s_joint = run_result.layers[layer].s_joint
             emb     = get_embeddings(embedding_path, layer)
             inf_z   = z_normalize(inferred_fitness(emb, s_joint, fitness_fn))
             _scatter_panel(axes[row, col], true_z, inf_z, title=f"Layer {layer}", color="seagreen")
@@ -139,9 +138,9 @@ def plot_true_vs_inferred_fitness(all_results, paths, cfg, output_dir, n_cols=NC
         for layer in layers:
             true_z  = z_normalize(np.array(all_layer_fits[layer]))
             emb     = get_embeddings(embedding_path, layer)
-            s_joint = detailed_results[layer][1]
+            s_joint = run_result.layers[layer].s_joint
             rs_joint.append(pearsonr(true_z, z_normalize(inferred_fitness(emb, s_joint, fitness_fn)))[0])
-            s = detailed_results[layer][0]
+            s = run_result.layers[layer].s
             for rep in range(n_reps):
                 rs_per_rep[rep].append(
                     pearsonr(true_z, z_normalize(inferred_fitness(emb, s[rep], fitness_fn)))[0]
@@ -161,17 +160,16 @@ def plot_true_vs_inferred_sel_coeffs(all_results, paths, cfg, output_dir, n_cols
     """True vs inferred selection coefficients across all layers: scatter grid + Pearson summary."""
     os.makedirs(output_dir, exist_ok=True)
 
-    for path_name, results in all_results.items():
-        true_sel_coefs   = results[1]
-        detailed_results = results[2]
+    for path_name, run_result in all_results.items():
+        true_sel_coefs = run_result.true_selection_coefficients
 
         if true_sel_coefs is None:
             print(f"[{path_name}] No true selection coefficients available, skipping.")
             continue
 
-        layers   = sorted(detailed_results.keys())
+        layers   = sorted(run_result.layers.keys())
         n_layers = len(layers)
-        n_reps   = len(detailed_results[layers[0]][0])
+        n_reps   = len(run_result.layers[layers[0]].s)
         nrows    = (n_layers + n_cols - 1) // n_cols
 
         fig, axes = plt.subplots(nrows, n_cols, figsize=(4.5 * n_cols, 4 * nrows), squeeze=False)
@@ -180,8 +178,8 @@ def plot_true_vs_inferred_sel_coeffs(all_results, paths, cfg, output_dir, n_cols
             row, col = divmod(idx, n_cols)
             ax      = axes[row, col]
             s_true  = true_sel_coefs[layer]
-            s       = detailed_results[layer][0]
-            s_joint = detailed_results[layer][1]
+            s       = run_result.layers[layer].s
+            s_joint = run_result.layers[layer].s_joint
             for rep in range(n_reps):
                 r, _ = pearsonr(s_true, s[rep])
                 ax.scatter(s_true, s[rep], color=_REP_COLORS[rep % len(_REP_COLORS)],
@@ -205,8 +203,8 @@ def plot_true_vs_inferred_sel_coeffs(all_results, paths, cfg, output_dir, n_cols
         rs_joint, rs_per_rep = [], [[] for _ in range(n_reps)]
         for layer in layers:
             s_true  = true_sel_coefs[layer]
-            s       = detailed_results[layer][0]
-            s_joint = detailed_results[layer][1]
+            s       = run_result.layers[layer].s
+            s_joint = run_result.layers[layer].s_joint
             rs_joint.append(pearsonr(s_true, s_joint)[0])
             for rep in range(n_reps):
                 rs_per_rep[rep].append(pearsonr(s_true, s[rep])[0])
@@ -250,18 +248,16 @@ def plot_cross_replicate_consistency(all_results, layers, max_cols=6, output_dir
         plt.show()
         plt.close(fig)
 
-    for path_name, results in all_results.items():
-        detailed_results = results[2]
-
+    for path_name, run_result in all_results.items():
         # summary data: layer -> (mean_r, std_r)
         summary_stats = {}
 
         for layer_idx, layer in enumerate(layers):
-            if layer not in detailed_results:
+            if layer not in run_result.layers:
                 print(f"[{path_name}]  Layer {layer}: no inference results")
                 continue
 
-            s_reps = detailed_results[layer][0]
+            s_reps = run_result.layers[layer].s
             n_reps = len(s_reps)
             print(f"n_reps for {path_name} layer {layer}: {n_reps}")
 
@@ -460,8 +456,8 @@ def plot_shuffled_consistency(layer_stats_by_dataset, layers, output_dir=None, n
 
 def plot_fitness_trajectories(all_results, n_cols=6, output_dir=None):
     """Mean fitness over time for each layer and replicate."""
-    for path_name, res in all_results.items():
-        layers   = sorted(res[4].keys())
+    for path_name, run_result in all_results.items():
+        layers   = sorted(run_result.generation_counts.keys())
         n_layers = len(layers)
         n_rows   = int(np.ceil(n_layers / n_cols))
 
@@ -472,8 +468,8 @@ def plot_fitness_trajectories(all_results, n_cols=6, output_dir=None):
 
         for ax_idx, layer in enumerate(layers):
             ax = axes[ax_idx]
-            generation_counts = res[4][layer]
-            layer_fits = res[0][layer]
+            generation_counts = run_result.generation_counts[layer]
+            layer_fits = run_result.layer_fits[layer]
             n_reps = len(generation_counts[0])
 
             for rep in range(n_reps):
@@ -523,7 +519,11 @@ def get_esm_individual_fitness_values(embedding_path, layer, s_joint, fitness_fn
 
     if os.path.exists(seq_id_map_path) and os.path.exists(layer_emb_path):
         with open(seq_id_map_path, "rb") as f:
-            protein_seqs = np.array(_pickle.load(f))
+            seq_id_map = _pickle.load(f)
+        protein_seqs = np.array([
+            item.get("ProteinSequence", str(item)) if isinstance(item, dict) else item
+            for item in seq_id_map
+        ])
         with open(layer_emb_path, "rb") as f:
             emb_matrix = _pickle.load(f).astype(float)  # (n_unique, L)
     else:
