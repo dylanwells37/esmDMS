@@ -4,5 +4,7 @@
     "reference_sequence_file": "Ube4b_reference_sequence.dat",
     "esm_model": "facebook/esm2_t33_650M_UR50D",
     "embed_zeroes": false,
-    "skip_stop_codons": false
+    "skip_stop_codons": false,
+    "embedding_method": "mean_pool",
+    "pool_mutations": false
 }

@@ -51,7 +51,7 @@ Produced by `_process_single_layer` (sim) and `run_inference` (real data), both 
  [0]  [1]  [2]   [3]     [4]       [5]        [6]       [7]            [8]
 ```
 
-`dx`: list of `(L,)` — allele-frequency-weighted change in embeddings, one per replicate.  
+`dx`: list of `(L,)` — allele-frequency-weighted change in embeddings, one per replicate.
 `x_array`: list of `(n_seqs, L)` — embedding matrix used for inference.
 
 ---
@@ -62,14 +62,21 @@ Produced by `_process_single_layer` (sim) and `run_inference` (real data), both 
 ```
 {embedding_path}/{basename}_embeddings.pkl
 ```
-DataFrame columns: `ProteinSequence, Replicate, Generation, Frequency, Embedding`  
-`Embedding` column: each cell is a list of length `n_layers`, where `emb[layer]` is a `(L,)` array.
+DataFrame columns: `ProteinSequence, Replicate, Generation, Frequency, Embedding` plus optional mutation-site metadata.
+`Embedding` column: each cell is a list/array of length `n_layers`, where `emb[layer]` is a `(L,)` array.
+
+Supported sequence embedding extraction methods:
+- `mean_pool`: mean-pool real residue token embeddings, excluding CLS/EOS/padding.
+- `cls`: use the ESM CLS token embedding.
+- `mutation_site`: use residue-level embeddings at mutated amino-acid sites.
+
+For `mutation_site` with `pool_mutations=false`, variants with multiple amino-acid mutations are expanded into separate dataframe rows, one per mutated site. These rows share `ProteinSequence`, `Replicate`, `Generation`, and `Frequency`, and are distinguished by `MutationSite` and `MutationSiteIndex`. With `pool_mutations=true`, mutated residue embeddings are averaged into one vector per variant.
 
 ### Compact inference format (written by `emb_df_to_inference_dfs`)
 ```
-{embedding_path}/seq_id_map.pkl            — list[str], length n_unique_seqs
-{embedding_path}/inference_metadata.pkl    — DataFrame(seq_id, Replicate, Generation, Frequency)
-{embedding_path}/layer{i}_seq_to_emb.pkl  — np.ndarray shape (n_unique_seqs, L)
+{embedding_path}/seq_id_map.pkl            — list[dict] or legacy list[str], length n_embedding_units
+{embedding_path}/inference_metadata.pkl    — DataFrame(seq_id, Replicate, Generation, Frequency, optional MutationSite metadata)
+{embedding_path}/layer{i}_seq_to_emb.pkl  — np.ndarray shape (n_embedding_units, L)
 ```
 `load_inference_df(layer, path)` reconstructs a df with an `Embedding` column from these.
 
@@ -77,7 +84,7 @@ DataFrame columns: `ProteinSequence, Replicate, Generation, Frequency, Embedding
 ```
 {embedding_path}/layer{i}_sim_df.pkl
 ```
-DataFrame columns: `Embedding (L,), Rep1_PreNums, Rep2_PreNums, ...`  
+DataFrame columns: `Embedding (L,), Rep1_PreNums, Rep2_PreNums, ...`
 `load_final_df(layer, path)` reads these.
 
 ---
@@ -101,5 +108,5 @@ s_joint       = results[2][layer][1]            # np.ndarray(L,)
 gen_counts    = results[4][layer]               # list[np.ndarray] — SIM ONLY
 ```
 
-`results[4]` is `None` for inference tuples — accessing it crashes.  
+`results[4]` is `None` for inference tuples — accessing it crashes.
 `results[0]` and `results[1]` are `None` for inference tuples.

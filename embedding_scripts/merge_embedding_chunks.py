@@ -29,6 +29,14 @@ def chunk_output_name(output_file, chunk_idx):
     return f"{output_file}.chunk_{chunk_idx}"
 
 
+def embedding_key_columns(df):
+    cols = ["ProteinSequence"]
+    for col in ["MutationSiteIndex", "MutationSite"]:
+        if col in df.columns:
+            cols.append(col)
+    return cols
+
+
 def main():
     parser = argparse.ArgumentParser(description="Merge ESM embedding chunk files.")
     parser.add_argument("output_file",
@@ -53,18 +61,22 @@ def main():
     merged = pd.concat(chunks, ignore_index=True)
 
     print(f"head:\n{merged.head()}")
-    # Build a lookup from ProteinSequence -> Embedding using only non-None rows
-    seq_to_embedding = (
+    # Build a lookup from sequence/site identity -> Embedding using only non-None rows.
+    key_cols = embedding_key_columns(merged)
+    key_to_embedding = (
         merged[merged["Embedding"].notna()]
-        .drop_duplicates(subset="ProteinSequence")
-        .set_index("ProteinSequence")["Embedding"]
+        .drop_duplicates(subset=key_cols)
+        .set_index(key_cols)["Embedding"]
     )
 
     # Replace None embeddings using the lookup
     none_mask = merged["Embedding"].isnull()
-    merged.loc[none_mask, "Embedding"] = (
-        merged.loc[none_mask, "ProteinSequence"].map(seq_to_embedding)
-    )
+    if none_mask.any():
+        if len(key_cols) == 1:
+            merged.loc[none_mask, "Embedding"] = merged.loc[none_mask, key_cols[0]].map(key_to_embedding)
+        else:
+            missing_keys = pd.MultiIndex.from_frame(merged.loc[none_mask, key_cols])
+            merged.loc[none_mask, "Embedding"] = missing_keys.map(key_to_embedding)
 
     still_none = merged["Embedding"].isnull().sum()
     print(f"None embeddings remaining after fix: {still_none}")

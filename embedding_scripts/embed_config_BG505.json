@@ -12,5 +12,7 @@
     ],
     "reference_sequence_file": "BG505_Reference_sequence.txt",
     "esm_model": "facebook/esm2_t33_650M_UR50D",
-    "embed_zeroes": false
+    "embed_zeroes": false,
+    "embedding_method": "mean_pool",
+    "pool_mutations": false
 }

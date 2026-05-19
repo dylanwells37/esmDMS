@@ -16,6 +16,8 @@
 # Optional flags passed through to embed_sequences.py:
 #   --embed_zeroes      embed sequences with zero pre-selection counts
 #   --esm_model <name>  override the ESM model (e.g. facebook/esm2_t6_8M_UR50D)
+#   --embedding_method <mean_pool|cls|mutation_site>
+#   --pool_mutations    average multiple mutation-site embeddings into one vector
 
 CONFIG=${1:-"embedding_scripts/embed_config_BF520.json"}
 OUTPUT_FILE=${2:-"embeddings.pkl"}
@@ -60,5 +62,4 @@ python embedding_scripts/embed_sequences.py \
     "$OUTPUT_FILE" \
     "$SCRDIR" \
     $EXTRA_ARGS
-
 
