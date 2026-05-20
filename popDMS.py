@@ -22,6 +22,15 @@ import matplotlib.patches as mpatches
 import matplotlib.ticker as ticker
 
 
+from dataclasses import dataclass, field
+
+
+#TODO Implement a dataclass to hold the results of the inference, instead of returning a list of outputs. 
+
+
+
+
+
 def find_last_below_threshold(nums_in, th=0.1):
     idx_out = 0
     for i, value in enumerate(nums_in):

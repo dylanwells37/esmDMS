@@ -21,6 +21,9 @@ from embedding_scripts.embed_sequences import (
 )
 
 
+## TYPE DEFINITIONS #################################
+
+
 EmbeddingModel = Literal[
     "esm2_t6_8M_UR50D",
     "esm2_t12_35M_UR50D",
@@ -31,18 +34,28 @@ EmbeddingModel = Literal[
 
 EmbeddingMethod = Literal["mean_pooling", "per_residue", "cls_token"]
 
+DMSInput = CellularDMSInput | ViralDMSInput
+
+## CONFIGURATION AND INPUT CLASSES #################################
 
 @dataclass(frozen=True)
 class ESMDMSConfig:
     embedding_model: EmbeddingModel = "esm2_t33_650M_UR50D"
     embedding_method: EmbeddingMethod = "mean_pooling"
     per_residue_mutation_pooling: bool = False
+    local_or_disk: Literal['local', 'disk'] = 'local'
+    save_dir: str | None = None
 
-
+    def __post_init__(self):
+        if self.local_or_disk == 'disk' and self.save_dir is None:
+                raise ValueError("save_dir must be specified when local_or_disk is set to 'disk'.")
+        
+    
 @dataclass(frozen=True)
 class CellularDMSInput:
     reference_nuc_path: Path
     mavedb_csv_path: Path
+    use_replicates: list[str] | None = None
     kind: Literal['cellular'] = 'cellular'
 
     def __post_init__(self):
@@ -52,7 +65,7 @@ class CellularDMSInput:
             raise ValueError(f"Reference nucleotide sequence path {self.reference_nuc_path} does not exist or is not a file.")
         if not self.mavedb_csv_path.is_file():
             raise ValueError(f"MaveDB CSV path {self.mavedb_csv_path} does not exist or is not a file.")
-        
+
 
 @dataclass(frozen=True)
 class ViralDMSInput:
@@ -73,8 +86,7 @@ class ViralDMSInput:
                 raise ValueError(f"Post-selection file path {p} does not exist or is not a file.")
 
 
-DMSInput = CellularDMSInput | ViralDMSInput
-
+####### esmDMS CLASS #########################################################
 
 class esmDMS:
 
@@ -157,6 +169,7 @@ class esmDMS:
             ) = build_sequence_dataframe_mavedb(
                 self.input_data.mavedb_csv_path,
                 self.reference_sequence,
+                self.input_data.use_replicates,
             )
 
         elif self.input_data.kind == "viral":
@@ -328,9 +341,11 @@ class esmDMS:
         """
         pass
     
+
     #TODO: add parameters for model type (linear, non-linear) and regularization scheme (L2, L1, ElasticNet)
-    def run_feature_inference(self, features: np.ndarray, layer: str,
-                              abstraction_method: Literal['None', 'PCA', 'SAE', 'SPCA'] = 'None') -> dict: 
+    def run_feature_inference(self, features: np.ndarray, layer: str | None = None,
+                              abstraction_method: Literal['None', 'PCA', 'SAE', 'SPCA'] = 'None',
+                              abstraction_params: dict | None = None) -> dict: 
         """
         Run the abstracted features through the popDMS framework to calculate selection coefficients and fitness.
 
@@ -344,7 +359,38 @@ class esmDMS:
         dict
             A dictionary containing inferred selection coefficients and fitness values.
         """
-        pass
+
+        norm_scheme = abstraction_params.norm_scheme if abstraction_params is not None else 'none'
+
+        if self.config.local_or_disk == 'disk':
+            # check if the features are already saved to disk
+            save_path = Path(self.config.save_dir) / f"{abstraction_method}_{layer}_{norm_scheme}_inference_results.pkl"
+            if save_path.is_file():
+                print(f"Loading inference results from {save_path}")
+                return pd.read_pickle(save_path)
+            else:
+                print(f"No saved inference results found at {save_path}. Running inference and saving results.")
+    
+
+        features_to_use = features
+        if abstraction_params is not None:
+            if abstraction_params.norm_scheme == 'cross_feature':
+                # Z-score normalize the features across the entire feature-space
+                mean = np.mean(features)
+                std = np.std(features)
+                features_to_use = (features - mean) / (std + 1e-8)
+            elif abstraction_params.norm_scheme == 'per_feature':
+                # Z-score normalize each feature independently
+                means = np.mean(features, axis=0)
+                stds = np.std(features, axis=0)
+                features_to_use = (features - means) / (stds + 1e-8)
+            elif abstraction_params.norm_scheme == 'none':
+                # Do not perform any normalization
+                features_to_use = features
+            else:
+                raise ValueError(f"Unsupported normalization scheme: {abstraction_params.norm_scheme}")
+
+        
 
 
     

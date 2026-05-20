@@ -215,7 +215,8 @@ def apply_substitutions(ref_nuc_seq, substitutions):
     return "".join(nuc_list)
 
 
-def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=True):
+def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, 
+                                    use_replicates=None, skip_stop_codons=True):
     """
     Load a MaveDB-format CSV and return:
         result_df
@@ -297,6 +298,8 @@ def build_sequence_dataframe_mavedb(csv_filepath, ref_nuc_seq, skip_stop_codons=
             seq_index = seq_to_index[aa_seq]
 
         for rep_name, gen_dict in seen.items():
+            if use_replicates is not None and rep_name not in use_replicates:
+                continue
             rep_idx = rep_name_to_idx[rep_name]
 
             for gen_idx, col_name in sorted(gen_dict.items()):
