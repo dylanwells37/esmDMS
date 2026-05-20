@@ -22,13 +22,41 @@ import matplotlib.patches as mpatches
 import matplotlib.ticker as ticker
 
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
-#TODO Implement a dataclass to hold the results of the inference, instead of returning a list of outputs. 
+@dataclass
+class InferenceResult:
+    dx: list
+    icov: list
+    s: np.ndarray
+    s_joint: np.ndarray
+    sel_data: list
+    gamma_opt: float
+    x_array: list
+    error_bars: np.ndarray
+    s_joint_error_bars: np.ndarray
 
+    def as_list(self):
+        return [
+            self.dx,
+            self.icov,
+            self.s,
+            self.s_joint,
+            self.gamma_opt,
+            self.x_array,
+            self.error_bars,
+            self.s_joint_error_bars,
+        ]
 
+    def __iter__(self):
+        return iter(self.as_list())
 
+    def __getitem__(self, index):
+        return self.as_list()[index]
+
+    def __len__(self):
+        return len(self.as_list())
 
 
 def find_last_below_threshold(nums_in, th=0.1):
@@ -250,18 +278,13 @@ def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cu
         if calc_error_bars and s_joint_err_ign is not None:
             s_joint_error_bars[ignored_dims] = s_joint_err_ign
 
-    # Convert selection coefficients to a data frame and save to file
-    sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates+1)] + ['joint']
-    sel_data = []
-    for dim in range(L):
-        sel_data.append([dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]])
 
     #if output_dir is not None:
     #    """path = get_selection_file(output_dir, name, file_ext='.csv.gz')
     #    df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
     #    df_temp.to_csv(path, index=False, compression='gzip')"""
 
-    return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
+    return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
 
 
 def infer_gamma_range(embedding_df, n_replicates=1,
@@ -402,9 +425,6 @@ def compute_dx_covariance_independent_esm(embedding_df):
     return dx, icov, x_array
     
 
-
-
-
 # ==============================================================================
 # Approach 2: full per-sequence covariance matrix
 # ==============================================================================
@@ -516,7 +536,7 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
 
     Returns
     -------
-    [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
+    InferenceResult
     """
     dx, icov, x_array = compute_dx_covariance_fullcov_esm(embedding_df)
     L = len(dx[0])
@@ -611,8 +631,4 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
         if calc_error_bars and s_joint_err_ign is not None:
             s_joint_error_bars[ignored_dims] = s_joint_err_ign
 
-    #sel_cols = ['embedding dimension'] + ['rep_%d' % r for r in range(1, n_replicates + 1)] + ['joint']
-    sel_data = [[dim] + [s[r][dim] for r in range(n_replicates)] + [s_joint[dim]] for dim in range(L)]
-
-    return [dx, icov, s, s_joint, sel_data, gamma_opt, x_array, error_bars, s_joint_error_bars]
-
+    return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
