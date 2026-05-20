@@ -238,7 +238,7 @@ def run_inference(embedding_path, inference_cfg, save_results=True, force_recomp
                                           variance_cutoff=0.0, infer_ignored_dims=True)
         processed[layer] = [data[2], data[3], data[7], data[8], data[1], data[5]]
         del layer_df, data
-
+    
     result_tuple = (None, None, processed, None, None)
 
     if save_results:
