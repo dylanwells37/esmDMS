@@ -46,10 +46,10 @@ def find_last_below_threshold(nums_in, th=0.1):
         idx_out = i
     return idx_out
 
-def get_best_regularization(corrs, gamma_values, corr_cutoff_pct=0.5):
-    '''
-    Compute best regularization strength from correlation data.
-    '''
+def get_best_regularization(corrs, gamma_values, 
+                            corr_cutoff_pct=0.5):
+    ''' Compute best regularization 
+    strength from correlation data. '''
     max_corrs = max(corrs)
     corr_thresh = (max_corrs**2 - corrs[0]**2) * corr_cutoff_pct
     
@@ -93,9 +93,8 @@ def plot_regularization(corrs, gamma_values):
 
 
 def plot_regularization_all(corrs_list, gamma_values):
-    '''
-    Plot correlation as a function of regularization strength for multiple data sets.
-    '''    
+    ''' Plot correlation as a function of 
+    regularization strength for multiple data sets. '''    
     corrs_list = np.array(corrs_list).T  # rows = replicate pairs, cols = gamma values
 
     for i in range(corrs_list.shape[0]):
@@ -132,8 +131,7 @@ def _prepare_eigendecomp(dx, icov, n_replicates):
 
 def infer_gamma_range(sequence_dataframe, sequence_to_feature, n_replicates=1,
                       gamma_values=None, max_reads=1e2):
-    """
-    Infer selection coefficients across a range of gamma values.
+    """ Infer selection coefficients across a range of gamma values.
 
     Returns
     -------
@@ -142,8 +140,7 @@ def infer_gamma_range(sequence_dataframe, sequence_to_feature, n_replicates=1,
     s_by_gamma : np.ndarray, shape (n_gamma, n_replicates, L)
         Per-replicate selection coefficients for each gamma.
     s_joint_by_gamma : np.ndarray, shape (n_gamma, L)
-        Joint selection coefficients for each gamma.
-    """
+        Joint selection coefficients for each gamma. """
     dx, icov, _ = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
 
     if gamma_values is None:
@@ -190,8 +187,7 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
     -------
     dx      : list of ndarray, length n_replicates, each shape (d,)
     icov    : list of ndarray, length n_replicates, each shape (d, d)
-    x_array : list of ndarray, length n_replicates, each shape (n_times, d)
-    """
+    x_array : list of ndarray, length n_replicates, each shape (n_times, d)"""
 
     sequence_indices = sorted(sequence_dataframe['SequenceIndex'].unique())
     sequence_to_feature_row = {seq_idx: i for i, seq_idx in enumerate(sequence_indices)}
@@ -289,8 +285,7 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature,
 
     Returns
     -------
-    InferenceResult
-    """
+    InferenceResult"""
     n_replicates = len(sequence_dataframe['Replicate'].unique())
 
     dx, icov, x_array = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, 
