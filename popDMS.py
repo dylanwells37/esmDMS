@@ -1,28 +1,8 @@
-import sys
-import os
-import re
-import copy
+from dataclasses import dataclass
 
 import numpy as np
-import scipy as sp
-import scipy.stats as st
-
-import itertools
-
-import pandas as pd
-pd.set_option('future.no_silent_downcasting', True)
-
-import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-import matplotlib.colors as mcolors
-import matplotlib.gridspec as gridspec
-from matplotlib.font_manager import FontProperties
-import matplotlib.patches as mpatches
-import matplotlib.ticker as ticker
-
-
-from dataclasses import dataclass
+from scipy.stats import pearsonr
 
 
 @dataclass
@@ -70,25 +50,9 @@ def get_best_regularization(corrs, gamma_values, corr_cutoff_pct=0.5):
     '''
     Compute best regularization strength from correlation data.
     '''
-
-    # corr_thresh = (np.max(corrs)**2 - corrs[0]**2)*corr_cutoff_pct
-    # gamma_opt = 1
-    # if np.fabs(np.max(corrs)**2-corrs[0]**2)<0.01:
-    #     gamma_opt = gamma_values[0]
-    # else:
-    #     gamma_set = False
-    #     for i in range(np.argmax(corrs), 0, -1):
-    #         if np.fabs((corrs[i]**2-corrs[i-1]**2)/(np.log10(gamma_values[i])-np.log10(gamma_values[i-1]))) >= corr_thresh:
-    #             gamma_opt = gamma_values[i+1]
-    #             gamma_set = True
-    #             break
-    #     if not gamma_set:
-    #         gamma_opt = gamma_values[np.argmax(corrs)]
-
     max_corrs = max(corrs)
     corr_thresh = (max_corrs**2 - corrs[0]**2) * corr_cutoff_pct
     
-    gamma_opt = 0.1
     if abs(max_corrs**2 - corrs[0]**2) < 0.01:
         gamma_opt = gamma_values[0]
     else:
@@ -105,15 +69,11 @@ def get_best_regularization(corrs, gamma_values, corr_cutoff_pct=0.5):
                 gamma_opt = gamma_values[i]
                 gamma_set = True
                 break
-        # if the loop completes without finding a gamma, set gamma_opt to the value that gives 1% of the drop in R
-         # if the loop completes without finding a gamma
         if not gamma_set:
             if not i_set:
-                # Fallback: if loop never ran, use the argmax or the first gamma
                 gamma_opt = gamma_values[np.argmax(corrs)]
             else:
                 i_before_below10percent = find_last_below_threshold(delta_cor_set)
-                # Ensure the index is valid for i_set
                 idx = min(i_before_below10percent, len(i_set) - 1)
                 gamma_opt = gamma_values[i_set[idx]]
     
@@ -136,8 +96,6 @@ def plot_regularization_all(corrs_list, gamma_values):
     '''
     Plot correlation as a function of regularization strength for multiple data sets.
     '''    
-    fig = plt.figure()
-    
     corrs_list = np.array(corrs_list).T  # rows = replicate pairs, cols = gamma values
 
     for i in range(corrs_list.shape[0]):
@@ -150,17 +108,25 @@ def plot_regularization_all(corrs_list, gamma_values):
     plt.show()
 
 
-def safe_error_bars(mat):
-    """Compute error bars ensuring positive-definite inverse."""
-    eigvals, eigvecs = np.linalg.eigh(mat)
-    # Clamp eigenvalues to a small positive floor
-    eigvals_clamped = np.maximum(eigvals, 1e-10)
-    mat_pd = eigvecs @ np.diag(eigvals_clamped) @ eigvecs.T
-    return np.sqrt(np.diag(np.linalg.inv(mat_pd)))
+def _prepare_eigendecomp(dx, icov, n_replicates):
+    dx_arr = np.array(dx)
+    eig_lam = [None] * n_replicates
+    eig_vec = [None] * n_replicates
+    vt_dx = [None] * n_replicates
+
+    for r in range(n_replicates):
+        eig_lam[r], eig_vec[r] = np.linalg.eigh(icov[r])
+        vt_dx[r] = eig_vec[r].T @ dx_arr[r]
+
+    icov_sum = np.sum(icov, axis=0)
+    dx_sum = np.sum(dx_arr, axis=0)
+    lam_j, V_j = np.linalg.eigh(icov_sum)
+    vt_dx_j = V_j.T @ dx_sum
+
+    return dx_arr, eig_lam, eig_vec, vt_dx, lam_j, V_j, vt_dx_j
 
 
-
-def infer_gamma_range(embedding_df, n_replicates=1,
+def infer_gamma_range(sequence_dataframe, sequence_to_feature, n_replicates=1,
                       gamma_values=None, max_reads=1e2):
     """
     Infer selection coefficients across a range of gamma values.
@@ -174,7 +140,7 @@ def infer_gamma_range(embedding_df, n_replicates=1,
     s_joint_by_gamma : np.ndarray, shape (n_gamma, L)
         Joint selection coefficients for each gamma.
     """
-    dx, icov, _ = compute_dx_covariance_independent_esm(embedding_df)
+    dx, icov, _ = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
 
     if gamma_values is None:
         gamma_values = np.logspace(np.log10(1 / max_reads), 4, num=20)
@@ -182,33 +148,15 @@ def infer_gamma_range(embedding_df, n_replicates=1,
 
     L = len(dx[0])
     n_gamma = len(gamma_values)
-    dx_arr = np.array(dx)
+    _, eig_lam, eig_vec, vt_dx, lam_j, V_j, vt_dx_j = _prepare_eigendecomp(dx, icov, n_replicates)
+    s_by_gamma = np.zeros((n_gamma, n_replicates, L))
+    s_joint_by_gamma = np.zeros((n_gamma, L))
 
-    def _gamma_sweep():
-        icov_sum = np.sum(icov, axis=0)
-        dx_sum = np.sum(dx_arr, axis=0)
+    for g_idx, g in enumerate(gamma_values):
+        for r_idx in range(n_replicates):
+            s_by_gamma[g_idx, r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
+        s_joint_by_gamma[g_idx] = V_j @ (vt_dx_j / (lam_j + g))
 
-        # Precompute eigendecompositions once; sweep over gamma with O(d^2) per step
-        eig_lam = [None] * n_replicates
-        eig_vec = [None] * n_replicates
-        vt_dx   = [None] * n_replicates
-        for r in range(n_replicates):
-            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov[r])
-            vt_dx[r] = eig_vec[r].T @ dx_arr[r]
-        lam_j, V_j = np.linalg.eigh(icov_sum)
-        vt_dx_j = V_j.T @ dx_sum
-
-        s_by_gamma = np.zeros((n_gamma, n_replicates, L))
-        s_joint_by_gamma = np.zeros((n_gamma, L))
-
-        for g_idx, g in enumerate(gamma_values):
-            for r_idx in range(n_replicates):
-                s_by_gamma[g_idx, r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
-            s_joint_by_gamma[g_idx] = V_j @ (vt_dx_j / (lam_j + g))
-
-        return s_by_gamma, s_joint_by_gamma
-
-    s_by_gamma, s_joint_by_gamma = _gamma_sweep()
     return gamma_values, s_by_gamma, s_joint_by_gamma
 
 
@@ -216,7 +164,7 @@ def infer_gamma_range(embedding_df, n_replicates=1,
 # Approach: full per-sequence covariance matrix (don't even bother with other methods)
 # ==============================================================================
 
-def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov=True):
+def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov=False):
     """Compute the mean change (dx) and time-integrated full covariance matrix
     (icov) from a sequence dataframe and sequence-to-feature mapping.
 
@@ -310,8 +258,8 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
 
 
 def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
-                            max_reads=1e2, output_dir=None, name='esm_fullcov',
-                            plot_gamma=True, verbose=False, calc_error_bars=False):
+                            max_reads=1e2, plot_gamma=True, verbose=False,
+                            calc_error_bars=False):
     """Infer selection coefficients on ESM feature dimensions using the full
     per-sequence covariance matrix (Approach 2 / full-covariance).
 
@@ -325,60 +273,41 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamm
     """
     dx, icov, x_array = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
     L = len(dx[0])
+    _, eig_lam, eig_vec, vt_dx, lam_j, V_j, vt_dx_j = _prepare_eigendecomp(dx, icov, n_replicates)
 
-    def _infer_full():
-        dx_arr = np.array(dx)
+    if gamma is not None:
+        gamma_opt = gamma
+    elif n_replicates == 1:
+        if verbose:
+            print('Only one replicate, setting gamma = 1')
+        gamma_opt = 1
+    else:
+        gamma_vals = np.logspace(np.log10(1 / max_reads), 4, num=20)
+        corrs = []
+        for g in gamma_vals:
+            s_temp = np.zeros((n_replicates, L))
+            for r_idx in range(n_replicates):
+                s_temp[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
+            corrs.append(np.mean([
+                pearsonr(s_temp[i], s_temp[j]).statistic
+                for i in range(n_replicates)
+                for j in range(i + 1, n_replicates)
+            ]))
+        if plot_gamma and verbose:
+            print(f"gamma_values: {gamma_vals}")
+            print(f"corrs: {corrs}")
+        gamma_opt = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
 
-        # Precompute eigendecompositions once per replicate: icov = V diag(lam) V.T
-        # Then (icov + gI)^{-1} b = V @ ((V.T b) / (lam + g)) — no per-gamma inversions.
-        eig_lam = [None] * n_replicates
-        eig_vec = [None] * n_replicates
-        vt_dx   = [None] * n_replicates
-        for r in range(n_replicates):
-            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov[r])
-            vt_dx[r] = eig_vec[r].T @ dx_arr[r]
+    s = np.zeros((n_replicates, L))
+    error_bars = np.zeros((n_replicates, L))
+    for r_idx in range(n_replicates):
+        inv_denom = 1.0 / (eig_lam[r_idx] + gamma_opt)
+        s[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
+        if calc_error_bars:
+            error_bars[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
 
-        if gamma is not None:
-            gamma_opt = gamma
-        elif n_replicates == 1:
-            if verbose:
-                print('Only one replicate, setting gamma = 1')
-            gamma_opt = 1
-        else:
-            gamma_vals = np.logspace(np.log10(1 / max_reads), 4, num=20)
-            corrs      = []
-            for g in gamma_vals:
-                s_temp = np.zeros((n_replicates, L))
-                for r_idx in range(n_replicates):
-                    s_temp[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
-                corrs.append(np.mean([
-                    st.pearsonr(s_temp[i], s_temp[j]).statistic
-                    for i in range(n_replicates)
-                    for j in range(i + 1, n_replicates)
-                ]))
-            if plot_gamma and verbose:
-                print(f"gamma_values: {gamma_vals}")
-                print(f"corrs: {corrs}")
-            gamma_opt = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
-
-        s   = np.zeros((n_replicates, L))
-        error_bars = np.zeros((n_replicates, L))
-        for r_idx in range(n_replicates):
-            inv_denom = 1.0 / (eig_lam[r_idx] + gamma_opt)
-            s[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
-            if calc_error_bars:
-                #err_sub[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
-                error_bars[r_idx] = np.sqrt(eig_vec[r_idx] **2 @ inv_denom)
-
-        icov_sum    = np.sum(icov, axis=0)
-        dx_sum      = np.sum(dx_arr, axis=0)
-        lam_j, V_j  = np.linalg.eigh(icov_sum)
-        inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_opt)
-        s_joint = V_j @ ((V_j.T @ dx_sum) * inv_denom_j)
-        s_joint_error_bars = np.sqrt(V_j ** 2 @ inv_denom_j**2) if calc_error_bars else np.full(L, np.nan)
-
-        return s, s_joint, error_bars, s_joint_error_bars, gamma_opt
-
-    s, s_joint, error_bars, s_joint_error_bars, gamma_opt = _infer_full()
+    inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_opt)
+    s_joint = V_j @ (vt_dx_j * inv_denom_j)
+    s_joint_error_bars = np.sqrt(V_j ** 2 @ inv_denom_j**2) if calc_error_bars else np.full(L, np.nan)
 
     return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
