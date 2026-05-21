@@ -161,8 +161,7 @@ def safe_error_bars(mat):
 
 
 def infer_gamma_range(embedding_df, n_replicates=1,
-                      gamma_values=None, max_reads=1e2,
-                      variance_cutoff=0.0, infer_ignored_dims=True):
+                      gamma_values=None, max_reads=1e2):
     """
     Infer selection coefficients across a range of gamma values.
 
@@ -172,10 +171,8 @@ def infer_gamma_range(embedding_df, n_replicates=1,
         The gamma values used.
     s_by_gamma : np.ndarray, shape (n_gamma, n_replicates, L)
         Per-replicate selection coefficients for each gamma.
-        Ignored dims (per variance_cutoff) are NaN unless infer_ignored_dims=True.
     s_joint_by_gamma : np.ndarray, shape (n_gamma, L)
         Joint selection coefficients for each gamma.
-        Ignored dims are NaN unless infer_ignored_dims=True.
     """
     dx, icov, _ = compute_dx_covariance_independent_esm(embedding_df)
 
@@ -185,60 +182,33 @@ def infer_gamma_range(embedding_df, n_replicates=1,
 
     L = len(dx[0])
     n_gamma = len(gamma_values)
+    dx_arr = np.array(dx)
 
-    # Determine which dimensions to use based on variance_cutoff
-    if variance_cutoff > 0.0:
-        all_embeddings = np.vstack(embedding_df['Embedding'].values)
-        dim_variances = np.var(all_embeddings, axis=0)
-        sorted_dims = np.argsort(dim_variances)[::-1]
-        cumulative_variance = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
-        n_keep = int(np.searchsorted(cumulative_variance, variance_cutoff)) + 1
-        kept_dims = np.sort(sorted_dims[:n_keep])
-        ignored_dims = np.setdiff1d(np.arange(L), kept_dims)
-    else:
-        kept_dims = np.arange(L)
-        ignored_dims = np.array([], dtype=int)
-
-    def _gamma_sweep(active_dims):
-        L_sub = len(active_dims)
-        dx_sub = np.array([dx[r][active_dims] for r in range(n_replicates)])
-        icov_sub = [icov[r][np.ix_(active_dims, active_dims)] for r in range(n_replicates)]
-        icov_sub_sum = np.sum(icov_sub, axis=0)
-        dx_sub_sum = np.sum(dx_sub, axis=0)
+    def _gamma_sweep():
+        icov_sum = np.sum(icov, axis=0)
+        dx_sum = np.sum(dx_arr, axis=0)
 
         # Precompute eigendecompositions once; sweep over gamma with O(d^2) per step
         eig_lam = [None] * n_replicates
         eig_vec = [None] * n_replicates
         vt_dx   = [None] * n_replicates
         for r in range(n_replicates):
-            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov_sub[r])
-            vt_dx[r] = eig_vec[r].T @ dx_sub[r]
-        lam_j, V_j = np.linalg.eigh(icov_sub_sum)
-        vt_dx_j = V_j.T @ dx_sub_sum
+            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov[r])
+            vt_dx[r] = eig_vec[r].T @ dx_arr[r]
+        lam_j, V_j = np.linalg.eigh(icov_sum)
+        vt_dx_j = V_j.T @ dx_sum
 
-        s_sub = np.zeros((n_gamma, n_replicates, L_sub))
-        s_joint_sub = np.zeros((n_gamma, L_sub))
+        s_by_gamma = np.zeros((n_gamma, n_replicates, L))
+        s_joint_by_gamma = np.zeros((n_gamma, L))
 
         for g_idx, g in enumerate(gamma_values):
             for r_idx in range(n_replicates):
-                s_sub[g_idx, r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
-            s_joint_sub[g_idx] = V_j @ (vt_dx_j / (lam_j + g))
+                s_by_gamma[g_idx, r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
+            s_joint_by_gamma[g_idx] = V_j @ (vt_dx_j / (lam_j + g))
 
-        return s_sub, s_joint_sub
+        return s_by_gamma, s_joint_by_gamma
 
-    # Initialize output arrays with NaN for ignored dims
-    s_by_gamma = np.full((n_gamma, n_replicates, L), np.nan)
-    s_joint_by_gamma = np.full((n_gamma, L), np.nan)
-
-    s_kept, s_joint_kept = _gamma_sweep(kept_dims)
-    s_by_gamma[:, :, kept_dims] = s_kept
-    s_joint_by_gamma[:, kept_dims] = s_joint_kept
-
-    if len(ignored_dims) > 0 and infer_ignored_dims:
-        s_ign, s_joint_ign = _gamma_sweep(ignored_dims)
-        s_by_gamma[:, :, ignored_dims] = s_ign
-        s_joint_by_gamma[:, ignored_dims] = s_joint_ign
-
+    s_by_gamma, s_joint_by_gamma = _gamma_sweep()
     return gamma_values, s_by_gamma, s_joint_by_gamma
 
 
