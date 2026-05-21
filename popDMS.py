@@ -114,6 +114,10 @@ def _prepare_eigendecomp(dx, icov, n_replicates):
     eig_vec = [None] * n_replicates
     vt_dx = [None] * n_replicates
 
+    # For each replicate, selection solves have the form
+    # (C + gamma I) s = dx. Since C = V diag(lambda) V.T,
+    # s = V @ ((V.T @ dx) / (lambda + gamma)). Cache V, lambda,
+    # and V.T @ dx once so gamma sweeps avoid repeated matrix inversions.
     for r in range(n_replicates):
         eig_lam[r], eig_vec[r] = np.linalg.eigh(icov[r])
         vt_dx[r] = eig_vec[r].T @ dx_arr[r]
