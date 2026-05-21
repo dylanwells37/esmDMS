@@ -261,9 +261,11 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
     return dx, icov, x_array
 
 
-def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
-                            max_reads=1e2, plot_gamma=True, verbose=False,
-                            calc_error_bars=False):
+def mini_infer_esm(sequence_dataframe, sequence_to_feature, 
+                    gamma=None, corr_cutoff_pct=0.5,
+                    max_reads=1e2, plot_gamma=False, 
+                    verbose=False, calc_error_bars=False,
+                    plot_icov=False):
     """Infer selection coefficients on ESM feature dimensions using the full
     per-sequence covariance matrix (Approach 2 / full-covariance).
 
@@ -275,7 +277,10 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamm
     -------
     InferenceResult
     """
-    dx, icov, x_array = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
+    n_replicates = len(sequence_dataframe['Replicate'].unique())
+
+    dx, icov, x_array = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, 
+                                                    plot_icov=plot_icov)
     L = len(dx[0])
     _, eig_lam, eig_vec, vt_dx, lam_j, V_j, vt_dx_j = _prepare_eigendecomp(dx, icov, n_replicates)
 
