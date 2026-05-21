@@ -31,7 +31,6 @@ class InferenceResult:
     icov: list
     s: np.ndarray
     s_joint: np.ndarray
-    sel_data: list
     gamma_opt: float
     x_array: list
     error_bars: np.ndarray
@@ -336,14 +335,13 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
 
             plt.tight_layout()
             plt.show()
-
+            
     return dx, icov, x_array
 
 
 def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
                             max_reads=1e2, output_dir=None, name='esm_fullcov',
-                            plot_gamma=True, verbose=False, calc_error_bars=False,
-                            variance_cutoff=0.0, infer_ignored_dims=True):
+                            plot_gamma=True, verbose=False, calc_error_bars=False):
     """Infer selection coefficients on ESM feature dimensions using the full
     per-sequence covariance matrix (Approach 2 / full-covariance).
 
@@ -358,25 +356,8 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamm
     dx, icov, x_array = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
     L = len(dx[0])
 
-    if variance_cutoff > 0.0:
-        sequence_indices = sequence_dataframe['SequenceIndex'].unique()
-        all_features     = np.vstack([sequence_to_feature[idx] for idx in sequence_indices])
-        dim_variances    = np.var(all_features, axis=0)
-        sorted_dims    = np.argsort(dim_variances)[::-1]
-        cumulative_var = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
-        n_keep         = int(np.searchsorted(cumulative_var, variance_cutoff)) + 1
-        kept_dims      = np.sort(sorted_dims[:n_keep])
-        ignored_dims   = np.setdiff1d(np.arange(L), kept_dims)
-        if verbose:
-            print(f"Variance cutoff {variance_cutoff:.2f}: keeping {len(kept_dims)}/{L} dims")
-    else:
-        kept_dims    = np.arange(L)
-        ignored_dims = np.array([], dtype=int)
-
-    def _infer_dims(active_dims):
-        L_sub    = len(active_dims)
-        dx_sub   = np.array([dx[r][active_dims]                   for r in range(n_replicates)])
-        icov_sub = [icov[r][np.ix_(active_dims, active_dims)]     for r in range(n_replicates)]
+    def _infer_full():
+        dx_arr = np.array(dx)
 
         # Precompute eigendecompositions once per replicate: icov = V diag(lam) V.T
         # Then (icov + gI)^{-1} b = V @ ((V.T b) / (lam + g)) — no per-gamma inversions.
@@ -384,20 +365,20 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamm
         eig_vec = [None] * n_replicates
         vt_dx   = [None] * n_replicates
         for r in range(n_replicates):
-            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov_sub[r])
-            vt_dx[r] = eig_vec[r].T @ dx_sub[r]
+            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov[r])
+            vt_dx[r] = eig_vec[r].T @ dx_arr[r]
 
         if gamma is not None:
-            gamma_sub = gamma
+            gamma_opt = gamma
         elif n_replicates == 1:
             if verbose:
                 print('Only one replicate, setting gamma = 1')
-            gamma_sub = 1
+            gamma_opt = 1
         else:
             gamma_vals = np.logspace(np.log10(1 / max_reads), 4, num=20)
             corrs      = []
             for g in gamma_vals:
-                s_temp = np.zeros((n_replicates, L_sub))
+                s_temp = np.zeros((n_replicates, L))
                 for r_idx in range(n_replicates):
                     s_temp[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
                 corrs.append(np.mean([
@@ -408,45 +389,26 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamm
             if plot_gamma and verbose:
                 print(f"gamma_values: {gamma_vals}")
                 print(f"corrs: {corrs}")
-            gamma_sub = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
+            gamma_opt = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
 
-        s_sub   = np.zeros((n_replicates, L_sub))
-        err_sub = np.zeros((n_replicates, L_sub))
+        s   = np.zeros((n_replicates, L))
+        error_bars = np.zeros((n_replicates, L))
         for r_idx in range(n_replicates):
-            inv_denom = 1.0 / (eig_lam[r_idx] + gamma_sub)
-            s_sub[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
+            inv_denom = 1.0 / (eig_lam[r_idx] + gamma_opt)
+            s[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
             if calc_error_bars:
                 #err_sub[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
-                err_sub[r_idx] = np.sqrt(eig_vec[r_idx] **2 @ inv_denom)
+                error_bars[r_idx] = np.sqrt(eig_vec[r_idx] **2 @ inv_denom)
 
-        icov_sum    = np.sum(icov_sub, axis=0)
-        dx_sum      = np.sum(dx_sub,   axis=0)
+        icov_sum    = np.sum(icov, axis=0)
+        dx_sum      = np.sum(dx_arr, axis=0)
         lam_j, V_j  = np.linalg.eigh(icov_sum)
-        inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_sub)
-        s_joint_sub = V_j @ ((V_j.T @ dx_sum) * inv_denom_j)
-        s_joint_err_sub = np.sqrt(V_j ** 2 @ inv_denom_j**2) if calc_error_bars else None
+        inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_opt)
+        s_joint = V_j @ ((V_j.T @ dx_sum) * inv_denom_j)
+        s_joint_error_bars = np.sqrt(V_j ** 2 @ inv_denom_j**2) if calc_error_bars else np.full(L, np.nan)
 
-        return s_sub, s_joint_sub, err_sub, s_joint_err_sub, gamma_sub
+        return s, s_joint, error_bars, s_joint_error_bars, gamma_opt
 
-    s_kept, s_joint_kept, err_kept, s_joint_err_kept, gamma_opt = _infer_dims(kept_dims)
+    s, s_joint, error_bars, s_joint_error_bars, gamma_opt = _infer_full()
 
-    s                  = np.full((n_replicates, L), np.nan)
-    s_joint            = np.full(L, np.nan)
-    error_bars         = np.full((n_replicates, L), np.nan)
-    s_joint_error_bars = np.full(L, np.nan)
-
-    s[:, kept_dims]               = s_kept
-    s_joint[kept_dims]            = s_joint_kept
-    error_bars[:, kept_dims]      = err_kept
-    if calc_error_bars and s_joint_err_kept is not None:
-        s_joint_error_bars[kept_dims] = s_joint_err_kept
-
-    if len(ignored_dims) > 0 and infer_ignored_dims:
-        s_ign, s_joint_ign, err_ign, s_joint_err_ign, _ = _infer_dims(ignored_dims)
-        s[:, ignored_dims]               = s_ign
-        s_joint[ignored_dims]            = s_joint_ign
-        error_bars[:, ignored_dims]      = err_ign
-        if calc_error_bars and s_joint_err_ign is not None:
-            s_joint_error_bars[ignored_dims] = s_joint_err_ign
-
-    return InferenceResult(dx, icov, s, s_joint, None, gamma_opt, x_array, error_bars, s_joint_error_bars)
+    return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
