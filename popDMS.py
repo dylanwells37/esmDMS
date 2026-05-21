@@ -189,27 +189,18 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
     icov    : list of ndarray, length n_replicates, each shape (d, d)
     x_array : list of ndarray, length n_replicates, each shape (n_times, d)"""
 
-    sequence_indices = sorted(sequence_dataframe['SequenceIndex'].unique())
-    sequence_to_feature_row = {seq_idx: i for i, seq_idx in enumerate(sequence_indices)}
-    feature_table = np.vstack([sequence_to_feature[seq_idx] for seq_idx in sequence_indices])
-    sequence_dataframe = sequence_dataframe.copy()
-    sequence_dataframe['_FeatureRow'] = sequence_dataframe['SequenceIndex'].map(sequence_to_feature_row)
-
     rep_vals = sorted(sequence_dataframe['Replicate'].unique())
     reps = len(rep_vals)
-    d    = feature_table.shape[1]
+    d    = len(next(iter(sequence_to_feature.values())))
 
     dx      = [np.zeros(d)       for _ in range(reps)] # MEAN change in feature
     icov    = [np.zeros((d, d))  for _ in range(reps)] # INTEGRATED covariance matrix
     x_array = []
 
-    for r_idx, (rep_val, df_rep) in enumerate(sequence_dataframe.groupby('Replicate', sort=True)):
+    for r_idx, rep_val in enumerate(rep_vals):
+        df_rep  = sequence_dataframe[sequence_dataframe['Replicate'] == rep_val]
         times   = np.sort(np.unique(df_rep['Generation']))
         n_times = len(times)
-        generation_groups = {
-            generation: df_t
-            for generation, df_t in df_rep.groupby('Generation', sort=True)
-        }
 
         # Trapezoid weights for time integration
         trap_weights        = np.zeros(n_times)
@@ -222,9 +213,9 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
         M = np.zeros((n_times, d, d))  # population second-moment matrix
 
         for i, t in enumerate(times):
-            df_t       = generation_groups[t]
+            df_t       = df_rep[df_rep['Generation'] == t]
             total_freq = df_t['Frequency'].sum()
-            feature_mat = feature_table[df_t['_FeatureRow'].to_numpy()] # (n_seqs, d)
+            feature_mat = np.vstack([sequence_to_feature[idx] for idx in df_t['SequenceIndex']]) # (n_seqs, d)
             w          = df_t['Frequency'].values / total_freq  # (n_seqs,)
             x[i]       = w @ feature_mat                       # weighted mean feature (dot product of (1, n_seqs) and (n_seqs, d) -> (d,))
             M[i]       = (feature_mat.T * w) @ feature_mat      # weighted second-moment matrix (dot product of (d, n_seqs) and (n_seqs, d) -> (d, d))
@@ -233,14 +224,10 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
         dx[r_idx] = x[-1] - x[0]
 
         # Compute C(t) for all time points and accumulate icov
-        if plot_icov:
-            C_all = np.zeros((n_times, d, d))
-            for i in range(n_times):
-                C_all[i]     = M[i] - np.outer(x[i], x[i])
-                icov[r_idx] += trap_weights[i] * C_all[i]
-        else:
-            for i in range(n_times):
-                icov[r_idx] += trap_weights[i] * (M[i] - np.outer(x[i], x[i]))
+        C_all = np.zeros((n_times, d, d))
+        for i in range(n_times):
+            C_all[i]     = M[i] - np.outer(x[i], x[i])
+            icov[r_idx] += trap_weights[i] * C_all[i]
 
         if plot_icov:
             # trace(C(t)): instantaneous total variance across all feature dims

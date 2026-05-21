@@ -43,7 +43,7 @@ class ESMDMSConfig:
     embedding_model: EmbeddingModel = "esm2_t33_650M_UR50D"
     embedding_method: EmbeddingMethod = "mean_pooling"
     per_residue_mutation_pooling: bool = False
-    local_or_disk: Literal['local', 'disk'] = 'local'
+    local_or_disk: Literal['local', 'disk', 'both'] = 'local'
     save_dir: str | None = None
 
     def __post_init__(self):
@@ -137,6 +137,7 @@ class esmDMS:
         self.sequence_dataframe = None
         self.sequence_to_mutation_sites = None
         self.sequence_to_protein_sequence = None
+        self.sequence_to_features = None
 
     def load_reference_sequence(self):
         """
@@ -225,7 +226,27 @@ class esmDMS:
         if out_path is not None:
             np.save(out_path, seq_idx_to_embedding)
         return seq_idx_to_embedding
+    
+    def load_embeddings(self, layer: str) -> dict[str, np.ndarray]:
+        """
+        Load embeddings from disk if they exist.
+
+        Returns:
+        --------
+        dict[str, np.ndarray] | None
+            A dictionary mapping sequence indices to their corresponding embeddings, or None if no saved embeddings are found.
+        """
+        if self.config.save_dir is None:
+            raise ValueError("save_dir must be specified in the configuration to load embeddings from disk.")
         
+        save_path = Path(self.config.save_dir) / f"{self.config.embedding_model}_{self.config.embedding_method}_{layer}_embeddings.npy"
+        if save_path.is_file():
+            print(f"Loading embeddings from {save_path}")
+            return np.load(save_path, allow_pickle=True).item()
+        else:
+            print(f"No saved embeddings found at {save_path}.")
+            return None
+
 
     def get_mutation_sites(self, indices: list[str]) -> list[list[int]]:
         """
@@ -249,17 +270,17 @@ class esmDMS:
         return mutation_sites
 
 
-    def create_feature_space(self, embeddings: dict[str, np.ndarray], 
-                            method: Literal['None', 'PCA', 'SAE', 'SPCA'] = 'None',
+    def create_feature_space(self, layer: str, 
+                            method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
                             method_params: dict | None = None) -> dict[str, np.ndarray]:
         """
         Create an abstraction of the embeddings using the specified method.
 
         Parameters:
         -----------
-        embeddings : dict[str, np.ndarray]
-            A dictionary mapping sequence indices to their corresponding embeddings.
-        method : Literal['None', 'PCA', 'SAE', 'SPCA']
+        layer : str
+            The layer from which to extract features.
+        method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
             The method to use for creating the abstraction.
         method_params : dict | None
             Parameters for the abstraction method.
@@ -269,8 +290,40 @@ class esmDMS:
         dict[str, np.ndarray]
             A dictionary mapping sequence indices to their corresponding abstracted features.
         """
+        if method == 'Embeddings':
+            print("No abstraction method specified. Using raw embeddings as features.")
+            return
+
+        embeddings = self.load_embeddings(layer)
+        local_or_disk = self.config.local_or_disk
+
+        # If local, save the abstracted features to 
+        # self.seqeunce_to_features,
+        # else, save the abstracted features to disk at the specified path
+        
+        if local_or_disk == 'disk' or local_or_disk == 'both':
+            save_path = Path(self.config.save_dir) / f"{method}_{layer}_abstracted_features.npy"
+            if save_path.is_file():
+                print(f"Abstracted already saved in {save_path}")
+            else:
+                print(f"No saved abstracted features found at {save_path}. Creating new features and saving to disk.")
+                abstracted_features = self._create_feature_space(embeddings, method, method_params)
+                np.save(save_path, abstracted_features)
+                return
+        elif local_or_disk == 'local':
+            if self.sequence_to_features is not None:
+                print("Abstracted features already exist in memory. Returning existing features.")
+            else:
+                print("No abstracted features found in memory. Creating new features and saving to memory.")
+                abstracted_features = self._create_feature_space(embeddings, method, method_params)
+                self.sequence_to_features[method] = abstracted_features
+
+
+    def _create_feature_space(self, embeddings: dict[str, np.ndarray], 
+                        method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+                        method_params: dict | None = None) -> dict[str, np.ndarray]:
         # Placeholder for abstraction implementation
-        if method == 'None':
+        if method == 'Embeddings':
             return embeddings
         elif method == 'PCA':
             # Implement PCA abstraction here
@@ -342,17 +395,80 @@ class esmDMS:
         pass
     
 
+    def _load_abstracted_features(self, layer: str, 
+                                    method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'], 
+                                    method_params: dict | None) -> dict[str, np.ndarray]:
+        """
+        Load abstracted features from disk if they exist.
+
+        Parameters:
+        -----------
+        layer : str
+            The layer from which to extract features.
+        method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
+            The method used for abstraction.
+        method_params : dict | None
+            Parameters for the abstraction method.
+
+        Returns:
+        --------
+        dict[str, np.ndarray] | None
+            A dictionary mapping sequence indices to their corresponding abstracted features, or None if no saved features are found.
+        """
+        if method == 'Embeddings':
+            print("No abstraction method specified. Using raw embeddings as features.")
+            return self.load_embeddings(layer)
+
+        if self.sequence_to_features[method] is not None:
+            print("Abstracted features already exist in memory. Returning existing features.")
+            return self.sequence_to_features[method]
+        elif self.config.local_or_disk == 'disk' or self.config.local_or_disk == 'both':
+            save_path = Path(self.config.save_dir) / f"{method}_{layer}_abstracted_features.npy"
+            if save_path.is_file():
+                print(f"Loading abstracted features from {save_path}")
+                return np.load(save_path, allow_pickle=True).item()
+        else:
+            print(f"No saved abstracted features found at {save_path}.")
+            print("Creating new abstracted features.")
+            self.create_feature_space(layer, method, method_params)
+            if self.config.local_or_disk == 'local' or self.config.local_or_disk == 'both':
+                return self.sequence_to_features[method]
+            elif self.config.local_or_disk == 'disk':
+                save_path = Path(self.config.save_dir) / f"{method}_{layer}_abstracted_features.npy"
+                if save_path.is_file():
+                    print(f"Loading abstracted features from {save_path}")
+                    return np.load(save_path, allow_pickle=True).item()
+                else:
+                    raise ValueError(f"Failed to create and save abstracted features at {save_path}.")
+            else:
+                raise ValueError(f"Unsupported local_or_disk configuration: {self.config.local_or_disk}")
+
+    def _normalize_features(features, norm_scheme):
+        if norm_scheme == "cross_feature":
+            return (features - np.mean(features)) / (np.std(features) + 1e-8)
+        if norm_scheme == "per_feature":
+            return (features - np.mean(features, axis=0)) / (np.std(features, axis=0) + 1e-8)
+        if norm_scheme == "none":
+            return features
+        raise ValueError(f"Unsupported normalization scheme: {norm_scheme}")
+
     #TODO: add parameters for model type (linear, non-linear) and regularization scheme (L2, L1, ElasticNet)
-    def run_feature_inference(self, features: np.ndarray, layer: str | None = None,
-                              abstraction_method: Literal['None', 'PCA', 'SAE', 'SPCA'] = 'None',
-                              abstraction_params: dict | None = None) -> dict: 
+    def run_feature_inference(self, layer: str,
+                              abstraction_method: Literal['Embeddings', 'PCA', 
+                                                          'SAE', 'SPCA'],
+                              abstraction_params: dict,
+                              save_results: bool = True) -> dict: 
         """
         Run the abstracted features through the popDMS framework to calculate selection coefficients and fitness.
 
         Parameters:
         -----------
-        features : np.ndarray
-            An array of abstracted features corresponding to the input sequences.
+        layer : str | None
+            The layer from which to extract features.
+        abstraction_method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
+            The method used for feature abstraction.
+        abstraction_params : dict | None
+            Parameters for the abstraction method.
 
         Returns:
         --------
@@ -360,9 +476,8 @@ class esmDMS:
             A dictionary containing inferred selection coefficients and fitness values.
         """
 
-        norm_scheme = abstraction_params.norm_scheme if abstraction_params is not None else 'none'
-
-        if self.config.local_or_disk == 'disk':
+        norm_scheme = abstraction_params.norm_scheme if 'norm_scheme' in abstraction_params else 'none'
+        if self.config.local_or_disk == 'disk' or self.config.local_or_disk == 'both':
             # check if the features are already saved to disk
             save_path = Path(self.config.save_dir) / f"{abstraction_method}_{layer}_{norm_scheme}_inference_results.pkl"
             if save_path.is_file():
@@ -370,32 +485,27 @@ class esmDMS:
                 return pd.read_pickle(save_path)
             else:
                 print(f"No saved inference results found at {save_path}. Running inference and saving results.")
-    
-
-        features_to_use = features
-        if abstraction_params is not None:
-            if abstraction_params.norm_scheme == 'cross_feature':
-                # Z-score normalize the features across the entire feature-space
-                mean = np.mean(features)
-                std = np.std(features)
-                features_to_use = (features - mean) / (std + 1e-8)
-            elif abstraction_params.norm_scheme == 'per_feature':
-                # Z-score normalize each feature independently
-                means = np.mean(features, axis=0)
-                stds = np.std(features, axis=0)
-                features_to_use = (features - means) / (stds + 1e-8)
-            elif abstraction_params.norm_scheme == 'none':
-                # Do not perform any normalization
-                features_to_use = features
-            else:
-                raise ValueError(f"Unsupported normalization scheme: {abstraction_params.norm_scheme}")
-
         
+        # load features, seq_to_features type = dict[str, np.ndarray]
+        seq_to_features = self._load_abstracted_features(layer, abstraction_method, abstraction_params)
+        if norm_scheme is not None and norm_scheme != "none":
+            seq_ids = list(seq_to_features)
+            features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
+            features = self._normalize_features(features, norm_scheme)
+            seq_to_features = dict(zip(seq_ids, features))
+
+        inf_result = mini_infer_esm(self.sequence_dataframe, seq_to_features)
+        if save_results:
+            self._save_inference_results(inf_result, layer, 
+                                         abstraction_method, norm_scheme)
+        return inf_result
 
 
-    
-
+    def _save_inference_results(self, results: dict, layer: str, abstraction_method: str, norm_scheme: str) -> None:
+        if self.config.save_dir is None:
+            raise ValueError("save_dir must be specified in the configuration to save inference results to disk.")
         
-
+        save_path = Path(self.config.save_dir) / f"{abstraction_method}_{layer}_{norm_scheme}_inference_results.pkl"
+        pd.to_pickle(results, save_path)
     
     
