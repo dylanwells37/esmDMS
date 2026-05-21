@@ -160,132 +160,6 @@ def safe_error_bars(mat):
     return np.sqrt(np.diag(np.linalg.inv(mat_pd)))
 
 
-def mini_infer_independent_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
-                               max_reads=1e3, output_dir=None, name='esm_inference', plot_gamma=True,
-                               verbose=False, calc_error_bars=False,
-                               variance_cutoff=0.0, infer_ignored_dims=True):
-    """function to just infer to modularize the code for esm"""
-    dx, icov, x_array = compute_dx_covariance_independent_esm(embedding_df)
-    L = len(dx[0])
-
-    # Determine which dimensions to use based on variance_cutoff
-    if variance_cutoff > 0.0:
-        all_embeddings = np.vstack(embedding_df['Embedding'].values)
-        unique_embeddings = np.unique(all_embeddings, axis=0)
-        dim_variances = np.var(unique_embeddings, axis=0)
-        sorted_dims = np.argsort(dim_variances)[::-1]
-        cumulative_variance = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
-        n_keep = int(np.searchsorted(cumulative_variance, variance_cutoff)) + 1
-        kept_dims = np.sort(sorted_dims[:n_keep])
-        ignored_dims = np.setdiff1d(np.arange(L), kept_dims)
-        if verbose:
-            print(f"Variance cutoff {variance_cutoff:.2f}: keeping {len(kept_dims)}/{L} dims")
-    else:
-        kept_dims = np.arange(L)
-        ignored_dims = np.array([], dtype=int)
-
-    def _infer_dims(active_dims):
-        """Run inference (gamma selection + s computation) on a subset of dimensions."""
-        L_sub = len(active_dims)
-        dx_sub = np.array([dx[r][active_dims] for r in range(n_replicates)])
-        icov_sub = [icov[r][np.ix_(active_dims, active_dims)] for r in range(n_replicates)]
-
-        # Precompute eigendecompositions once per replicate: icov = V diag(lam) V.T
-        # Then (icov + gI)^{-1} b = V @ ((V.T b) / (lam + g)) — no per-gamma inversions.
-        eig_lam = [None] * n_replicates
-        eig_vec = [None] * n_replicates
-        vt_dx   = [None] * n_replicates
-        for r in range(n_replicates):
-            eig_lam[r], eig_vec[r] = np.linalg.eigh(icov_sub[r])
-            vt_dx[r] = eig_vec[r].T @ dx_sub[r]
-
-        # Compute optimal regularization value
-        gamma_sub = 1
-        if gamma is not None:
-            gamma_sub = gamma
-        elif n_replicates == 1:
-            if verbose:
-                print('Only one replicate, setting gamma = 1')
-            gamma_sub = 1
-        else:
-            gamma_vals = np.logspace(np.log10(1/max_reads), 4, num=20)
-            corrs = []
-            corrs_list = []
-            for g in gamma_vals:
-                s_temp = np.zeros((n_replicates, L_sub))
-                for r_idx in range(n_replicates):
-                    s_temp[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] / (eig_lam[r_idx] + g))
-                corrs.append(np.mean([st.pearsonr(s_temp[i].flatten(), s_temp[j].flatten()).statistic
-                                      for i in range(n_replicates) for j in range(i+1, n_replicates)]))
-                temp_list = []
-                for i in range(n_replicates):
-                    for j in range(i+1, n_replicates):
-                        if i != j:
-                            temp_list.append(st.pearsonr(s_temp[i], s_temp[j]).statistic)
-                corrs_list.append(temp_list)
-
-            """if plot_gamma and verbose:
-                print(f"corrs_list: {corrs_list}")
-                print(f"gamma_values: {gamma_vals}")
-                print(f"corrs: {corrs}")
-                plot_regularization_all(corrs_list, gamma_vals)"""
-
-            gamma_sub = get_best_regularization(corrs, gamma_vals, corr_cutoff_pct)
-
-        # Compute selection coefficients at optimal gamma using eigendecomposition
-        s_sub = np.zeros((n_replicates, L_sub))
-        err_sub = np.zeros((n_replicates, L_sub))
-        for r_idx in range(n_replicates):
-            inv_denom = 1.0 / (eig_lam[r_idx] + gamma_sub)
-            s_sub[r_idx] = eig_vec[r_idx] @ (vt_dx[r_idx] * inv_denom)
-            if calc_error_bars:
-                # diag((A+gI)^{-1}) = sum_k V[:,k]^2 / (lam_k + g)
-                err_sub[r_idx] = np.sqrt(eig_vec[r_idx] ** 2 @ inv_denom)
-
-        icov_sub_sum = np.sum(icov_sub, axis=0)
-        dx_sub_sum = np.sum(dx_sub, axis=0)
-        lam_j, V_j = np.linalg.eigh(icov_sub_sum)
-        inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_sub)
-        s_joint_sub = V_j @ ((V_j.T @ dx_sub_sum) * inv_denom_j)
-        if calc_error_bars:
-            s_joint_err_sub = np.sqrt(V_j ** 2 @ inv_denom_j)
-        else:
-            s_joint_err_sub = None
-
-        return s_sub, s_joint_sub, err_sub, s_joint_err_sub, gamma_sub
-
-    # Run inference on important dims
-    s_kept, s_joint_kept, err_kept, s_joint_err_kept, gamma_opt = _infer_dims(kept_dims)
-
-    # Build full output arrays; ignored dims are NaN by default
-    s = np.full((n_replicates, L), np.nan)
-    s_joint = np.full(L, np.nan)
-    error_bars = np.full((n_replicates, L), np.nan)
-    s_joint_error_bars = np.full(L, np.nan)
-
-    s[:, kept_dims] = s_kept
-    s_joint[kept_dims] = s_joint_kept
-    error_bars[:, kept_dims] = err_kept
-    if calc_error_bars and s_joint_err_kept is not None:
-        s_joint_error_bars[kept_dims] = s_joint_err_kept
-
-    # Optionally also infer the ignored dims
-    if len(ignored_dims) > 0 and infer_ignored_dims:
-        s_ign, s_joint_ign, err_ign, s_joint_err_ign, _ = _infer_dims(ignored_dims)
-        s[:, ignored_dims] = s_ign
-        s_joint[ignored_dims] = s_joint_ign
-        error_bars[:, ignored_dims] = err_ign
-        if calc_error_bars and s_joint_err_ign is not None:
-            s_joint_error_bars[ignored_dims] = s_joint_err_ign
-
-
-    #if output_dir is not None:
-    #    """path = get_selection_file(output_dir, name, file_ext='.csv.gz')
-    #    df_temp = pd.DataFrame(data=sel_data, columns=sel_cols)
-    #    df_temp.to_csv(path, index=False, compression='gzip')"""
-
-    return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
-
 
 def infer_gamma_range(embedding_df, n_replicates=1,
                       gamma_values=None, max_reads=1e2,
@@ -369,72 +243,16 @@ def infer_gamma_range(embedding_df, n_replicates=1,
     return gamma_values, s_by_gamma, s_joint_by_gamma
 
 
-
-def compute_dx_covariance_independent_esm(embedding_df):
-    """Compute the dx and icov from an embedding dataframe.
-    
-    Dataframe will have shape:
-    
-    generation | embeddings | frequency | replicate
-    
-    where embeddings is a list of floats of length d (embedding dimension).
-    """
-    
-    #print(f"EMBEDDINGS DF HEAD:\n{embedding_df.head()}")
-    
-    rep_vals = sorted(embedding_df['Replicate'].unique())
-    reps = len(rep_vals)
-    d = len(embedding_df.iloc[0]['Embedding'])
-
-    # Shape dx vector (reps x [d]) and covariance matrix (reps x [d, d]), compute for each replicate
-    dx  = [np.zeros(d) for i in range(reps)]
-    icov = [np.zeros((d, d)) for i in range(reps)]
-    x_array = []
-
-    for r_idx, rep_val in enumerate(rep_vals):
-        df_rep = embedding_df[embedding_df['Replicate'] == rep_val]
-        times = np.sort(np.unique(df_rep['Generation']))
-        dtsum = np.array([times[1]-times[0]] + [times[i+1]-times[i-1] for i in range(1, len(times)-1)] + [times[-1]-times[-2]])
-
-        x = np.zeros((len(times), d))
-        for i, t in enumerate(times):
-            df_t = df_rep[df_rep['Generation'] == t]
-            z_mat = np.vstack(df_t['Embedding'].values)
-            w = df_t['Frequency'].values / df_t['Frequency'].values.sum()
-            x[i] = w @ z_mat
-
-        x_array.append(x)
-        # Compute dx (final - initial frequency)
-        dx[r_idx] = x[-1] - x[0]
-        # Compute integrated covariance
-        ## Off-diagonal terms, same time (note: diagonals will temporarily be incorrect)
-        icov[r_idx] = np.tensordot(dtsum, -np.array([np.outer(x[i], x[i])/3 for i in range(len(times))]), axes=1)
-        ## Off-diagonal terms, cross times
-        for i in range(1, len(times)):
-            dt = times[i] - times[i-1]
-            icov[r_idx] -= dt * (np.outer(x[i-1], x[i]) + np.outer(x[i], x[i-1]))/6
-            
-        ## Diagonal terms, same time (overwrite previous diagonals)
-        icov[r_idx][np.diag_indices_from(icov[r_idx])] = dtsum.dot((x/2) - (x**2/3))
-        
-        ## Diagonal terms, cross times
-        for i in range(1, len(times)):
-            dt = times[i] - times[i-1]
-            icov[r_idx][np.diag_indices_from(icov[r_idx])] -= dt * (x[i] * x[i-1])/3
-    
-    return dx, icov, x_array
-    
-
 # ==============================================================================
-# Approach 2: full per-sequence covariance matrix
+# Approach: full per-sequence covariance matrix (don't even bother with other methods)
 # ==============================================================================
 
-def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
+def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov=True):
     """Compute the mean change (dx) and time-integrated full covariance matrix
-    (icov) from an embedding dataframe.
+    (icov) from a sequence dataframe and sequence-to-feature mapping.
 
     The covariance matrix at each time point is computed directly from
-    per-sequence embeddings:
+    per-sequence features:
 
         C_kl(t) = E[z_k * z_l](t) - E[z_k](t) * E[z_l](t)
 
@@ -444,7 +262,8 @@ def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
 
     Parameters
     ----------
-    embedding_df : DataFrame with columns Generation, Embedding, Frequency, Replicate
+    sequence_dataframe : DataFrame with columns SequenceIndex, Generation, Frequency, Replicate
+    sequence_to_feature : dict mapping SequenceIndex -> feature vector
 
     Returns
     -------
@@ -452,16 +271,16 @@ def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
     icov    : list of ndarray, length n_replicates, each shape (d, d)
     x_array : list of ndarray, length n_replicates, each shape (n_times, d)
     """
-    rep_vals = sorted(embedding_df['Replicate'].unique())
+    rep_vals = sorted(sequence_dataframe['Replicate'].unique())
     reps = len(rep_vals)
-    d    = len(embedding_df.iloc[0]['Embedding'])
+    d    = len(next(iter(sequence_to_feature.values())))
 
-    dx      = [np.zeros(d)       for _ in range(reps)] # MEAN change in embedding
+    dx      = [np.zeros(d)       for _ in range(reps)] # MEAN change in feature
     icov    = [np.zeros((d, d))  for _ in range(reps)] # INTEGRATED covariance matrix
     x_array = []
 
     for r_idx, rep_val in enumerate(rep_vals):
-        df_rep  = embedding_df[embedding_df['Replicate'] == rep_val]
+        df_rep  = sequence_dataframe[sequence_dataframe['Replicate'] == rep_val]
         times   = np.sort(np.unique(df_rep['Generation']))
         n_times = len(times)
 
@@ -472,16 +291,16 @@ def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
         for i in range(1, n_times - 1):
             trap_weights[i] = (times[i + 1] - times[i - 1]) / 2
 
-        x = np.zeros((n_times, d))     # population mean embedding
+        x = np.zeros((n_times, d))     # population mean feature
         M = np.zeros((n_times, d, d))  # population second-moment matrix
 
         for i, t in enumerate(times):
             df_t       = df_rep[df_rep['Generation'] == t]
             total_freq = df_t['Frequency'].sum()
-            z_mat      = np.vstack(df_t['Embedding'].values)   # (n_seqs, d)
+            feature_mat = np.vstack([sequence_to_feature[idx] for idx in df_t['SequenceIndex']]) # (n_seqs, d)
             w          = df_t['Frequency'].values / total_freq  # (n_seqs,)
-            x[i]       = w @ z_mat                              # weighted mean embedding (dot product of (1, n_seqs) and (n_seqs, d) -> (d,))
-            M[i]       = (z_mat.T * w) @ z_mat                 # weighted second-moment matrix (dot product of (d, n_seqs) and (n_seqs, d) -> (d, d))
+            x[i]       = w @ feature_mat                       # weighted mean feature (dot product of (1, n_seqs) and (n_seqs, d) -> (d,))
+            M[i]       = (feature_mat.T * w) @ feature_mat      # weighted second-moment matrix (dot product of (d, n_seqs) and (n_seqs, d) -> (d, d))
 
         x_array.append(x)
         dx[r_idx] = x[-1] - x[0]
@@ -493,7 +312,7 @@ def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
             icov[r_idx] += trap_weights[i] * C_all[i]
 
         if plot_icov:
-            # trace(C(t)): instantaneous total variance across all embedding dims
+            # trace(C(t)): instantaneous total variance across all feature dims
             trace_C = np.array([np.trace(C_all[i]) for i in range(n_times)])
 
             # Frobenius norm of cumulative integral up to each time point
@@ -521,29 +340,28 @@ def compute_dx_covariance_fullcov_esm(embedding_df, plot_icov=True):
     return dx, icov, x_array
 
 
-def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
+def mini_infer_esm(sequence_dataframe, sequence_to_feature, n_replicates=1, gamma=None, corr_cutoff_pct=0.5,
                             max_reads=1e2, output_dir=None, name='esm_fullcov',
                             plot_gamma=True, verbose=False, calc_error_bars=False,
                             variance_cutoff=0.0, infer_ignored_dims=True):
-    """Infer selection coefficients on ESM embedding dimensions using the full
+    """Infer selection coefficients on ESM feature dimensions using the full
     per-sequence covariance matrix (Approach 2 / full-covariance).
 
-    The covariance matrix is computed directly from per-sequence embeddings so
+    The covariance matrix is computed directly from per-sequence features so
     it is guaranteed PSD, and error bars from sqrt(diag(inv(C + gamma*I))) are
     always valid.
-
-    Parameters mirror mini_infer_independent_esm.
 
     Returns
     -------
     InferenceResult
     """
-    dx, icov, x_array = compute_dx_covariance_fullcov_esm(embedding_df)
+    dx, icov, x_array = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
     L = len(dx[0])
 
     if variance_cutoff > 0.0:
-        all_embeddings = np.vstack(embedding_df['Embedding'].values)
-        dim_variances  = np.var(all_embeddings, axis=0)
+        sequence_indices = sequence_dataframe['SequenceIndex'].unique()
+        all_features     = np.vstack([sequence_to_feature[idx] for idx in sequence_indices])
+        dim_variances    = np.var(all_features, axis=0)
         sorted_dims    = np.argsort(dim_variances)[::-1]
         cumulative_var = np.cumsum(dim_variances[sorted_dims]) / np.sum(dim_variances)
         n_keep         = int(np.searchsorted(cumulative_var, variance_cutoff)) + 1
@@ -631,4 +449,4 @@ def mini_infer_fullcov_esm(embedding_df, n_replicates=1, gamma=None, corr_cutoff
         if calc_error_bars and s_joint_err_ign is not None:
             s_joint_error_bars[ignored_dims] = s_joint_err_ign
 
-    return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
+    return InferenceResult(dx, icov, s, s_joint, None, gamma_opt, x_array, error_bars, s_joint_error_bars)
