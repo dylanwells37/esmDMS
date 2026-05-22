@@ -47,6 +47,8 @@ class ESMDMSConfig:
     save_dir: str | None = None
 
     def __post_init__(self):
+        if self.local_or_disk not in {"local", "disk", "both"}:
+            raise ValueError("local_or_disk must be one of 'local', 'disk', or 'both'.")
         if (self.local_or_disk == 'disk' or self.local_or_disk == 'both') and self.save_dir is None:
                 raise ValueError("save_dir must be specified when local_or_disk is set to 'disk' or 'both'.")
         
@@ -138,7 +140,69 @@ class esmDMS:
         self.sequence_dataframe = None
         self.sequence_to_mutation_sites = None
         self.sequence_to_protein_sequence = None
+        self.sequence_to_embeddings = {}
         self.sequence_to_features = {}
+
+    def _use_memory(self) -> bool:
+        return self.config.local_or_disk in {"local", "both"}
+
+    def _use_disk(self) -> bool:
+        return self.config.local_or_disk in {"disk", "both"}
+
+    def _save_dir(self) -> Path:
+        if self.config.save_dir is None:
+            raise ValueError("save_dir must be specified for disk-backed caching.")
+        save_dir = Path(self.config.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        return save_dir
+
+    @staticmethod
+    def _layer_label(layer: str | int) -> str:
+        layer_str = str(layer)
+        if layer_str.startswith("Layer_"):
+            return layer_str
+        return f"Layer_{int(layer_str)}"
+
+    def _embedding_key(self, layer: str | int) -> str:
+        return f"Embeddings_{self._layer_label(layer)}"
+
+    def _feature_key(self, method: str, layer: str | int) -> str:
+        return f"{method}_{self._layer_label(layer)}"
+
+    def _embedding_path(self, layer: str | int) -> Path:
+        return self._save_dir() / f"{self.config.embedding_model}_{self.config.embedding_method}_{self._layer_label(layer)}_embeddings.npy"
+
+    def _feature_path(self, method: str, layer: str | int) -> Path:
+        return self._save_dir() / f"{method}_{self._layer_label(layer)}_abstracted_features.npy"
+
+    def _inference_path(self, abstraction_method: str, layer: str | int, norm_scheme: str) -> Path:
+        return self._save_dir() / f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
+
+    @staticmethod
+    def _load_npy_dict(path: Path) -> dict[str, np.ndarray]:
+        return np.load(path, allow_pickle=True).item()
+
+    @staticmethod
+    def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
+        layer_idx = int(str(layer).replace("Layer_", ""))
+        selected = {}
+        for seq_id, embedding in embeddings.items():
+            embedding = np.asarray(embedding)
+            if embedding.ndim == 1:
+                selected[seq_id] = embedding
+            elif embedding.ndim == 2:
+                selected[seq_id] = embedding[layer_idx]
+            elif embedding.ndim == 3:
+                layer_embedding = embedding[:, layer_idx, :]
+                if layer_embedding.shape[0] != 1:
+                    raise ValueError(
+                        "Unpooled per-residue embeddings are not valid feature vectors for inference. "
+                        "Set per_residue_mutation_pooling=True or add a feature abstraction that flattens them intentionally."
+                    )
+                selected[seq_id] = layer_embedding[0]
+            else:
+                raise ValueError(f"Unsupported embedding shape for sequence {seq_id}: {embedding.shape}")
+        return selected
 
     def load_reference_sequence(self):
         """
@@ -184,7 +248,6 @@ class esmDMS:
                 self.input_data.pre_files,
                 self.input_data.post_files,
                 self.reference_sequence,
-                skip_stop_codons=drop_stop_codons
             )
 
         else:
@@ -215,7 +278,6 @@ class esmDMS:
         tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
         model = AutoModel.from_pretrained(esm_model)
         model.eval()
-        sequence_embeddings = []
 
         mutation_sites = self.get_mutation_sites(seq_ids)
         seq_idx_to_embedding = {}
@@ -225,8 +287,11 @@ class esmDMS:
             layer_embeddings = embed_sequence(prot_seq, tokenizer, model,
                                              embedding_method=embedding_method,
                                              mutation_sites=idx_mutation_sites,
-                                             per_residue_mutation_pooling=self.config.per_residue_mutation_pooling)
+                                             pool_mutations=self.config.per_residue_mutation_pooling)
             seq_idx_to_embedding[idx] = layer_embeddings
+
+        if self._use_memory():
+            self.sequence_to_embeddings.update(seq_idx_to_embedding)
 
         # Save the embeddings to the specified path if it exists
         if out_path is not None:
@@ -234,33 +299,31 @@ class esmDMS:
         return seq_idx_to_embedding
     
 
-    def embed_all_sequences(self, layer: str) -> None:
+    def embed_all_sequences(self, layer: str = "all") -> None:
         """
         Embed all sequences in the sequence dataframe and save the embeddings to disk if specified in the configuration.
         """
         if self.sequence_dataframe is None:
             raise ValueError("Sequence dataframe is not available. Please run process_raw_data() first.")
-        
-        l_o_d = self.config.local_or_disk
-        if l_o_d == 'local' or l_o_d == 'both':
-            "dsjhfaijdsf"
-        seq_ids = self.sequence_dataframe['sequence_id'].tolist()
+
+        seq_ids = sorted(self.sequence_dataframe['SequenceIndex'].unique())
         embeddings = self.embed_sequences(seq_ids)
 
         n_layers = embeddings[seq_ids[0]].shape[0]
         if layer == 'all':
             for l in range(n_layers):
-                layer_embeddings = {seq_id: embeddings[seq_id][l] for seq_id in seq_ids}
-                self.sequence_to_features[f"Layer_{l}_Embeddings"] = layer_embeddings
-                if self.config.save_dir is not None and (self.config.local_or_disk == 'disk' or self.config.local_or_disk == 'both'):
-                    save_path = Path(self.config.save_dir) / f"{self.config.embedding_model}_{self.config.embedding_method}_Layer_{l}_embeddings.npy"
+                layer_embeddings = self._select_layer(embeddings, l)
+                if self._use_memory():
+                    self.sequence_to_features[self._embedding_key(l)] = layer_embeddings
+                if self._use_disk():
+                    save_path = self._embedding_path(l)
                     np.save(save_path, layer_embeddings)
         else:
-            layer_idx = int(layer)
-            layer_embeddings = {seq_id: embeddings[seq_id][layer_idx] for seq_id in seq_ids}
-            self.sequence_to_features[f"Layer_{layer_idx}_Embeddings"] = layer_embeddings
-            if self.config.save_dir is not None and (self.config.local_or_disk == 'disk' or self.config.local_or_disk == 'both'):
-                save_path = Path(self.config.save_dir) / f"{self.config.embedding_model}_{self.config.embedding_method}_Layer_{layer_idx}_embeddings.npy"
+            layer_embeddings = self._select_layer(embeddings, layer)
+            if self._use_memory():
+                self.sequence_to_features[self._embedding_key(layer)] = layer_embeddings
+            if self._use_disk():
+                save_path = self._embedding_path(layer)
                 np.save(save_path, layer_embeddings)
         
 
@@ -275,27 +338,29 @@ class esmDMS:
             A dictionary mapping sequence indices to their corresponding embeddings, or None if no saved embeddings are found.
         """
 
-        l_o_d = self.config.local_or_disk
-        if l_o_d == 'local' or l_o_d == 'both':
-            if self.sequence_to_features.get('Embeddings') is not None:
-                print("Embeddings already exist in memory. Returning existing embeddings.")
-                return self.sequence_to_features['Embeddings']
-            else:
-                if l_o_d == 'local':
-                    print("No embeddings found in memory. Please run embed_all_sequences() to calculate embeddings.")
-                    return None
-                print("No embeddings found in memory. Attempting to load from disk if save_dir is specified.")
-        
-        if self.config.save_dir is None:
-            raise ValueError("save_dir must be specified in the configuration to load embeddings from disk.")
-        
-        save_path = Path(self.config.save_dir) / f"{self.config.embedding_model}_{self.config.embedding_method}_{layer}_embeddings.npy"
-        if save_path.is_file():
-            print(f"Loading embeddings from {save_path}")
-            return np.load(save_path, allow_pickle=True).item()
-        else:
-            print(f"No saved embeddings found at {save_path}.")
-            return None
+        key = self._embedding_key(layer)
+        if self._use_memory() and self.sequence_to_features.get(key) is not None:
+            print("Embeddings already exist in memory. Returning existing embeddings.")
+            return self.sequence_to_features[key]
+
+        if self._use_memory() and self.sequence_to_embeddings:
+            layer_embeddings = self._select_layer(self.sequence_to_embeddings, layer)
+            self.sequence_to_features[key] = layer_embeddings
+            if self._use_disk():
+                np.save(self._embedding_path(layer), layer_embeddings)
+            return layer_embeddings
+
+        if self._use_disk():
+            save_path = self._embedding_path(layer)
+            if save_path.is_file():
+                print(f"Loading embeddings from {save_path}")
+                embeddings = self._load_npy_dict(save_path)
+                if self._use_memory():
+                    self.sequence_to_features[key] = embeddings
+                return embeddings
+            raise FileNotFoundError(f"No saved embeddings found at {save_path}. Run embed_all_sequences({layer!r}) first.")
+
+        raise ValueError("No embeddings found in memory. Run embed_all_sequences() before inference.")
 
 
     def get_mutation_sites(self, indices: list[str]) -> list[list[int]]:
@@ -322,7 +387,7 @@ class esmDMS:
 
     def create_feature_space(self, layer: str, 
                             method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
-                            method_params: dict | None = None) -> None:
+                            method_params: dict | None = None) -> dict[str, np.ndarray]:
         """
         Create an abstraction of the embeddings using the specified method.
 
@@ -337,45 +402,36 @@ class esmDMS:
 
         Returns:
         --------
-        None
+        dict[str, np.ndarray]
+            A dictionary mapping sequence indices to their corresponding features.
         """
         if method == 'Embeddings':
             print("No abstraction method specified. Using raw embeddings as features.")
-            return
+            return self.load_embeddings(layer)
 
         embeddings = self.load_embeddings(layer)
-        local_or_disk = self.config.local_or_disk
+        key = self._feature_key(method, layer)
 
-        # If local, save the abstracted features to 
-        # self.seqeunce_to_features,
-        # else, save the abstracted features to disk at the specified path
-        
-        if local_or_disk == 'disk' or local_or_disk == 'both':
-            save_path = Path(self.config.save_dir) / f"{method}_{layer}_abstracted_features.npy"
+        if self._use_memory() and self.sequence_to_features.get(key) is not None:
+            print("Abstracted features already exist in memory. Returning existing features.")
+            return self.sequence_to_features[key]
+
+        if self._use_disk():
+            save_path = self._feature_path(method, layer)
             if save_path.is_file():
                 print(f"Abstracted already saved in {save_path}")
-                if local_or_disk == 'disk':
-                    return
-                else:
-                    if self.sequence_to_features.get(method) is  None:
-                        self.sequence_to_features[method] = np.load(save_path, allow_pickle=True).item()
-                    return
-            else:
-                print(f"No saved abstracted features found at {save_path}. Creating new features and saving to disk.")
-                abstracted_features = self._create_feature_space(embeddings, method, method_params)
-                np.save(save_path, abstracted_features)
-                if local_or_disk == 'disk':
-                    return 
-                else:
-                    self.sequence_to_features[method] = abstracted_features
-                    return
-        elif local_or_disk == 'local':
-            if self.sequence_to_features.get(method) is not None:
-                print("Abstracted features already exist in memory. Returning existing features.")
-            else:
-                print("No abstracted features found in memory. Creating new features and saving to memory.")
-                abstracted_features = self._create_feature_space(embeddings, method, method_params)
-                self.sequence_to_features[method] = abstracted_features
+                abstracted_features = self._load_npy_dict(save_path)
+                if self._use_memory():
+                    self.sequence_to_features[key] = abstracted_features
+                return abstracted_features
+
+        print("No abstracted features found. Creating new features.")
+        abstracted_features = self._create_feature_space(embeddings, method, method_params)
+        if self._use_memory():
+            self.sequence_to_features[key] = abstracted_features
+        if self._use_disk():
+            np.save(self._feature_path(method, layer), abstracted_features)
+        return abstracted_features
 
 
     def _create_feature_space(self, embeddings: dict[str, np.ndarray], 
@@ -413,7 +469,7 @@ class esmDMS:
         dict[str, np.ndarray]
             A dictionary mapping sequence indices to their corresponding PCA-transformed features.
         """
-        pass
+        raise NotImplementedError("PCA abstraction is not implemented yet.")
 
 
     def _sae_abstraction(self, embeddings: dict[str, np.ndarray], method_params: dict | None) -> dict[str, np.ndarray]:
@@ -432,7 +488,7 @@ class esmDMS:
         dict[str, np.ndarray]             
         A dictionary mapping sequence indices to their corresponding SAE-transformed features.
         """
-        pass
+        raise NotImplementedError("SAE abstraction is not implemented yet.")
 
 
     def _spca_abstraction(self, embeddings: dict[str, np.ndarray], method_params: dict | None) -> dict[str, np.ndarray]:
@@ -451,7 +507,7 @@ class esmDMS:
         dict[str, np.ndarray]
             A dictionary mapping sequence indices to their corresponding SPCA-transformed features.
         """
-        pass
+        raise NotImplementedError("SPCA abstraction is not implemented yet.")
     
 
     def _load_abstracted_features(self, layer: str, 
@@ -478,38 +534,21 @@ class esmDMS:
             print("No abstraction method specified. Using raw embeddings as features.")
             return self.load_embeddings(layer)
 
-        
-        if self.sequence_to_features.get(method) is not None:
+        key = self._feature_key(method, layer)
+        if self._use_memory() and self.sequence_to_features.get(key) is not None:
             print("Abstracted features already exist in memory. Returning existing features.")
-            return self.sequence_to_features[method]
-            
-        if self.config.local_or_disk == 'disk' or self.config.local_or_disk == 'both':
-            save_path = Path(self.config.save_dir) / f"{method}_{layer}_abstracted_features.npy"
+            return self.sequence_to_features[key]
+
+        if self._use_disk():
+            save_path = self._feature_path(method, layer)
             if save_path.is_file():
                 print(f"Loading abstracted features from {save_path}")
-                return np.load(save_path, allow_pickle=True).item()
-            else:
-                print(f"No saved abstracted features found at {save_path}. Creating new features and saving to disk.")
-                self.create_feature_space(layer, method, method_params)
-                if save_path.is_file():
-                    print(f"Loading abstracted features from {save_path}")
-                    return np.load(save_path, allow_pickle=True).item()
-                else:
-                    raise ValueError(f"Failed to create and save abstracted features at {save_path}.")
-        else:
-            print(f"No saved abstracted features found at the save path.")
-            print("Creating new abstracted features.")
-            self.create_feature_space(layer, method, method_params)
-            if self.config.local_or_disk == 'local' or self.config.local_or_disk == 'both':
-                return self.sequence_to_features[method]
-            elif self.config.local_or_disk == 'disk':
-                if save_path.is_file():
-                    print(f"Loading abstracted features from {save_path}")
-                    return np.load(save_path, allow_pickle=True).item()
-                else:
-                    raise ValueError(f"Failed to create and save abstracted features at {save_path}.")
-            else:
-                raise ValueError(f"Unsupported local_or_disk configuration: {self.config.local_or_disk}")
+                abstracted_features = self._load_npy_dict(save_path)
+                if self._use_memory():
+                    self.sequence_to_features[key] = abstracted_features
+                return abstracted_features
+
+        return self.create_feature_space(layer, method, method_params)
 
     def _normalize_features(self, features, norm_scheme):
         if norm_scheme == "cross_feature":
@@ -524,7 +563,7 @@ class esmDMS:
     def run_feature_inference(self, layer: str,
                               abstraction_method: Literal['Embeddings', 'PCA', 
                                                           'SAE', 'SPCA'],
-                              abstraction_params: dict,
+                              abstraction_params: dict | None = None,
                               save_results: bool = False) -> dict: 
         """
         Run the abstracted features through the popDMS framework to calculate selection coefficients and fitness.
@@ -535,7 +574,7 @@ class esmDMS:
             The layer from which to extract features.
         abstraction_method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
             The method used for feature abstraction.
-        abstraction_params : dict 
+        abstraction_params : dict | None
             Parameters for the abstraction method.
 
         Returns:
@@ -544,10 +583,14 @@ class esmDMS:
             A dictionary containing inferred selection coefficients and fitness values.
         """
 
+        if self.sequence_dataframe is None:
+            raise ValueError("Sequence dataframe is not available. Please run process_raw_data() first.")
+
+        abstraction_params = abstraction_params or {}
         norm_scheme = abstraction_params.get('norm_scheme', 'none')
-        if self.config.local_or_disk == 'disk' or self.config.local_or_disk == 'both':
+        if self._use_disk():
             # check if the features are already saved to disk
-            save_path = Path(self.config.save_dir) / f"{abstraction_method}_{layer}_{norm_scheme}_inference_results.pkl"
+            save_path = self._inference_path(abstraction_method, layer, norm_scheme)
             if save_path.is_file():
                 print(f"Loading inference results from {save_path}")
                 return pd.read_pickle(save_path)
@@ -573,6 +616,6 @@ class esmDMS:
         if self.config.save_dir is None:
             raise ValueError("save_dir must be specified in the configuration to save inference results to disk.")
         
-        save_path = Path(self.config.save_dir) / f"{abstraction_method}_{layer}_{norm_scheme}_inference_results.pkl"
+        save_path = self._inference_path(abstraction_method, layer, norm_scheme)
         pd.to_pickle(results, save_path)
     
