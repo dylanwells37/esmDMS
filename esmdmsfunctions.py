@@ -11,7 +11,7 @@ import pickle
 from scipy.stats import pearsonr, rankdata, spearmanr
 import matplotlib.pyplot as plt
 
-from popDMS import (mini_infer_independent_esm, infer_gamma_range, mini_infer_fullcov_esm)
+from popDMS import (mini_infer_esm, infer_gamma_range)
 
 #import torch
 #from transformers import AutoModel, AutoTokenizer

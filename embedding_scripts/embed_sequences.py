@@ -14,15 +14,33 @@ import pandas as pd
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-
 import psutil
 
 # Project directory
 PROJECT_DIR = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
-#PROJECT_DIR = "/Users/dylanwells/popDMS/esmDMS"
+
+# check if the project directory exists, if not, try the alternative path
+if not os.path.isdir(PROJECT_DIR):
+    PROJECT_DIR = "/Users/dylanwells/popDMS/esmDMS"
+
 sys.path.insert(0, PROJECT_DIR)
 
-from esmdmsfunctions import CODON2AA
+CODON2AA = {'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',            # Map from codons to amino acids
+            'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
+            'AAC':'N', 'AAT':'N', 'AAA':'K', 'AAG':'K',
+            'AGC':'S', 'AGT':'S', 'AGA':'R', 'AGG':'R',
+            'CTA':'L', 'CTC':'L', 'CTG':'L', 'CTT':'L',
+            'CCA':'P', 'CCC':'P', 'CCG':'P', 'CCT':'P',
+            'CAC':'H', 'CAT':'H', 'CAA':'Q', 'CAG':'Q',
+            'CGA':'R', 'CGC':'R', 'CGG':'R', 'CGT':'R',
+            'GTA':'V', 'GTC':'V', 'GTG':'V', 'GTT':'V',
+            'GCA':'A', 'GCC':'A', 'GCG':'A', 'GCT':'A',
+            'GAC':'D', 'GAT':'D', 'GAA':'E', 'GAG':'E',
+            'GGA':'G', 'GGC':'G', 'GGG':'G', 'GGT':'G',
+            'TCA':'S', 'TCC':'S', 'TCG':'S', 'TCT':'S',
+            'TTC':'F', 'TTT':'F', 'TTA':'L', 'TTG':'L',
+            'TAC':'Y', 'TAT':'Y', 'TAA':'*', 'TAG':'*',
+            'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W' }
 
 DATA_DIR = os.path.join(PROJECT_DIR, "data", "raw_data")
 HOME_SEQ_FOLDER = os.path.join(PROJECT_DIR, "data", "sequence_data")
@@ -374,9 +392,9 @@ def embed_sequence(sequence, tokenizer, model, embedding_method="mean_pool",
 
     embedding_method:
       - mean_pool: (num_layers, embedding_dim)
-      - cls: (num_layers, embedding_dim)
-      - mutation_site with pool_mutations=True: (num_layers, embedding_dim)
-      - mutation_site with pool_mutations=False: (num_mutations, num_layers, embedding_dim)
+      - cls_token: (num_layers, embedding_dim)
+      - per_residue with pool_mutations=True: (num_layers, embedding_dim)
+      - per_residue with pool_mutations=False: (num_mutations, num_layers, embedding_dim)
     """
     inputs = tokenizer(
         sequence,
@@ -389,10 +407,10 @@ def embed_sequence(sequence, tokenizer, model, embedding_method="mean_pool",
     if embedding_method == "mean_pool":
         layer_embeddings = [pool_sequence_representation(layer, inputs) for layer in outputs.hidden_states]
         return np.vstack(layer_embeddings)
-    if embedding_method == "cls":
+    if embedding_method == "cls_token":
         layer_embeddings = [cls_sequence_representation(layer) for layer in outputs.hidden_states]
         return np.vstack(layer_embeddings)
-    if embedding_method == "mutation_site":
+    if embedding_method == "per_residue":
         layer_embeddings = [
             mutation_site_representation(layer, mutation_sites or [], pool_mutations=pool_mutations)
             for layer in outputs.hidden_states

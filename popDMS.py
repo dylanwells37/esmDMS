@@ -59,7 +59,7 @@ def get_best_regularization(corrs, gamma_values,
         gamma_set = False
         
         delta_cor_set, i_set = [], []
-        for i in range(np.argmax(corrs), 1, -1):
+        for i in range(np.argmax(corrs), 0, -1):
             delta_cor_num = corrs[i]**2 - corrs[i-1]**2
             delta_cor_den = (np.log10(gamma_values[i]) - np.log10(gamma_values[i-1]))
             delta_cor_ratio = abs(delta_cor_num / delta_cor_den)
@@ -129,7 +129,7 @@ def _prepare_eigendecomp(dx, icov, n_replicates):
     return dx_arr, eig_lam, eig_vec, vt_dx, lam_j, V_j, vt_dx_j
 
 
-def infer_gamma_range(sequence_dataframe, sequence_to_feature, n_replicates=1,
+def infer_gamma_range(sequence_dataframe, sequence_to_feature,
                       gamma_values=None, max_reads=1e2):
     """ Infer selection coefficients across a range of gamma values.
 
@@ -141,6 +141,7 @@ def infer_gamma_range(sequence_dataframe, sequence_to_feature, n_replicates=1,
         Per-replicate selection coefficients for each gamma.
     s_joint_by_gamma : np.ndarray, shape (n_gamma, L)
         Joint selection coefficients for each gamma. """
+    n_replicates = len(sequence_dataframe['Replicate'].unique())
     dx, icov, _ = compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature)
 
     if gamma_values is None:
@@ -313,6 +314,6 @@ def mini_infer_esm(sequence_dataframe, sequence_to_feature,
 
     inv_denom_j = 1.0 / (lam_j + n_replicates * gamma_opt)
     s_joint = V_j @ (vt_dx_j * inv_denom_j)
-    s_joint_error_bars = np.sqrt(V_j ** 2 @ inv_denom_j**2) if calc_error_bars else np.full(L, np.nan)
+    s_joint_error_bars = np.sqrt(V_j ** 2 @ inv_denom_j) if calc_error_bars else np.full(L, np.nan)
 
     return InferenceResult(dx, icov, s, s_joint, gamma_opt, x_array, error_bars, s_joint_error_bars)
