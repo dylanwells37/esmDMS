@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -170,17 +171,23 @@ class esmDMS:
         return f"{method}_{self._layer_label(layer)}"
 
     def _embedding_path(self, layer: str | int) -> Path:
-        return self._save_dir() / f"{self.config.embedding_model}_{self.config.embedding_method}_{self._layer_label(layer)}_embeddings.npy"
+        return self._save_dir() / f"{self.config.embedding_model}_{self.config.embedding_method}_{self._layer_label(layer)}_embeddings.pkl"
 
     def _feature_path(self, method: str, layer: str | int) -> Path:
-        return self._save_dir() / f"{method}_{self._layer_label(layer)}_abstracted_features.npy"
+        return self._save_dir() / f"{method}_{self._layer_label(layer)}_abstracted_features.pkl"
 
     def _inference_path(self, abstraction_method: str, layer: str | int, norm_scheme: str) -> Path:
         return self._save_dir() / f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
 
     @staticmethod
-    def _load_npy_dict(path: Path) -> dict[str, np.ndarray]:
-        return np.load(path, allow_pickle=True).item()
+    def _load_pickle(path: Path):
+        with path.open("rb") as f:
+            return pickle.load(f)
+
+    @staticmethod
+    def _save_pickle(value, path: Path) -> None:
+        with path.open("wb") as f:
+            pickle.dump(value, f)
 
     @staticmethod
     def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
@@ -295,7 +302,7 @@ class esmDMS:
 
         # Save the embeddings to the specified path if it exists
         if out_path is not None:
-            np.save(out_path, seq_idx_to_embedding)
+            self._save_pickle(seq_idx_to_embedding, Path(out_path))
         return seq_idx_to_embedding
     
 
@@ -317,14 +324,14 @@ class esmDMS:
                     self.sequence_to_features[self._embedding_key(l)] = layer_embeddings
                 if self._use_disk():
                     save_path = self._embedding_path(l)
-                    np.save(save_path, layer_embeddings)
+                    self._save_pickle(layer_embeddings, save_path)
         else:
             layer_embeddings = self._select_layer(embeddings, layer)
             if self._use_memory():
                 self.sequence_to_features[self._embedding_key(layer)] = layer_embeddings
             if self._use_disk():
                 save_path = self._embedding_path(layer)
-                np.save(save_path, layer_embeddings)
+                self._save_pickle(layer_embeddings, save_path)
         
 
 
@@ -347,14 +354,14 @@ class esmDMS:
             layer_embeddings = self._select_layer(self.sequence_to_embeddings, layer)
             self.sequence_to_features[key] = layer_embeddings
             if self._use_disk():
-                np.save(self._embedding_path(layer), layer_embeddings)
+                self._save_pickle(layer_embeddings, self._embedding_path(layer))
             return layer_embeddings
 
         if self._use_disk():
             save_path = self._embedding_path(layer)
             if save_path.is_file():
                 print(f"Loading embeddings from {save_path}")
-                embeddings = self._load_npy_dict(save_path)
+                embeddings = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = embeddings
                 return embeddings
@@ -420,7 +427,7 @@ class esmDMS:
             save_path = self._feature_path(method, layer)
             if save_path.is_file():
                 print(f"Abstracted already saved in {save_path}")
-                abstracted_features = self._load_npy_dict(save_path)
+                abstracted_features = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = abstracted_features
                 return abstracted_features
@@ -430,7 +437,7 @@ class esmDMS:
         if self._use_memory():
             self.sequence_to_features[key] = abstracted_features
         if self._use_disk():
-            np.save(self._feature_path(method, layer), abstracted_features)
+            self._save_pickle(abstracted_features, self._feature_path(method, layer))
         return abstracted_features
 
 
@@ -543,7 +550,7 @@ class esmDMS:
             save_path = self._feature_path(method, layer)
             if save_path.is_file():
                 print(f"Loading abstracted features from {save_path}")
-                abstracted_features = self._load_npy_dict(save_path)
+                abstracted_features = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = abstracted_features
                 return abstracted_features
@@ -593,7 +600,7 @@ class esmDMS:
             save_path = self._inference_path(abstraction_method, layer, norm_scheme)
             if save_path.is_file():
                 print(f"Loading inference results from {save_path}")
-                return pd.read_pickle(save_path)
+                return self._load_pickle(save_path)
             else:
                 print(f"No saved inference results found at {save_path}. Running inference and saving results.")
         
@@ -617,5 +624,5 @@ class esmDMS:
             raise ValueError("save_dir must be specified in the configuration to save inference results to disk.")
         
         save_path = self._inference_path(abstraction_method, layer, norm_scheme)
-        pd.to_pickle(results, save_path)
+        self._save_pickle(results, save_path)
     
