@@ -202,7 +202,8 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
         df_rep  = sequence_dataframe[sequence_dataframe['Replicate'] == rep_val]
         times   = np.sort(np.unique(df_rep['Generation']))
         n_times = len(times)
-
+        if n_times < 2:
+            raise ValueError(f"Replicate {rep_val} has {n_times} timepoint(s); need >= 2.")
         # Trapezoid weights for time integration
         trap_weights        = np.zeros(n_times)
         trap_weights[0]     = (times[1] - times[0]) / 2
@@ -216,6 +217,8 @@ def compute_dx_covariance_esm(sequence_dataframe, sequence_to_feature, plot_icov
         for i, t in enumerate(times):
             df_t       = df_rep[df_rep['Generation'] == t]
             total_freq = df_t['Frequency'].sum()
+            if total_freq == 0:
+                continue
             feature_mat = np.vstack([sequence_to_feature[idx] for idx in df_t['SequenceIndex']]) # (n_seqs, d)
             w          = df_t['Frequency'].values / total_freq  # (n_seqs,)
             x[i]       = w @ feature_mat                       # weighted mean feature (dot product of (1, n_seqs) and (n_seqs, d) -> (d,))

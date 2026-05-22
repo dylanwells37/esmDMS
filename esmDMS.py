@@ -21,7 +21,7 @@ from embedding_scripts.embed_sequences import (
     embed_sequence
 )
 
-from popDMS import mini_infer_esm
+from popDMS import mini_infer_esm, InferenceResult
 
 
 ## TYPE DEFINITIONS #################################
@@ -134,7 +134,6 @@ class esmDMS:
     sequence_dataframe: pd.DataFrame | None
 
     def __init__(self, input_data: DMSInput, config: ESMDMSConfig = ESMDMSConfig()):
-
         self.input_data = input_data
         self.config = config
         self.reference_sequence = None
@@ -143,6 +142,7 @@ class esmDMS:
         self.sequence_to_protein_sequence = None
         self.sequence_to_embeddings = {}
         self.sequence_to_features = {}
+        self.inference_results = {}
 
     def _use_memory(self) -> bool:
         return self.config.local_or_disk in {"local", "both"}
@@ -178,6 +178,9 @@ class esmDMS:
 
     def _inference_path(self, abstraction_method: str, layer: str | int, norm_scheme: str) -> Path:
         return self._save_dir() / f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
+
+    def _inference_key(self, layer: str, abstraction_method: str, norm_scheme: str) -> str:
+        return f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results"
 
     @staticmethod
     def _load_pickle(path: Path):
@@ -570,8 +573,7 @@ class esmDMS:
     def run_feature_inference(self, layer: str,
                               abstraction_method: Literal['Embeddings', 'PCA', 
                                                           'SAE', 'SPCA'],
-                              abstraction_params: dict | None = None,
-                              save_results: bool = False) -> dict: 
+                              abstraction_params: dict | None = None) -> InferenceResult: 
         """
         Run the abstracted features through the popDMS framework to calculate selection coefficients and fitness.
 
@@ -586,8 +588,17 @@ class esmDMS:
 
         Returns:
         --------
-        dict
-            A dictionary containing inferred selection coefficients and fitness values.
+        InferenceResult
+            An InferenceResult object containing inferred selection coefficients and fitness values.
+            class InferenceResult:
+            dx: list
+            icov: list
+            s: np.ndarray
+            s_joint: np.ndarray
+            gamma_opt: float
+            x_array: list
+            error_bars: np.ndarray
+            s_joint_error_bars: np.ndarray
         """
 
         if self.sequence_dataframe is None:
@@ -613,9 +624,11 @@ class esmDMS:
             seq_to_features = dict(zip(seq_ids, features))
 
         inf_result = mini_infer_esm(self.sequence_dataframe, seq_to_features)
-        if save_results:
+        if self._use_disk():
             self._save_inference_results(inf_result, layer, 
                                          abstraction_method, norm_scheme)
+        if self._use_memory():
+            self.inference_results[self._inference_key(layer, abstraction_method, norm_scheme)] = inf_result
         return inf_result
 
 
@@ -626,3 +639,36 @@ class esmDMS:
         save_path = self._inference_path(abstraction_method, layer, norm_scheme)
         self._save_pickle(results, save_path)
     
+
+    def plot_rep_sel_comps(self, inference_results: InferenceResult):
+        """
+        Plot the consistency of inferred selection coefficients across replicates.
+
+        Parameters:
+        -----------
+        inference_results : InferenceResult
+            An InferenceResult object containing inferred selection coefficients and fitness values.
+
+        Returns:
+        --------
+        None
+            Displays a plot of inferred selection coefficients across replicates.
+        """
+
+        pass
+
+    def plot_rep_fit_comps(self, inference_results: InferenceResult):
+        """
+        Plot the consistency of inferred fitness values across replicates.
+
+        Parameters:
+        -----------
+        inference_results : InferenceResult
+            An InferenceResult object containing inferred selection coefficients and fitness values.
+
+        Returns:
+        --------
+        None
+            Displays a plot of inferred fitness values across replicates.
+        """
+        pass    
