@@ -8,6 +8,9 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearsonr, spearmanr
 from transformers import AutoModel, AutoTokenizer
 
 from embedding_scripts.embed_sequences import (
@@ -638,37 +641,205 @@ class esmDMS:
         
         save_path = self._inference_path(abstraction_method, layer, norm_scheme)
         self._save_pickle(results, save_path)
-    
 
-    def plot_rep_sel_comps(self, inference_results: InferenceResult):
+    def load_inference_results(
+        self,
+        layer: str | int,
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        norm_scheme: str = "none",
+    ) -> InferenceResult:
         """
-        Plot the consistency of inferred selection coefficients across replicates.
-
-        Parameters:
-        -----------
-        inference_results : InferenceResult
-            An InferenceResult object containing inferred selection coefficients and fitness values.
-
-        Returns:
-        --------
-        None
-            Displays a plot of inferred selection coefficients across replicates.
+        Load inference results from memory or disk for a layer/method/norm tuple.
         """
+        key = self._inference_key(str(layer), abstraction_method, norm_scheme)
+        if self._use_memory() and key in self.inference_results:
+            return self.inference_results[key]
 
-        pass
+        if self._use_disk():
+            path = self._inference_path(abstraction_method, layer, norm_scheme)
+            if path.is_file():
+                result = self._load_pickle(path)
+                if self._use_memory():
+                    self.inference_results[key] = result
+                return result
 
-    def plot_rep_fit_comps(self, inference_results: InferenceResult):
+        raise FileNotFoundError(
+            f"No inference results found for layer={layer}, "
+            f"abstraction_method={abstraction_method}, norm_scheme={norm_scheme}."
+        )
+
+    @staticmethod
+    def _safe_corr(x, y, corr_fn):
+        x = np.asarray(x)
+        y = np.asarray(y)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 2:
+            return np.nan
+        x = x[mask]
+        y = y[mask]
+        if np.std(x) == 0 or np.std(y) == 0:
+            return np.nan
+        return corr_fn(x, y).statistic
+
+    @staticmethod
+    def _rep_pairs(n_reps: int) -> list[tuple[int, int]]:
+        return [(i, j) for i in range(n_reps) for j in range(i + 1, n_reps)]
+
+    def _features_for_inference(
+        self,
+        layer: str | int,
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'],
+        norm_scheme: str,
+    ) -> tuple[list, np.ndarray]:
+        seq_to_features = self._load_abstracted_features(layer, abstraction_method, {"norm_scheme": norm_scheme})
+        seq_ids = list(seq_to_features)
+        features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
+        if norm_scheme is not None and norm_scheme != "none":
+            features = self._normalize_features(features, norm_scheme)
+        return seq_ids, features
+
+    def _plot_rep_scatter_grid(
+        self,
+        rep_values: np.ndarray,
+        title: str,
+        axis_label: str,
+        output_path: str | Path | None = None,
+        max_cols: int = 3,
+    ):
+        sns.set_theme(style="darkgrid")
+        rep_values = np.asarray(rep_values)
+        n_reps = rep_values.shape[0]
+        pairs = self._rep_pairs(n_reps)
+        if not pairs:
+            raise ValueError("At least two replicates are required for replicate comparison plots.")
+
+        n_cols = min(max_cols, len(pairs))
+        n_rows = int(np.ceil(len(pairs) / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows), squeeze=False)
+        fig.suptitle(title, fontsize=13)
+
+        for ax_idx, (ri, rj) in enumerate(pairs):
+            row, col = divmod(ax_idx, n_cols)
+            ax = axes[row][col]
+            x = rep_values[ri]
+            y = rep_values[rj]
+            pr = self._safe_corr(x, y, pearsonr)
+            sr = self._safe_corr(x, y, spearmanr)
+            sns.scatterplot(x=x, y=y, ax=ax, s=14, alpha=0.55, edgecolor=None)
+
+            finite = np.isfinite(x) & np.isfinite(y)
+            if finite.any():
+                lo = min(np.min(x[finite]), np.min(y[finite]))
+                hi = max(np.max(x[finite]), np.max(y[finite]))
+                pad = (hi - lo) * 0.05 if hi > lo else 1.0
+                lo -= pad
+                hi += pad
+                ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1, color="black", alpha=0.7)
+                ax.set_xlim(lo, hi)
+                ax.set_ylim(lo, hi)
+
+            ax.set_title(f"Rep {ri + 1} vs Rep {rj + 1}\nr={pr:.3f}, rho={sr:.3f}", fontsize=10)
+            ax.set_xlabel(f"Rep {ri + 1} {axis_label}")
+            ax.set_ylabel(f"Rep {rj + 1} {axis_label}")
+
+        for ax_idx in range(len(pairs), n_rows * n_cols):
+            row, col = divmod(ax_idx, n_cols)
+            axes[row][col].set_visible(False)
+
+        fig.tight_layout()
+        if output_path is not None:
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        return fig
+
+    def plot_rep_sel_comps(
+        self,
+        layer: str | int,
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        norm_scheme: str = "none",
+        label: str | None = None,
+        output_path: str | Path | None = None,
+        max_cols: int = 3,
+    ):
         """
-        Plot the consistency of inferred fitness values across replicates.
-
-        Parameters:
-        -----------
-        inference_results : InferenceResult
-            An InferenceResult object containing inferred selection coefficients and fitness values.
-
-        Returns:
-        --------
-        None
-            Displays a plot of inferred fitness values across replicates.
+        Plot replicate-vs-replicate inferred selection coefficients for a saved result.
         """
-        pass    
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme)
+        title_label = label or abstraction_method
+        title = f"{title_label} selection coefficients, {self._layer_label(layer)}"
+        return self._plot_rep_scatter_grid(result.s, title, "selection coefficient", output_path, max_cols)
+
+    def plot_rep_fit_comps(
+        self,
+        layer: str | int,
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        norm_scheme: str = "none",
+        label: str | None = None,
+        output_path: str | Path | None = None,
+        max_cols: int = 3,
+    ):
+        """
+        Plot replicate-vs-replicate inferred sequence fitness for a saved result.
+        """
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme)
+        _, features = self._features_for_inference(layer, abstraction_method, norm_scheme)
+        rep_fitness = np.asarray([features @ result.s[rep_idx] for rep_idx in range(result.s.shape[0])])
+        title_label = label or abstraction_method
+        title = f"{title_label} inferred fitness, {self._layer_label(layer)}"
+        return self._plot_rep_scatter_grid(rep_fitness, title, "fitness", output_path, max_cols)
+
+    def plot_avg_rep_correlations_by_layer(
+        self,
+        layers: list[str | int],
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        norm_scheme: str = "none",
+        comparison: Literal["selection", "fitness"] = "selection",
+        label: str | None = None,
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, pd.DataFrame]:
+        """
+        Plot average pairwise Pearson and Spearman replicate correlations across layers.
+        """
+        sns.set_theme(style="darkgrid")
+        rows = []
+        for layer in layers:
+            result = self.load_inference_results(layer, abstraction_method, norm_scheme)
+            if comparison == "selection":
+                rep_values = result.s
+            elif comparison == "fitness":
+                _, features = self._features_for_inference(layer, abstraction_method, norm_scheme)
+                rep_values = np.asarray([features @ result.s[rep_idx] for rep_idx in range(result.s.shape[0])])
+            else:
+                raise ValueError("comparison must be either 'selection' or 'fitness'.")
+
+            pearson_vals = []
+            spearman_vals = []
+            pairs = self._rep_pairs(rep_values.shape[0])
+            for ri, rj in pairs:
+                pearson_vals.append(self._safe_corr(rep_values[ri], rep_values[rj], pearsonr))
+                spearman_vals.append(self._safe_corr(rep_values[ri], rep_values[rj], spearmanr))
+
+            rows.append({
+                "layer": layer,
+                "pearson_r": np.nanmean(pearson_vals) if pearson_vals else np.nan,
+                "spearman_r": np.nanmean(spearman_vals) if spearman_vals else np.nan,
+                "n_pairs": len(pairs),
+            })
+
+        corr_df = pd.DataFrame(rows)
+        if corr_df.empty:
+            raise ValueError("At least one layer is required for the correlation summary plot.")
+
+        fig, ax = plt.subplots(figsize=(max(6, len(corr_df) * 0.45), 4))
+        ax.plot(corr_df["layer"], corr_df["pearson_r"], marker="o", label="Pearson r")
+        ax.plot(corr_df["layer"], corr_df["spearman_r"], marker="s", label="Spearman rho")
+        ax.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_ylim(-1, 1)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Average pairwise replicate correlation")
+        title_label = label or abstraction_method
+        ax.set_title(f"{title_label} {comparison} replicate correlations by layer")
+        ax.legend()
+        fig.tight_layout()
+        if output_path is not None:
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        return fig, corr_df
