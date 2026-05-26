@@ -745,7 +745,8 @@ export TMPDIR="$SCRDIR"
         A dictionary mapping sequence indices to their corresponding SAE-transformed features.
         """
         raise NotImplementedError("SAE abstraction is not implemented yet.")
-
+    
+    #TODO Add a regular autoencoder abstraction as well 
 
     def _spca_abstraction(self, embeddings: dict[str, np.ndarray], method_params: dict | None) -> dict[str, np.ndarray]:
         """
