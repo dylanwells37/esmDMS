@@ -101,6 +101,51 @@ class ViralDMSInput:
 
 DMSInput = CellularDMSInput | ViralDMSInput
 
+## SPARSE AUTOENCODER ########################################################
+
+
+class SparseAutoencoder(torch.nn.Module):
+    """
+    Simple sparse autoencoder: Linear+ReLU encoder, linear decoder (no bias).
+
+    Architecture:
+        x  →  encoder (Linear + ReLU)  →  z  →  decoder (Linear)  →  x_hat
+
+    The decoder columns are optionally kept at unit norm throughout training to
+    prevent feature collapse (standard SAE practice).
+
+    Loss = MSE(x, x_hat) + sparsity_coeff * mean(|z|)
+    """
+
+    def __init__(self, input_dim: int, n_features: int, normalize_decoder: bool = True):
+        super().__init__()
+        self.encoder = torch.nn.Linear(input_dim, n_features)
+        self.decoder = torch.nn.Linear(n_features, input_dim, bias=False)
+        self.normalize_decoder = normalize_decoder
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        torch.nn.init.kaiming_uniform_(self.encoder.weight)
+        torch.nn.init.zeros_(self.encoder.bias)
+        torch.nn.init.kaiming_uniform_(self.decoder.weight)
+        if self.normalize_decoder:
+            self._renorm_decoder()
+
+    def _renorm_decoder(self) -> None:
+        """Project decoder columns back to the unit sphere (in-place, no grad)."""
+        with torch.no_grad():
+            norms = self.decoder.weight.norm(dim=0, keepdim=True).clamp(min=1e-8)
+            self.decoder.weight.div_(norms)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(self.encoder(x))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z = self.encode(x)
+        x_hat = self.decoder(z)
+        return x_hat, z
+
+
 ####### esmDMS CLASS #########################################################
 
 class esmDMS:
@@ -245,6 +290,22 @@ class esmDMS:
 
     def _inference_payload_path(self, inference_job_dir: Path) -> Path:
         return inference_job_dir / f"{self._dataset_prefix()}inference_payload.pkl"
+
+    # ── SAE path helpers ──────────────────────────────────────────────────
+
+    def _sae_model_dir(self) -> Path:
+        return self._save_dir() / "sae_models"
+
+    def _sae_tag(self, layer: str | int, n_features: int, sparsity_coeff: float) -> str:
+        return f"{self._dataset_prefix()}sae_{self._layer_label(layer)}_{n_features}_{sparsity_coeff}"
+
+    def _sae_model_path(self, layer: str | int, n_features: int, sparsity_coeff: float) -> Path:
+        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff)}_model.pt"
+
+    def _sae_viz_path(self, layer: str | int, n_features: int, sparsity_coeff: float) -> Path:
+        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff)}_viz_data.pkl"
+
+    # ── Embedding layer selection ─────────────────────────────────────────
 
     @staticmethod
     def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
@@ -682,7 +743,9 @@ export TMPDIR="$SCRDIR"
                 return abstracted_features
 
         print("No abstracted features found. Creating new features.")
-        abstracted_features = self._create_feature_space(embeddings, method, method_params)
+        _params = dict(method_params or {})
+        _params.setdefault("_layer", layer)
+        abstracted_features = self._create_feature_space(embeddings, method, _params)
         if self._use_memory():
             self.sequence_to_features[key] = abstracted_features
         if self._use_disk():
@@ -744,9 +807,138 @@ export TMPDIR="$SCRDIR"
         dict[str, np.ndarray]             
         A dictionary mapping sequence indices to their corresponding SAE-transformed features.
         """
-        raise NotImplementedError("SAE abstraction is not implemented yet.")
-    
-    #TODO Add a regular autoencoder abstraction as well 
+        params = method_params or {}
+        layer = params.get("_layer", "unknown")
+
+        # ── Hyper-parameters ──────────────────────────────────────────────
+        sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
+        lr: float = params.get("lr", 1e-3)
+        epochs: int = params.get("epochs", 200)
+        batch_size: int = params.get("batch_size", 64)
+        train_frac: float = params.get("train_frac", 0.8)
+        normalize_decoder: bool = params.get("normalize_decoder", True)
+        activity_threshold: float = params.get("activity_threshold", 1e-3)
+        seed: int = params.get("seed", 42)
+
+        # ── Build data matrix ─────────────────────────────────────────────
+        seq_ids = list(embeddings.keys())
+        X = np.asarray([embeddings[sid] for sid in seq_ids], dtype=np.float32)
+        n_samples, input_dim = X.shape
+
+        n_features: int = params.get("n_features", input_dim * 2)
+
+        # ── Train / test split ────────────────────────────────────────────
+        n_train = max(1, int(n_samples * train_frac))
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(n_samples)
+        train_idx, test_idx = perm[:n_train], perm[n_train:]
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        X_train = torch.from_numpy(X[train_idx]).to(device)
+        X_test = torch.from_numpy(X[test_idx]).to(device) if len(test_idx) else None
+
+        # ── Model + optimizer ─────────────────────────────────────────────
+        model = SparseAutoencoder(input_dim, n_features, normalize_decoder).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        # ── Training loop ─────────────────────────────────────────────────
+        train_losses: list[float] = []
+        test_losses: list[float] = []
+        for epoch in range(epochs):
+            model.train()
+            epoch_perm = torch.randperm(len(X_train), device=device)
+            epoch_loss = 0.0
+            n_batches = 0
+            for start in range(0, len(X_train), batch_size):
+                batch = X_train[epoch_perm[start : start + batch_size]]
+                optimizer.zero_grad()
+                x_hat, z = model(batch)
+                loss = torch.nn.functional.mse_loss(x_hat, batch) + sparsity_coeff * z.abs().mean()
+                loss.backward()
+                optimizer.step()
+                if normalize_decoder:
+                    model._renorm_decoder()
+                epoch_loss += loss.item()
+                n_batches += 1
+            train_losses.append(epoch_loss / max(n_batches, 1))
+
+            model.eval()
+            with torch.no_grad():
+                if X_test is not None:
+                    x_hat_t, _ = model(X_test)
+                    test_losses.append(torch.nn.functional.mse_loss(x_hat_t, X_test).item())
+                else:
+                    test_losses.append(float("nan"))
+
+            if (epoch + 1) % 50 == 0:
+                print(
+                    f"  SAE epoch {epoch + 1}/{epochs}  "
+                    f"train_loss={train_losses[-1]:.5f}  "
+                    f"test_loss={test_losses[-1]:.5f}"
+                )
+
+        # ── Extract activations for all sequences ─────────────────────────
+        model.eval()
+        X_all_t = torch.from_numpy(X).to(device)
+        with torch.no_grad():
+            X_recon_t, Z_all_t = model(X_all_t)
+        Z_all = Z_all_t.cpu().numpy()          # (n_samples, n_features)
+        X_recon = X_recon_t.cpu().numpy()      # (n_samples, input_dim)
+
+        # ── Identify active neurons ───────────────────────────────────────
+        mean_act = Z_all.mean(axis=0)
+        active_mask = mean_act > activity_threshold
+        if not active_mask.any():
+            print(
+                "Warning: no neurons exceeded the activity threshold. "
+                "Falling back to the top 10% most active neurons."
+            )
+            active_mask = mean_act >= np.percentile(mean_act, 90)
+
+        n_active = int(active_mask.sum())
+        print(
+            f"SAE: {n_active}/{n_features} neurons active "
+            f"(threshold={activity_threshold}, layer={layer})"
+        )
+        Z_active = Z_all[:, active_mask]       # (n_samples, n_active)
+
+        result = {sid: Z_active[i] for i, sid in enumerate(seq_ids)}
+
+        # ── Persist model + viz data ──────────────────────────────────────
+        if self._use_disk():
+            sae_dir = self._sae_model_dir()
+            sae_dir.mkdir(parents=True, exist_ok=True)
+
+            model_path = self._sae_model_path(layer, n_features, sparsity_coeff)
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "input_dim": input_dim,
+                    "n_features": n_features,
+                    "normalize_decoder": normalize_decoder,
+                    "active_mask": active_mask,
+                    "params": params,
+                },
+                model_path,
+            )
+            print(f"SAE model saved to {model_path}")
+
+            viz_data = {
+                "seq_ids": seq_ids,
+                "train_idx": train_idx.tolist(),
+                "test_idx": test_idx.tolist(),
+                "Z_all": Z_all,
+                "X_original": X,
+                "X_reconstructed": X_recon,
+                "train_losses": train_losses,
+                "test_losses": test_losses,
+                "active_mask": active_mask,
+            }
+            self._save_pickle(viz_data, self._sae_viz_path(layer, n_features, sparsity_coeff))
+
+        return result
+
+    #TODO Add a regular autoencoder abstraction as well
 
     def _spca_abstraction(self, embeddings: dict[str, np.ndarray], method_params: dict | None) -> dict[str, np.ndarray]:
         """
@@ -765,7 +957,154 @@ export TMPDIR="$SCRDIR"
             A dictionary mapping sequence indices to their corresponding SPCA-transformed features.
         """
         raise NotImplementedError("SPCA abstraction is not implemented yet.")
-    
+
+
+    def visualize_sae_reconstructions(
+        self,
+        layer: str | int,
+        method_params: dict | None = None,
+        output_path: str | Path | None = None,
+    ) -> plt.Figure:
+        """
+        Visualise SAE reconstruction quality for a trained model.
+
+        Four panels (2x2):
+          - Per-sample MSE distribution (train / test)
+          - Per-sample cosine similarity distribution (train / test)
+          - Reconstruction accuracy: cumulative fraction of samples above each
+            cosine-similarity threshold
+          - Spread of hidden-neuron activation frequencies across the population
+
+        Parameters
+        ----------
+        layer : str | int
+            Layer for which the SAE was trained.
+        method_params : dict | None
+            Same params used when calling create_feature_space(method='SAE').
+            Must provide n_features / sparsity_coeff so the right model can be
+            located (defaults will match defaults used during training).
+        output_path : str | Path | None
+            Override where the figure is saved.  When None the figure is saved
+            to the SAE model directory (disk mode) and / or shown interactively
+            (local mode), matching the local_or_disk setting.
+        """
+        params = dict(method_params or {})
+        sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
+
+        # Resolve n_features: need input_dim to compute the default.
+        embeddings = self.load_embeddings(layer)
+        input_dim = next(iter(embeddings.values())).shape[0]
+        n_features: int = params.get("n_features", input_dim * 2)
+
+        viz_path = self._sae_viz_path(layer, n_features, sparsity_coeff)
+        if not viz_path.is_file():
+            raise FileNotFoundError(
+                f"No SAE visualisation data found at {viz_path}. "
+                "Run create_feature_space(..., method='SAE') first."
+            )
+        viz = self._load_pickle(viz_path)
+
+        X_orig = viz["X_original"]           # (n, d)
+        X_recon = viz["X_reconstructed"]     # (n, d)
+        Z_all = viz["Z_all"]                 # (n, n_features)
+        train_idx = np.asarray(viz["train_idx"])
+        test_idx = np.asarray(viz["test_idx"])
+        train_losses = viz["train_losses"]
+        test_losses = viz["test_losses"]
+        active_mask = viz["active_mask"]
+
+        # ── Per-sample metrics ────────────────────────────────────────────
+        mse_per_sample = np.mean((X_orig - X_recon) ** 2, axis=1)
+
+        norm_orig = np.linalg.norm(X_orig, axis=1, keepdims=True).clip(min=1e-8)
+        norm_recon = np.linalg.norm(X_recon, axis=1, keepdims=True).clip(min=1e-8)
+        cos_sim = np.sum((X_orig / norm_orig) * (X_recon / norm_recon), axis=1)
+
+        # Activation frequency per hidden neuron
+        act_freq = (Z_all > 0).mean(axis=0)
+
+        # ── Figure ────────────────────────────────────────────────────────
+        sns.set_theme(style="darkgrid")
+        fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+        fig.suptitle(
+            f"SAE Reconstruction Quality — {self._layer_label(layer)}, "
+            f"n_features={n_features}, λ={sparsity_coeff}",
+            fontsize=13,
+        )
+
+        splits = [("train", train_idx)]
+        if len(test_idx):
+            splits.append(("test", test_idx))
+
+        # Panel 1: MSE
+        ax = axes[0, 0]
+        for name, idx in splits:
+            ax.hist(mse_per_sample[idx], bins=50, alpha=0.65, density=True,
+                    label=f"{name} (n={len(idx)})")
+        ax.set_xlabel("MSE")
+        ax.set_ylabel("Density")
+        ax.set_title("Per-sample reconstruction MSE")
+        ax.legend()
+
+        # Panel 2: Cosine similarity
+        ax = axes[0, 1]
+        for name, idx in splits:
+            ax.hist(cos_sim[idx], bins=50, alpha=0.65, density=True, label=name)
+        ax.set_xlabel("Cosine similarity")
+        ax.set_ylabel("Density")
+        ax.set_title("Per-sample cosine similarity (original vs reconstructed)")
+        ax.legend()
+
+        # Panel 3: Reconstruction accuracy (cumulative cosine-sim curve)
+        ax = axes[1, 0]
+        thresholds = np.linspace(0.0, 1.0, 300)
+        for name, idx in splits:
+            frac_above = np.array([(cos_sim[idx] >= t).mean() for t in thresholds])
+            ax.plot(thresholds, frac_above, label=name)
+        ax.set_xlabel("Cosine similarity threshold")
+        ax.set_ylabel("Fraction of samples above threshold")
+        ax.set_title("Reconstruction accuracy (cumulative)")
+        ax.legend()
+
+        # Panel 4: Activation frequency spread
+        ax = axes[1, 1]
+        ax.hist(act_freq, bins=50, color="steelblue", alpha=0.85)
+        threshold_val = params.get("activity_threshold", 1e-3)
+        n_active = int(active_mask.sum())
+        ax.axvline(
+            threshold_val,
+            color="red",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"threshold → {n_active}/{len(active_mask)} active",
+        )
+        ax.set_xlabel("Activation frequency")
+        ax.set_ylabel("Number of hidden neurons")
+        ax.set_title("Hidden-neuron activation frequency spread")
+        ax.set_yscale("log")
+        ax.legend()
+
+        fig.tight_layout()
+
+        # ── Save / show ───────────────────────────────────────────────────
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        else:
+            if self._use_disk():
+                default_path = (
+                    self._sae_model_dir()
+                    / f"{self._sae_tag(layer, n_features, sparsity_coeff)}_viz.png"
+                )
+                self._sae_model_dir().mkdir(parents=True, exist_ok=True)
+                fig.savefig(default_path, bbox_inches="tight", dpi=150)
+                print(f"SAE visualization saved to {default_path}")
+            if self._use_memory():
+                plt.show()
+
+        return fig
+
 
     def _load_abstracted_features(self, layer: str, 
                                     method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'], 
