@@ -225,6 +225,27 @@ class esmDMS:
     def _merged_embeddings_path(self, batch_dir: Path) -> Path:
         return batch_dir / f"{self._dataset_prefix()}merged_sequence_embeddings.pkl"
 
+    def _inference_job_dir(
+        self,
+        layer: str | int,
+        abstraction_method: str,
+        norm_scheme: str,
+        job_dir: str | Path | None = None,
+    ) -> Path:
+        if job_dir is not None:
+            inference_job_dir = Path(job_dir)
+        else:
+            inference_job_dir = (
+                self._save_dir()
+                / "inference_jobs"
+                / f"{self._dataset_prefix()}{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}"
+            )
+        inference_job_dir.mkdir(parents=True, exist_ok=True)
+        return inference_job_dir
+
+    def _inference_payload_path(self, inference_job_dir: Path) -> Path:
+        return inference_job_dir / f"{self._dataset_prefix()}inference_payload.pkl"
+
     @staticmethod
     def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
         layer_idx = int(str(layer).replace("Layer_", ""))
@@ -389,6 +410,8 @@ class esmDMS:
         scratch, then copies embeddings_chunk_<idx>.pkl back to job_dir. After
         the jobs finish, call merge_embedding_batch_outputs(job_dir).
         """
+        if not self._use_disk():
+            raise ValueError("Embedding batch jobs require local_or_disk to be 'disk' or 'both'.")
         if self.sequence_dataframe is None or self.sequence_to_protein_sequence is None:
             raise ValueError("Run process_raw_data() before creating an embedding batch job.")
         if n_chunks < 1:
@@ -783,7 +806,8 @@ export TMPDIR="$SCRDIR"
 
         return self.create_feature_space(layer, method, method_params)
 
-    def _normalize_features(self, features, norm_scheme):
+    @staticmethod
+    def _normalize_features(features, norm_scheme):
         if norm_scheme == "cross_feature":
             return (features - np.mean(features)) / (np.std(features) + 1e-8)
         if norm_scheme == "per_feature":
@@ -791,6 +815,141 @@ export TMPDIR="$SCRDIR"
         if norm_scheme == "none":
             return features
         raise ValueError(f"Unsupported normalization scheme: {norm_scheme}")
+
+    def _feature_input_path(
+        self,
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'],
+        layer: str | int,
+    ) -> Path:
+        if abstraction_method == "Embeddings":
+            return self._embedding_path(layer)
+        return self._feature_path(abstraction_method, layer)
+
+    def create_inference_job(
+        self,
+        layer: str | int,
+        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        abstraction_params: dict | None = None,
+        job_dir: str | Path | None = None,
+        job_name: str = "esm_infer",
+        partition: str = "dept_cpu",
+        cpus_per_task: int = 4,
+        mem: str = "16G",
+        time: str = "06:00:00",
+        python_executable: str = "python3",
+        scratch_root: str | Path = "/scr",
+        submit: bool = False,
+    ) -> dict[str, Path | str]:
+        """
+        Create a single Slurm job that runs feature inference for one layer.
+
+        The worker reads saved features from disk, writes inference results into
+        scratch, then copies the result to the standard inference cache path.
+        """
+        if not self._use_disk():
+            raise ValueError("Inference jobs require local_or_disk to be 'disk' or 'both'.")
+        if self.sequence_dataframe is None:
+            raise ValueError("Run process_raw_data() before creating an inference job.")
+
+        abstraction_params = abstraction_params or {}
+        norm_scheme = abstraction_params.get("norm_scheme", "none")
+        feature_path = self._feature_input_path(abstraction_method, layer)
+        if not feature_path.is_file():
+            raise FileNotFoundError(
+                f"No saved features found at {feature_path}. "
+                f"Create or save the {abstraction_method} features for layer={layer!r} before running an inference job."
+            )
+
+        output_path = self._inference_path(abstraction_method, layer, norm_scheme)
+        inference_job_dir = self._inference_job_dir(layer, abstraction_method, norm_scheme, job_dir)
+        logs_dir = inference_job_dir / "logs"
+        logs_dir.mkdir(exist_ok=True)
+
+        payload = {
+            "sequence_dataframe": self.sequence_dataframe,
+            "feature_path": str(feature_path),
+            "output_path": str(output_path),
+            "norm_scheme": norm_scheme,
+        }
+        payload_path = self._inference_payload_path(inference_job_dir)
+        self._save_pickle(payload, payload_path)
+
+        script_path = inference_job_dir / "submit_inference_job.sh"
+        script = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH -p {partition}
+#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --time={time}
+#SBATCH --mem={mem}
+#SBATCH --output={logs_dir}/slurm-%j.out
+#SBATCH --error={logs_dir}/slurm-%j.err
+
+set -euo pipefail
+cd {Path.cwd()}
+
+SCRDIR={scratch_root}/${{SLURM_JOB_ID}}
+mkdir -p "$SCRDIR"
+export TMPDIR="$SCRDIR"
+
+{python_executable} -c "import sys, os; sys.path.insert(0, r'{Path.cwd()}'); import popDMS; from esmDMS import esmDMS; esmDMS.run_inference_job(r'{payload_path}', scratch_dir=os.environ['TMPDIR'])"
+"""
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        job_id = ""
+        if submit:
+            completed = subprocess.run(
+                ["sbatch", str(script_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            job_id = completed.stdout.strip()
+
+        return {
+            "inference_job_dir": inference_job_dir,
+            "payload_path": payload_path,
+            "script_path": script_path,
+            "output_path": output_path,
+            "job_id": job_id,
+        }
+
+    @staticmethod
+    def run_inference_job(
+        payload_path: str | Path,
+        scratch_dir: str | Path | None = None,
+    ) -> Path:
+        """
+        Worker entrypoint used by create_inference_job().
+        """
+        payload_path = Path(payload_path)
+        with payload_path.open("rb") as f:
+            payload = pickle.load(f)
+
+        sequence_dataframe = payload["sequence_dataframe"]
+        feature_path = Path(payload["feature_path"])
+        output_path = Path(payload["output_path"])
+        norm_scheme = payload["norm_scheme"]
+
+        seq_to_features = esmDMS._load_pickle(feature_path)
+        if norm_scheme is not None and norm_scheme != "none":
+            seq_ids = list(seq_to_features)
+            features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
+            features = esmDMS._normalize_features(features, norm_scheme)
+            seq_to_features = dict(zip(seq_ids, features))
+
+        result = mini_infer_esm(sequence_dataframe, seq_to_features)
+        if scratch_dir is None:
+            scratch_path = output_path
+        else:
+            scratch_path = Path(scratch_dir) / "esm_inference_saves" / output_path.name
+            scratch_path.parent.mkdir(parents=True, exist_ok=True)
+
+        esmDMS._save_pickle(result, scratch_path)
+        if scratch_path != output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(scratch_path, output_path)
+        return output_path
 
     #TODO: add parameters for model type (linear, non-linear) and regularization scheme (L2, L1, ElasticNet)
     def run_feature_inference(self, layer: str,
