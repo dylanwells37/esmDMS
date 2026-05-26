@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import pickle
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -195,6 +197,14 @@ class esmDMS:
         with path.open("wb") as f:
             pickle.dump(value, f)
 
+    def _batch_dir(self, job_dir: str | Path | None = None) -> Path:
+        if job_dir is not None:
+            batch_dir = Path(job_dir)
+        else:
+            batch_dir = self._save_dir() / "embedding_batches" / f"{self.config.embedding_model}_{self.config.embedding_method}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        return batch_dir
+
     @staticmethod
     def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
         layer_idx = int(str(layer).replace("Layer_", ""))
@@ -338,6 +348,193 @@ class esmDMS:
             if self._use_disk():
                 save_path = self._embedding_path(layer)
                 self._save_pickle(layer_embeddings, save_path)
+
+    def create_embedding_batch_job(
+        self,
+        job_dir: str | Path | None = None,
+        n_chunks: int = 10,
+        job_name: str = "esm_embed",
+        partition: str = "dept_cpu",
+        cpus_per_task: int = 4,
+        mem: str = "16G",
+        time: str = "06:00:00",
+        python_executable: str = "python3",
+        scratch_root: str | Path = "/scr",
+        submit: bool = False,
+    ) -> dict[str, Path | str]:
+        """
+        Create a Slurm array job that embeds this dataset's processed protein sequences.
+
+        Run process_raw_data() first. Each array task writes one chunk to
+        scratch, then copies embeddings_chunk_<idx>.pkl back to job_dir. After
+        the jobs finish, call merge_embedding_batch_outputs(job_dir).
+        """
+        if self.sequence_dataframe is None or self.sequence_to_protein_sequence is None:
+            raise ValueError("Run process_raw_data() before creating an embedding batch job.")
+        if n_chunks < 1:
+            raise ValueError("n_chunks must be at least 1.")
+
+        batch_dir = self._batch_dir(job_dir)
+        logs_dir = batch_dir / "logs"
+        logs_dir.mkdir(exist_ok=True)
+
+        seq_ids = [int(seq_id) for seq_id in sorted(self.sequence_dataframe["SequenceIndex"].unique())]
+        if not seq_ids:
+            raise ValueError("No sequences are available to embed.")
+        payload = {
+            "seq_ids": seq_ids,
+            "sequence_to_protein_sequence": {
+                seq_id: self.sequence_to_protein_sequence[seq_id] for seq_id in seq_ids
+            },
+            "sequence_to_mutation_sites": {
+                seq_id: self.sequence_to_mutation_sites[seq_id] for seq_id in seq_ids
+            },
+            "embedding_model": self.config.embedding_model,
+            "embedding_method": self.config.embedding_method,
+            "per_residue_mutation_pooling": self.config.per_residue_mutation_pooling,
+            "n_chunks": n_chunks,
+            "batch_dir": str(batch_dir),
+        }
+
+        payload_path = batch_dir / "embedding_batch_payload.pkl"
+        self._save_pickle(payload, payload_path)
+
+        script_path = batch_dir / "submit_embedding_array.sh"
+        script = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH -p {partition}
+#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --time={time}
+#SBATCH --mem={mem}
+#SBATCH --array=0-{n_chunks - 1}
+#SBATCH --output={logs_dir}/slurm-%A_%a.out
+#SBATCH --error={logs_dir}/slurm-%A_%a.err
+
+set -euo pipefail
+cd {Path.cwd()}
+
+SCRDIR={scratch_root}/${{SLURM_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}
+mkdir -p "$SCRDIR"
+export TMPDIR="$SCRDIR"
+
+{python_executable} -c "import sys, os; sys.path.insert(0, r'{Path.cwd()}'); import popDMS; from esmDMS import esmDMS; esmDMS.run_embedding_batch_chunk(r'{payload_path}', int(os.environ['SLURM_ARRAY_TASK_ID']), scratch_dir=os.environ['TMPDIR'])"
+"""
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        job_id = ""
+        if submit:
+            completed = subprocess.run(
+                ["sbatch", str(script_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            job_id = completed.stdout.strip()
+
+        return {
+            "batch_dir": batch_dir,
+            "payload_path": payload_path,
+            "script_path": script_path,
+            "job_id": job_id,
+        }
+
+    @staticmethod
+    def run_embedding_batch_chunk(
+        payload_path: str | Path,
+        chunk_idx: int,
+        scratch_dir: str | Path | None = None,
+    ) -> Path:
+        """
+        Worker entrypoint used by create_embedding_batch_job().
+        """
+        payload_path = Path(payload_path)
+        with payload_path.open("rb") as f:
+            payload = pickle.load(f)
+
+        seq_ids = payload["seq_ids"]
+        n_chunks = payload["n_chunks"]
+        chunks = np.array_split(np.asarray(seq_ids), n_chunks)
+        if chunk_idx < 0 or chunk_idx >= n_chunks:
+            raise ValueError(f"chunk_idx must be between 0 and {n_chunks - 1}.")
+
+        esm_model = f"facebook/{payload['embedding_model']}"
+        tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
+        model = AutoModel.from_pretrained(esm_model)
+        model.eval()
+
+        out = {}
+        for seq_id in chunks[chunk_idx].tolist():
+            prot_seq = payload["sequence_to_protein_sequence"][seq_id]
+            mutation_sites = payload["sequence_to_mutation_sites"][seq_id]
+            out[seq_id] = embed_sequence(
+                prot_seq,
+                tokenizer,
+                model,
+                embedding_method=payload["embedding_method"],
+                mutation_sites=mutation_sites,
+                pool_mutations=payload["per_residue_mutation_pooling"],
+            )
+
+        final_path = Path(payload["batch_dir"]) / f"embeddings_chunk_{chunk_idx}.pkl"
+        if scratch_dir is None:
+            scratch_path = final_path
+        else:
+            scratch_path = Path(scratch_dir) / "esm_embed_saves" / f"embeddings_chunk_{chunk_idx}.pkl"
+            scratch_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with scratch_path.open("wb") as f:
+            pickle.dump(out, f)
+        if scratch_path != final_path:
+            shutil.copy2(scratch_path, final_path)
+        return final_path
+
+    def merge_embedding_batch_outputs(
+        self,
+        job_dir: str | Path | None = None,
+        layer: str | int = "all",
+        n_chunks: int | None = None,
+        save_layers: bool = True,
+    ) -> dict[str, np.ndarray]:
+        """
+        Merge embedding chunk pickle files from create_embedding_batch_job().
+        """
+        batch_dir = self._batch_dir(job_dir)
+        payload_path = batch_dir / "embedding_batch_payload.pkl"
+        if payload_path.is_file() and n_chunks is None:
+            n_chunks = self._load_pickle(payload_path)["n_chunks"]
+        if n_chunks is None:
+            chunk_files = sorted(batch_dir.glob("embeddings_chunk_*.pkl"))
+        else:
+            chunk_files = [batch_dir / f"embeddings_chunk_{idx}.pkl" for idx in range(n_chunks)]
+        if not chunk_files:
+            raise FileNotFoundError(f"No embedding chunk files found in {batch_dir}.")
+
+        missing = [path for path in chunk_files if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Missing embedding chunk files: {missing}")
+
+        merged = {}
+        for path in chunk_files:
+            merged.update(self._load_pickle(path))
+
+        self.sequence_to_embeddings.update(merged)
+        self._save_pickle(merged, batch_dir / "merged_sequence_embeddings.pkl")
+
+        first_embedding = next(iter(merged.values()))
+        if layer == "all":
+            layers = range(np.asarray(first_embedding).shape[0])
+        else:
+            layers = [layer]
+
+        for layer_value in layers:
+            layer_embeddings = self._select_layer(merged, layer_value)
+            if self._use_memory():
+                self.sequence_to_features[self._embedding_key(layer_value)] = layer_embeddings
+            if save_layers and self._use_disk():
+                self._save_pickle(layer_embeddings, self._embedding_path(layer_value))
+
+        return merged
         
 
 
