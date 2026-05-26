@@ -455,6 +455,7 @@ class esmDMS:
         self,
         job_dir: str | Path | None = None,
         n_chunks: int = 10,
+        max_active_jobs: int | None = None,
         job_name: str = "esm_embed",
         partition: str = "dept_cpu",
         cpus_per_task: int = 4,
@@ -470,6 +471,7 @@ class esmDMS:
         Run process_raw_data() first. Each array task writes one chunk to
         scratch, then copies embeddings_chunk_<idx>.pkl back to job_dir. After
         the jobs finish, call merge_embedding_batch_outputs(job_dir).
+        Set max_active_jobs to limit concurrently active Slurm array tasks.
         """
         if not self._use_disk():
             raise ValueError("Embedding batch jobs require local_or_disk to be 'disk' or 'both'.")
@@ -477,6 +479,8 @@ class esmDMS:
             raise ValueError("Run process_raw_data() before creating an embedding batch job.")
         if n_chunks < 1:
             raise ValueError("n_chunks must be at least 1.")
+        if max_active_jobs is not None and max_active_jobs < 1:
+            raise ValueError("max_active_jobs must be at least 1 when specified.")
 
         batch_dir = self._batch_dir(job_dir)
         logs_dir = batch_dir / "logs"
@@ -499,6 +503,7 @@ class esmDMS:
             "dataset_name": self.config.dataset_name,
             "dataset_prefix": self._dataset_prefix(),
             "n_chunks": n_chunks,
+            "max_active_jobs": max_active_jobs,
             "batch_dir": str(batch_dir),
         }
 
@@ -506,13 +511,16 @@ class esmDMS:
         self._save_pickle(payload, payload_path)
 
         script_path = batch_dir / "submit_embedding_array.sh"
+        array_spec = f"0-{n_chunks - 1}"
+        if max_active_jobs is not None:
+            array_spec = f"{array_spec}%{max_active_jobs}"
         script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH -p {partition}
 #SBATCH --cpus-per-task={cpus_per_task}
 #SBATCH --time={time}
 #SBATCH --mem={mem}
-#SBATCH --array=0-{n_chunks - 1}
+#SBATCH --array={array_spec}
 #SBATCH --output={logs_dir}/slurm-%A_%a.out
 #SBATCH --error={logs_dir}/slurm-%A_%a.err
 
