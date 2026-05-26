@@ -1,0 +1,9 @@
+{
+    "n_gens": 50,
+    "sel_func": "gaussian",
+    "inference": 1,
+    "fitness": "exp",
+    "save_every": 1,
+    "layers": [0],
+    "calc_error_bars": 1
+}

@@ -1,0 +1,8 @@
+{
+    "protein": "BRCA1",
+    "mavedb_file": "BRCA1_nucleotide_counts.csv",
+    "reference_sequence_file": "BRCA1_reference_sequence.dat",
+    "esm_model": "facebook/esm2_t33_650M_UR50D",
+    "embed_zeroes": false,
+    "skip_stop_codons": false
+}
