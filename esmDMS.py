@@ -51,12 +51,18 @@ class ESMDMSConfig:
     per_residue_mutation_pooling: bool = False
     local_or_disk: Literal['local', 'disk', 'both'] = 'local'
     save_dir: str | None = None
+    dataset_name: str | None = None
 
     def __post_init__(self):
         if self.local_or_disk not in {"local", "disk", "both"}:
             raise ValueError("local_or_disk must be one of 'local', 'disk', or 'both'.")
         if (self.local_or_disk == 'disk' or self.local_or_disk == 'both') and self.save_dir is None:
                 raise ValueError("save_dir must be specified when local_or_disk is set to 'disk' or 'both'.")
+        if self.dataset_name is not None:
+            if not self.dataset_name:
+                raise ValueError("dataset_name must not be empty when specified.")
+            if any(sep in self.dataset_name for sep in ("/", "\\")):
+                raise ValueError("dataset_name must be a file name component and cannot contain path separators.")
         
     
 @dataclass(frozen=True)
@@ -175,14 +181,19 @@ class esmDMS:
     def _feature_key(self, method: str, layer: str | int) -> str:
         return f"{method}_{self._layer_label(layer)}"
 
+    def _dataset_prefix(self) -> str:
+        if self.config.dataset_name is None:
+            return ""
+        return f"{self.config.dataset_name}_"
+
     def _embedding_path(self, layer: str | int) -> Path:
-        return self._save_dir() / f"{self.config.embedding_model}_{self.config.embedding_method}_{self._layer_label(layer)}_embeddings.pkl"
+        return self._save_dir() / f"{self._dataset_prefix()}{self.config.embedding_model}_{self.config.embedding_method}_{self._layer_label(layer)}_embeddings.pkl"
 
     def _feature_path(self, method: str, layer: str | int) -> Path:
-        return self._save_dir() / f"{method}_{self._layer_label(layer)}_abstracted_features.pkl"
+        return self._save_dir() / f"{self._dataset_prefix()}{method}_{self._layer_label(layer)}_abstracted_features.pkl"
 
     def _inference_path(self, abstraction_method: str, layer: str | int, norm_scheme: str) -> Path:
-        return self._save_dir() / f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
+        return self._save_dir() / f"{self._dataset_prefix()}{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
 
     def _inference_key(self, layer: str, abstraction_method: str, norm_scheme: str) -> str:
         return f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results"
@@ -201,9 +212,18 @@ class esmDMS:
         if job_dir is not None:
             batch_dir = Path(job_dir)
         else:
-            batch_dir = self._save_dir() / "embedding_batches" / f"{self.config.embedding_model}_{self.config.embedding_method}"
+            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self.config.embedding_model}_{self.config.embedding_method}"
         batch_dir.mkdir(parents=True, exist_ok=True)
         return batch_dir
+
+    def _batch_payload_path(self, batch_dir: Path) -> Path:
+        return batch_dir / f"{self._dataset_prefix()}embedding_batch_payload.pkl"
+
+    def _batch_chunk_path(self, batch_dir: Path, chunk_idx: int) -> Path:
+        return batch_dir / f"{self._dataset_prefix()}embeddings_chunk_{chunk_idx}.pkl"
+
+    def _merged_embeddings_path(self, batch_dir: Path) -> Path:
+        return batch_dir / f"{self._dataset_prefix()}merged_sequence_embeddings.pkl"
 
     @staticmethod
     def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
@@ -392,11 +412,13 @@ class esmDMS:
             "embedding_model": self.config.embedding_model,
             "embedding_method": self.config.embedding_method,
             "per_residue_mutation_pooling": self.config.per_residue_mutation_pooling,
+            "dataset_name": self.config.dataset_name,
+            "dataset_prefix": self._dataset_prefix(),
             "n_chunks": n_chunks,
             "batch_dir": str(batch_dir),
         }
 
-        payload_path = batch_dir / "embedding_batch_payload.pkl"
+        payload_path = self._batch_payload_path(batch_dir)
         self._save_pickle(payload, payload_path)
 
         script_path = batch_dir / "submit_embedding_array.sh"
@@ -476,11 +498,12 @@ export TMPDIR="$SCRDIR"
                 pool_mutations=payload["per_residue_mutation_pooling"],
             )
 
-        final_path = Path(payload["batch_dir"]) / f"embeddings_chunk_{chunk_idx}.pkl"
+        dataset_prefix = payload.get("dataset_prefix", "")
+        final_path = Path(payload["batch_dir"]) / f"{dataset_prefix}embeddings_chunk_{chunk_idx}.pkl"
         if scratch_dir is None:
             scratch_path = final_path
         else:
-            scratch_path = Path(scratch_dir) / "esm_embed_saves" / f"embeddings_chunk_{chunk_idx}.pkl"
+            scratch_path = Path(scratch_dir) / "esm_embed_saves" / f"{dataset_prefix}embeddings_chunk_{chunk_idx}.pkl"
             scratch_path.parent.mkdir(parents=True, exist_ok=True)
 
         with scratch_path.open("wb") as f:
@@ -500,13 +523,13 @@ export TMPDIR="$SCRDIR"
         Merge embedding chunk pickle files from create_embedding_batch_job().
         """
         batch_dir = self._batch_dir(job_dir)
-        payload_path = batch_dir / "embedding_batch_payload.pkl"
+        payload_path = self._batch_payload_path(batch_dir)
         if payload_path.is_file() and n_chunks is None:
             n_chunks = self._load_pickle(payload_path)["n_chunks"]
         if n_chunks is None:
-            chunk_files = sorted(batch_dir.glob("embeddings_chunk_*.pkl"))
+            chunk_files = sorted(batch_dir.glob(f"{self._dataset_prefix()}embeddings_chunk_*.pkl"))
         else:
-            chunk_files = [batch_dir / f"embeddings_chunk_{idx}.pkl" for idx in range(n_chunks)]
+            chunk_files = [self._batch_chunk_path(batch_dir, idx) for idx in range(n_chunks)]
         if not chunk_files:
             raise FileNotFoundError(f"No embedding chunk files found in {batch_dir}.")
 
@@ -519,7 +542,7 @@ export TMPDIR="$SCRDIR"
             merged.update(self._load_pickle(path))
 
         self.sequence_to_embeddings.update(merged)
-        self._save_pickle(merged, batch_dir / "merged_sequence_embeddings.pkl")
+        self._save_pickle(merged, self._merged_embeddings_path(batch_dir))
 
         first_embedding = next(iter(merged.values()))
         if layer == "all":
