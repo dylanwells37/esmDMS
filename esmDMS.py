@@ -238,12 +238,10 @@ class esmDMS:
         return f"{self.config.dataset_name}_"
 
     def _base_embedding_path(self, layer: str | int) -> Path:
-        return self._save_dir() / f"{self._dataset_prefix()}{self.config.embedding_model}_per_residue_unpooled_{self._layer_label(layer)}_embeddings.pkl"
+        return self._save_dir() / f"{self._dataset_prefix()}{self.config.embedding_model}_all_data_{self._layer_label(layer)}_embeddings.pkl"
 
     def _embedding_path(self, layer: str | int, embedding_type: str | None = None) -> Path:
         embedding_type = self._embedding_type(embedding_type)
-        if embedding_type == "per_residue":
-            return self._base_embedding_path(layer)
         return self._feature_path("none", layer, embedding_type)
 
     def _feature_path(self, method: str, layer: str | int, embedding_type: str | None = None) -> Path:
@@ -305,7 +303,7 @@ class esmDMS:
         if job_dir is not None:
             batch_dir = Path(job_dir)
         else:
-            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self.config.embedding_model}_per_residue_unpooled"
+            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self.config.embedding_model}_all_data"
         batch_dir.mkdir(parents=True, exist_ok=True)
         return batch_dir
 
@@ -380,7 +378,7 @@ class esmDMS:
                         "Unpooled per-residue embeddings are not valid feature vectors for inference. "
                         "Use embedding_type='mutation_pooled' or add a feature abstraction that flattens them intentionally."
                     )
-                if allow_per_residue and layer_embedding.shape[0] != 1:
+                if allow_per_residue:
                     selected[seq_id] = layer_embedding
                 else:
                     selected[seq_id] = layer_embedding[0]
@@ -388,31 +386,55 @@ class esmDMS:
                 raise ValueError(f"Unsupported embedding shape for sequence {seq_id}: {embedding.shape}")
         return selected
 
-    @staticmethod
     def _derive_embedding_type(
+        self,
         layer_embeddings: dict[str, np.ndarray],
         embedding_type: str,
     ) -> dict[str, np.ndarray]:
-        if embedding_type == "per_residue":
-            return layer_embeddings
-        if embedding_type in {"mutation_pooled", "mean_pool"}:
-            derived = {}
-            for seq_id, embedding in layer_embeddings.items():
-                if embedding is None:
-                    derived[seq_id] = None
-                    continue
-                embedding = np.asarray(embedding)
-                if embedding.ndim == 1:
-                    derived[seq_id] = embedding
-                elif embedding.ndim == 2:
-                    derived[seq_id] = embedding.mean(axis=0)
-                else:
-                    raise ValueError(
-                        f"Cannot derive {embedding_type} from layer embedding shape {embedding.shape} "
-                        f"for sequence {seq_id}."
-                    )
-            return derived
-        raise ValueError(f"Unsupported embedding_type: {embedding_type}")
+        if embedding_type not in {"per_residue", "mutation_pooled", "mean_pool"}:
+            raise ValueError(f"Unsupported embedding_type: {embedding_type}")
+
+        derived = {}
+        for seq_id, embedding in layer_embeddings.items():
+            if embedding is None:
+                derived[seq_id] = None
+                continue
+            embedding = np.asarray(embedding)
+            if embedding.ndim != 2:
+                raise ValueError(
+                    f"Cannot derive {embedding_type} from all-data layer embedding shape {embedding.shape} "
+                    f"for sequence {seq_id}."
+                )
+
+            if embedding_type == "mean_pool":
+                derived[seq_id] = embedding.mean(axis=0)
+                continue
+
+            if self.sequence_to_mutation_sites is None:
+                raise ValueError(
+                    f"Cannot derive {embedding_type} embeddings without sequence_to_mutation_sites. "
+                    "Run process_raw_data() before deriving mutation-site features."
+                )
+
+            mutation_sites = self.sequence_to_mutation_sites.get(seq_id)
+            if mutation_sites is None and isinstance(seq_id, np.integer):
+                mutation_sites = self.sequence_to_mutation_sites.get(int(seq_id))
+            if mutation_sites is None:
+                raise KeyError(f"No mutation-site mapping found for sequence {seq_id}.")
+            if not mutation_sites:
+                derived[seq_id] = None
+                continue
+            if max(mutation_sites) >= embedding.shape[0] or min(mutation_sites) < 0:
+                raise ValueError(
+                    f"Mutation sites {mutation_sites} are out of bounds for sequence {seq_id} "
+                    f"with length {embedding.shape[0]}."
+                )
+            mutation_embeddings = embedding[mutation_sites]
+            if embedding_type == "per_residue":
+                derived[seq_id] = mutation_embeddings
+            else:
+                derived[seq_id] = mutation_embeddings.mean(axis=0)
+        return derived
 
     @staticmethod
     def _require_vector_features(seq_to_features: dict[str, np.ndarray], context: str) -> None:
@@ -503,15 +525,11 @@ class esmDMS:
         model = AutoModel.from_pretrained(esm_model)
         model.eval()
 
-        mutation_sites = self.get_mutation_sites(seq_ids)
         seq_idx_to_embedding = {}
 
-        for idx, idx_mutation_sites in zip(seq_ids, mutation_sites):
+        for idx in seq_ids:
             prot_seq = self.sequence_to_protein_sequence[idx]
-            layer_embeddings = embed_sequence(prot_seq, tokenizer, model,
-                                             embedding_method="per_residue",
-                                             mutation_sites=idx_mutation_sites,
-                                             pool_mutations=False)
+            layer_embeddings = embed_sequence(prot_seq, tokenizer, model)
             seq_idx_to_embedding[idx] = layer_embeddings
 
         if self._use_memory():
@@ -596,11 +614,8 @@ class esmDMS:
             "sequence_to_protein_sequence": {
                 seq_id: self.sequence_to_protein_sequence[seq_id] for seq_id in seq_ids
             },
-            "sequence_to_mutation_sites": {
-                seq_id: self.sequence_to_mutation_sites[seq_id] for seq_id in seq_ids
-            },
             "embedding_model": self.config.embedding_model,
-            "embedding_type": "per_residue",
+            "embedding_type": "all_data",
             "dataset_name": self.config.dataset_name,
             "dataset_prefix": self._dataset_prefix(),
             "n_chunks": n_chunks,
@@ -681,15 +696,7 @@ export TMPDIR="$SCRDIR"
         out = {}
         for seq_id in chunks[chunk_idx].tolist():
             prot_seq = payload["sequence_to_protein_sequence"][seq_id]
-            mutation_sites = payload["sequence_to_mutation_sites"][seq_id]
-            out[seq_id] = embed_sequence(
-                prot_seq,
-                tokenizer,
-                model,
-                embedding_method="per_residue",
-                mutation_sites=mutation_sites,
-                pool_mutations=False,
-            )
+            out[seq_id] = embed_sequence(prot_seq, tokenizer, model)
 
         dataset_prefix = payload.get("dataset_prefix", "")
         final_path = Path(payload["batch_dir"]) / f"{dataset_prefix}embeddings_chunk_{chunk_idx}.pkl"
@@ -869,9 +876,17 @@ cd {Path.cwd()}
             print("Embeddings already exist in memory. Returning existing embeddings.")
             return self.sequence_to_features[key]
 
+        base_key = self._embedding_key(layer)
+        if self._use_memory() and self.sequence_to_features.get(base_key) is not None:
+            embeddings = self._derive_embedding_type(self.sequence_to_features[base_key], embedding_type)
+            self.sequence_to_features[key] = embeddings
+            if self._use_disk():
+                self._save_pickle(embeddings, self._embedding_path(layer, embedding_type))
+            return embeddings
+
         if self._use_memory() and self.sequence_to_embeddings:
-            per_residue_embeddings = self._select_layer(self.sequence_to_embeddings, layer, allow_per_residue=True)
-            layer_embeddings = self._derive_embedding_type(per_residue_embeddings, embedding_type)
+            all_data_embeddings = self._select_layer(self.sequence_to_embeddings, layer, allow_per_residue=True)
+            layer_embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
             self.sequence_to_features[key] = layer_embeddings
             if self._use_disk():
                 self._save_pickle(layer_embeddings, self._embedding_path(layer, embedding_type))
@@ -879,7 +894,7 @@ cd {Path.cwd()}
 
         if self._use_disk():
             save_path = self._embedding_path(layer, embedding_type)
-            if save_path.is_file() and embedding_type != "per_residue":
+            if save_path.is_file():
                 print(f"Loading {embedding_type} embeddings from {save_path}")
                 embeddings = self._load_pickle(save_path)
                 if self._use_memory():
@@ -887,15 +902,15 @@ cd {Path.cwd()}
                 return embeddings
             base_path = self._base_embedding_path(layer)
             if base_path.is_file():
-                print(f"Loading per-residue embeddings from {base_path}")
-                per_residue_embeddings = self._load_pickle(base_path)
-                embeddings = self._derive_embedding_type(per_residue_embeddings, embedding_type)
+                print(f"Loading all-data embeddings from {base_path}")
+                all_data_embeddings = self._load_pickle(base_path)
+                embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
                 if self._use_memory():
+                    self.sequence_to_features[base_key] = all_data_embeddings
                     self.sequence_to_features[key] = embeddings
-                if embedding_type != "per_residue":
-                    self._save_pickle(embeddings, save_path)
+                self._save_pickle(embeddings, save_path)
                 return embeddings
-            raise FileNotFoundError(f"No saved per-residue embeddings found at {base_path}. Run embed_all_sequences({layer!r}) first.")
+            raise FileNotFoundError(f"No saved all-data embeddings found at {base_path}. Run embed_all_sequences({layer!r}) first.")
 
         raise ValueError("No embeddings found in memory. Run embed_all_sequences() before inference.")
 
@@ -1427,6 +1442,8 @@ cd {Path.cwd()}
         abstraction_method = self._abstraction_type(abstraction_method)
         norm_scheme = abstraction_params.get("norm_scheme", "none")
         feature_path = self._feature_input_path(abstraction_method, layer, embedding_type)
+        if not feature_path.is_file():
+            self.create_feature_space(layer, abstraction_method, abstraction_params, embedding_type)
         if not feature_path.is_file():
             raise FileNotFoundError(
                 f"No saved features found at {feature_path}. "

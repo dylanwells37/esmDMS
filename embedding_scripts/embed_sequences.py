@@ -365,33 +365,18 @@ def pool_sequence_representation(token_representations, inputs):
     return (summed / counts).squeeze(0).cpu().numpy()  # (embedding_dim,)
 
 
-def mutation_site_representation(token_representations, mutation_sites, pool_mutations=False):
-    """Return residue embeddings at mutated positions.
+def all_residue_representation(token_representations, inputs):
+    """Return representations for every real residue token."""
+    residue_mask = _residue_token_mask(inputs).squeeze(0)
+    return token_representations[:, residue_mask, :].squeeze(0).cpu().numpy()
 
-    mutation_sites are 0-indexed amino-acid positions. With special tokens
-    enabled for ESM models, residue i is token position i + 1.
+
+def embed_sequence(sequence, tokenizer, model):
     """
-    if not mutation_sites:
-        return None
-    token_positions = [site + 1 for site in mutation_sites]
-    per_site = token_representations[:, token_positions, :].squeeze(0).cpu().numpy()
-    if pool_mutations:
-        return per_site.mean(axis=0)
-    return per_site
+    Return full all-residue hidden-state embeddings for all transformer layers.
 
-
-def embed_sequence(sequence, tokenizer, model, embedding_method="per_residue",
-                   mutation_sites=None, pool_mutations=False):
+    Shape: (num_residues, num_layers, embedding_dim)
     """
-    Return hidden-state embeddings for all transformer layers.
-
-    The stored ESM representation is unpooled per-residue by default:
-      - per_residue: (num_mutations, num_layers, embedding_dim)
-    """
-    if embedding_method != "per_residue":
-        raise ValueError("Only unpooled per_residue embeddings are generated. Derive pooled embedding types at runtime.")
-    if pool_mutations:
-        raise ValueError("Pooled per-residue embeddings are derived at runtime; generate unpooled per_residue embeddings instead.")
     inputs = tokenizer(
         sequence,
         return_tensors="pt",
@@ -401,11 +386,9 @@ def embed_sequence(sequence, tokenizer, model, embedding_method="per_residue",
     with torch.no_grad():
         outputs = model(**inputs, output_hidden_states=True)
     layer_embeddings = [
-        mutation_site_representation(layer, mutation_sites or [], pool_mutations=False)
+        all_residue_representation(layer, inputs)
         for layer in outputs.hidden_states
     ]
-    if any(emb is None for emb in layer_embeddings):
-        return None
     return np.stack(layer_embeddings, axis=1)
 
 
@@ -422,49 +405,8 @@ def _normalise_mutation_sites(value):
     return [int(v) for v in value]
 
 
-def _expand_unpooled_mutation_embeddings(seq_df, seq_to_emb):
-    rows = []
-    for _, row in seq_df.iterrows():
-        sites = _normalise_mutation_sites(row.get("MutationSites"))
-        emb = seq_to_emb.get(row["ProteinSequence"])
-        if emb is None:
-            base = row.to_dict()
-            base["Embedding"] = None
-            base["MutationSite"] = np.nan
-            base["MutationSiteIndex"] = np.nan
-            rows.append(base)
-            continue
-        for site_idx, site in enumerate(sites):
-            base = row.to_dict()
-            base["Embedding"] = emb[site_idx]
-            base["MutationSite"] = site
-            base["MutationSiteIndex"] = site_idx
-            rows.append(base)
-    return pd.DataFrame(rows)
-
-
-def _expand_unpooled_mutation_embeddings_wide(seq_df, embeddings):
-    rows = []
-    for (_, row), emb in zip(seq_df.iterrows(), embeddings):
-        sites = _normalise_mutation_sites(row.get("MutationSites"))
-        if emb is None:
-            base = row.to_dict()
-            base["Embeddings"] = None
-            base["MutationSite"] = np.nan
-            base["MutationSiteIndex"] = np.nan
-            rows.append(base)
-            continue
-        for site_idx, site in enumerate(sites):
-            base = row.to_dict()
-            base["Embeddings"] = emb[site_idx]
-            base["MutationSite"] = site
-            base["MutationSiteIndex"] = site_idx
-            rows.append(base)
-    return pd.DataFrame(rows)
-
-
 def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None,
-                    embedding_method="per_residue", pool_mutations=False):
+                    embedding_method="all_data", pool_mutations=False):
     """
     Embed protein sequences and return an annotated DataFrame.
 
@@ -496,16 +438,7 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None,
     for i, seq in enumerate(unique_seqs):
         has_observations = embed_zeroes or total_freq.get(seq, 0) > 0
         if has_observations:
-            sites = _normalise_mutation_sites(
-                seq_df.loc[seq_df["ProteinSequence"] == seq, "MutationSites"].iloc[0]
-                if "MutationSites" in seq_df.columns else []
-            )
-            seq_to_emb[seq] = embed_sequence(
-                seq, tokenizer, model,
-                embedding_method=embedding_method,
-                mutation_sites=sites,
-                pool_mutations=pool_mutations,
-            )
+            seq_to_emb[seq] = embed_sequence(seq, tokenizer, model)
         else:
             seq_to_emb[seq] = None
 
@@ -518,7 +451,8 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None,
             )
             print(f"  Memory usage: {psutil.Process(os.getpid()).memory_info().rss / 1024**2:.1f} MB")
 
-    out = _expand_unpooled_mutation_embeddings(seq_df, seq_to_emb)
+    out = seq_df.copy()
+    out["Embedding"] = out["ProteinSequence"].map(seq_to_emb)
     out["EmbeddingMethod"] = embedding_method
     out["PoolMutations"] = pool_mutations
     extra_cols = [c for c in ["MutationSites", "MutationSite", "MutationSiteIndex"] if c in out.columns]
@@ -553,12 +487,13 @@ def load_config(config_path):
 
     cfg.setdefault("esm_model", "facebook/esm2_t30_150M_UR50D")
     cfg.setdefault("embed_zeroes", False)
-    cfg.setdefault("embedding_method", "per_residue")
+    cfg.setdefault("embedding_method", "all_data")
     cfg["pool_mutations"] = False
     if cfg["embedding_method"] in {"cls", "cls_token"}:
         raise ValueError("CLS embeddings are no longer supported.")
-    if cfg["embedding_method"] != "per_residue":
-        raise ValueError("embedding_method must be per_residue. Derive pooled embedding types at runtime.")
+    if cfg["embedding_method"] not in {"all_data", "per_residue"}:
+        raise ValueError("embedding_method must be all_data. Derive embedding types at runtime.")
+    cfg["embedding_method"] = "all_data"
 
     return cfg
 
@@ -580,9 +515,9 @@ def main():
                         help="Override ESM model (e.g. facebook/esm2_t6_8M_UR50D)")
     parser.add_argument("--n_test", type=int, default=None,
                         help="Only embed the first N sequences (for testing)")
-    parser.add_argument("--embedding_method", choices=["per_residue"],
+    parser.add_argument("--embedding_method", choices=["all_data", "per_residue"],
                         default=None,
-                        help="Embedding extraction method. Only unpooled per_residue generation is supported.")
+                        help="Embedding extraction method. Only full all_data generation is supported.")
     parser.add_argument("--chunk_idx", type=int, default=0,
                         help="Index of this chunk (0-based, used in array jobs)")
     parser.add_argument("--n_chunks", type=int, default=1,
