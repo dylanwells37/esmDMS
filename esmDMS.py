@@ -20,9 +20,6 @@ from embedding_scripts.embed_sequences import (
     build_sequence_dataframe_mavedb,
     get_reference_sequence_from_wildtypes,
     build_sequence_dataframe,
-    cls_sequence_representation,
-    pool_sequence_representation,
-    mutation_site_representation,
     embed_sequence
 )
 
@@ -40,15 +37,16 @@ EmbeddingModel = Literal[
     "esm2_t36_3B_UR50D",
 ]
 
-EmbeddingMethod = Literal["mean_pool", "per_residue", "cls_token"]
+EmbeddingType = Literal["per_residue", "mutation_pooled", "mean_pool"]
+AbstractionMethod = Literal["none", "PCA", "SAE", "SPCA"]
 
 ## CONFIGURATION AND INPUT CLASSES #################################
 
 @dataclass(frozen=True)
 class ESMDMSConfig:
     embedding_model: EmbeddingModel = "esm2_t33_650M_UR50D"
-    embedding_method: EmbeddingMethod = "mean_pool"
-    per_residue_mutation_pooling: bool = False
+    embedding_type: EmbeddingType = "per_residue"
+    embedding_method: str | None = None
     local_or_disk: Literal['local', 'disk', 'both'] = 'local'
     save_dir: str | None = None
     dataset_name: str | None = None
@@ -58,6 +56,14 @@ class ESMDMSConfig:
             raise ValueError("local_or_disk must be one of 'local', 'disk', or 'both'.")
         if (self.local_or_disk == 'disk' or self.local_or_disk == 'both') and self.save_dir is None:
                 raise ValueError("save_dir must be specified when local_or_disk is set to 'disk' or 'both'.")
+        if self.embedding_method in {"cls", "cls_token"}:
+            raise ValueError("CLS embeddings are no longer supported. Use embedding_type='per_residue', 'mutation_pooled', or 'mean_pool'.")
+        if self.embedding_method is not None and self.embedding_method != self.embedding_type:
+            object.__setattr__(self, "embedding_type", self.embedding_method)
+        if self.embedding_type in {"mutation_site", "mutation_pool", "pooled"}:
+            object.__setattr__(self, "embedding_type", "mutation_pooled")
+        if self.embedding_type not in {"per_residue", "mutation_pooled", "mean_pool"}:
+            raise ValueError("embedding_type must be one of 'per_residue', 'mutation_pooled', or 'mean_pool'.")
         if self.dataset_name is not None:
             if not self.dataset_name:
                 raise ValueError("dataset_name must not be empty when specified.")
@@ -172,7 +178,7 @@ class esmDMS:
             - Compare the inferred results across sizes of ESM embeddings (ESM-2 8M, ESM-2 650M, etc.)
             - Investigate the sparsity of the inferred selection coefficients and fitness across different models and regularization schemes
             - Investigate how shuffling frequencies across time points affects the inferred selection coefficients and fitness (as a control)
-            - Investigate how embedding method impacts all of this (mean-pooling vs per-residue vs cls token)
+            - Investigate how embedding type impacts all of this (mean-pooling vs per-residue)
             - Investigate how ALL of this changes across DMS datasets (BRCA1, BF520, BG505, Ube4b, TpoR, etc.)
 
         Statistical analysis of simulated data (reconstructions)
@@ -223,25 +229,67 @@ class esmDMS:
     def _embedding_key(self, layer: str | int) -> str:
         return f"Embeddings_{self._layer_label(layer)}"
 
-    def _feature_key(self, method: str, layer: str | int) -> str:
-        return f"{method}_{self._layer_label(layer)}"
+    def _feature_key(self, method: str, layer: str | int, embedding_type: str | None = None) -> str:
+        return f"{self._embedding_type(embedding_type)}_{self._abstraction_type(method)}_{self._layer_label(layer)}"
 
     def _dataset_prefix(self) -> str:
         if self.config.dataset_name is None:
             return ""
         return f"{self.config.dataset_name}_"
 
-    def _embedding_path(self, layer: str | int) -> Path:
-        return self._save_dir() / f"{self._dataset_prefix()}{self.config.embedding_model}_{self.config.embedding_method}_{self._layer_label(layer)}_embeddings.pkl"
+    def _base_embedding_path(self, layer: str | int) -> Path:
+        return self._save_dir() / f"{self._dataset_prefix()}{self.config.embedding_model}_per_residue_unpooled_{self._layer_label(layer)}_embeddings.pkl"
 
-    def _feature_path(self, method: str, layer: str | int) -> Path:
-        return self._save_dir() / f"{self._dataset_prefix()}{method}_{self._layer_label(layer)}_abstracted_features.pkl"
+    def _embedding_path(self, layer: str | int, embedding_type: str | None = None) -> Path:
+        embedding_type = self._embedding_type(embedding_type)
+        if embedding_type == "per_residue":
+            return self._base_embedding_path(layer)
+        return self._feature_path("none", layer, embedding_type)
 
-    def _inference_path(self, abstraction_method: str, layer: str | int, norm_scheme: str) -> Path:
-        return self._save_dir() / f"{self._dataset_prefix()}{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
+    def _feature_path(self, method: str, layer: str | int, embedding_type: str | None = None) -> Path:
+        embedding_type = self._embedding_type(embedding_type)
+        abstraction_type = self._abstraction_type(method)
+        return self._save_dir() / (
+            f"{self._dataset_prefix()}{self.config.embedding_model}_{embedding_type}_{abstraction_type}_"
+            f"{self._layer_label(layer)}_seq_to_features.pkl"
+        )
 
-    def _inference_key(self, layer: str, abstraction_method: str, norm_scheme: str) -> str:
-        return f"{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}_inference_results"
+    def _inference_path(
+        self,
+        abstraction_method: str,
+        layer: str | int,
+        norm_scheme: str,
+        embedding_type: str | None = None,
+    ) -> Path:
+        embedding_type = self._embedding_type(embedding_type)
+        abstraction_type = self._abstraction_type(abstraction_method)
+        return self._save_dir() / (
+            f"{self._dataset_prefix()}{self.config.embedding_model}_{embedding_type}_{abstraction_type}_"
+            f"{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
+        )
+
+    def _inference_key(
+        self,
+        layer: str,
+        abstraction_method: str,
+        norm_scheme: str,
+        embedding_type: str | None = None,
+    ) -> str:
+        return f"{self._embedding_type(embedding_type)}_{self._abstraction_type(abstraction_method)}_{self._layer_label(layer)}_{norm_scheme}_inference_results"
+
+    @staticmethod
+    def _abstraction_type(method: str) -> str:
+        if method == "Embeddings":
+            return "none"
+        return method
+
+    def _embedding_type(self, embedding_type: str | None = None) -> str:
+        embedding_type = embedding_type or self.config.embedding_type
+        if embedding_type in {"mutation_site", "mutation_pool", "pooled"}:
+            return "mutation_pooled"
+        if embedding_type not in {"per_residue", "mutation_pooled", "mean_pool"}:
+            raise ValueError("embedding_type must be one of 'per_residue', 'mutation_pooled', or 'mean_pool'.")
+        return embedding_type
 
     @staticmethod
     def _load_pickle(path: Path):
@@ -257,7 +305,7 @@ class esmDMS:
         if job_dir is not None:
             batch_dir = Path(job_dir)
         else:
-            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self.config.embedding_model}_{self.config.embedding_method}"
+            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self.config.embedding_model}_per_residue_unpooled"
         batch_dir.mkdir(parents=True, exist_ok=True)
         return batch_dir
 
@@ -275,6 +323,7 @@ class esmDMS:
         layer: str | int,
         abstraction_method: str,
         norm_scheme: str,
+        embedding_type: str | None = None,
         job_dir: str | Path | None = None,
     ) -> Path:
         if job_dir is not None:
@@ -283,7 +332,7 @@ class esmDMS:
             inference_job_dir = (
                 self._save_dir()
                 / "inference_jobs"
-                / f"{self._dataset_prefix()}{abstraction_method}_{self._layer_label(layer)}_{norm_scheme}"
+                / f"{self._dataset_prefix()}{self.config.embedding_model}_{self._embedding_type(embedding_type)}_{self._abstraction_type(abstraction_method)}_{self._layer_label(layer)}_{norm_scheme}"
             )
         inference_job_dir.mkdir(parents=True, exist_ok=True)
         return inference_job_dir
@@ -329,7 +378,7 @@ class esmDMS:
                 if layer_embedding.shape[0] != 1 and not allow_per_residue:
                     raise ValueError(
                         "Unpooled per-residue embeddings are not valid feature vectors for inference. "
-                        "Set per_residue_mutation_pooling=True or add a feature abstraction that flattens them intentionally."
+                        "Use embedding_type='mutation_pooled' or add a feature abstraction that flattens them intentionally."
                     )
                 if allow_per_residue and layer_embedding.shape[0] != 1:
                     selected[seq_id] = layer_embedding
@@ -338,6 +387,47 @@ class esmDMS:
             else:
                 raise ValueError(f"Unsupported embedding shape for sequence {seq_id}: {embedding.shape}")
         return selected
+
+    @staticmethod
+    def _derive_embedding_type(
+        layer_embeddings: dict[str, np.ndarray],
+        embedding_type: str,
+    ) -> dict[str, np.ndarray]:
+        if embedding_type == "per_residue":
+            return layer_embeddings
+        if embedding_type in {"mutation_pooled", "mean_pool"}:
+            derived = {}
+            for seq_id, embedding in layer_embeddings.items():
+                if embedding is None:
+                    derived[seq_id] = None
+                    continue
+                embedding = np.asarray(embedding)
+                if embedding.ndim == 1:
+                    derived[seq_id] = embedding
+                elif embedding.ndim == 2:
+                    derived[seq_id] = embedding.mean(axis=0)
+                else:
+                    raise ValueError(
+                        f"Cannot derive {embedding_type} from layer embedding shape {embedding.shape} "
+                        f"for sequence {seq_id}."
+                    )
+            return derived
+        raise ValueError(f"Unsupported embedding_type: {embedding_type}")
+
+    @staticmethod
+    def _require_vector_features(seq_to_features: dict[str, np.ndarray], context: str) -> None:
+        bad = [
+            (seq_id, np.asarray(feature).shape)
+            for seq_id, feature in seq_to_features.items()
+            if feature is None or np.asarray(feature).ndim != 1
+        ]
+        if bad:
+            seq_id, shape = bad[0]
+            raise ValueError(
+                f"{context} requires one vector per sequence, but sequence {seq_id} has feature shape {shape}. "
+                "Use embedding_type='mutation_pooled' or embedding_type='mean_pool', or add an abstraction "
+                "that explicitly handles per-residue features."
+            )
 
     def load_reference_sequence(self):
         """
@@ -408,7 +498,6 @@ class esmDMS:
             A dictionary mapping sequence indices to their corresponding embeddings.
         """
         esm_model = f"facebook/{self.config.embedding_model}"
-        embedding_method = self.config.embedding_method
 
         tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
         model = AutoModel.from_pretrained(esm_model)
@@ -420,9 +509,9 @@ class esmDMS:
         for idx, idx_mutation_sites in zip(seq_ids, mutation_sites):
             prot_seq = self.sequence_to_protein_sequence[idx]
             layer_embeddings = embed_sequence(prot_seq, tokenizer, model,
-                                             embedding_method=embedding_method,
+                                             embedding_method="per_residue",
                                              mutation_sites=idx_mutation_sites,
-                                             pool_mutations=self.config.per_residue_mutation_pooling)
+                                             pool_mutations=False)
             seq_idx_to_embedding[idx] = layer_embeddings
 
         if self._use_memory():
@@ -444,21 +533,24 @@ class esmDMS:
         seq_ids = sorted(self.sequence_dataframe['SequenceIndex'].unique())
         embeddings = self.embed_sequences(seq_ids)
 
-        n_layers = embeddings[seq_ids[0]].shape[0]
+        first_embedding = next((np.asarray(embedding) for embedding in embeddings.values() if embedding is not None), None)
+        if first_embedding is None:
+            raise ValueError("No non-empty embeddings were created.")
+        n_layers = first_embedding.shape[1] if first_embedding.ndim == 3 else first_embedding.shape[0]
         if layer == 'all':
             for l in range(n_layers):
-                layer_embeddings = self._select_layer(embeddings, l)
+                layer_embeddings = self._select_layer(embeddings, l, allow_per_residue=True)
                 if self._use_memory():
                     self.sequence_to_features[self._embedding_key(l)] = layer_embeddings
                 if self._use_disk():
-                    save_path = self._embedding_path(l)
+                    save_path = self._base_embedding_path(l)
                     self._save_pickle(layer_embeddings, save_path)
         else:
-            layer_embeddings = self._select_layer(embeddings, layer)
+            layer_embeddings = self._select_layer(embeddings, layer, allow_per_residue=True)
             if self._use_memory():
                 self.sequence_to_features[self._embedding_key(layer)] = layer_embeddings
             if self._use_disk():
-                save_path = self._embedding_path(layer)
+                save_path = self._base_embedding_path(layer)
                 self._save_pickle(layer_embeddings, save_path)
 
     def create_embedding_batch_job(
@@ -508,8 +600,7 @@ class esmDMS:
                 seq_id: self.sequence_to_mutation_sites[seq_id] for seq_id in seq_ids
             },
             "embedding_model": self.config.embedding_model,
-            "embedding_method": self.config.embedding_method,
-            "per_residue_mutation_pooling": self.config.per_residue_mutation_pooling,
+            "embedding_type": "per_residue",
             "dataset_name": self.config.dataset_name,
             "dataset_prefix": self._dataset_prefix(),
             "n_chunks": n_chunks,
@@ -595,9 +686,9 @@ export TMPDIR="$SCRDIR"
                 prot_seq,
                 tokenizer,
                 model,
-                embedding_method=payload["embedding_method"],
+                embedding_method="per_residue",
                 mutation_sites=mutation_sites,
-                pool_mutations=payload["per_residue_mutation_pooling"],
+                pool_mutations=False,
             )
 
         dataset_prefix = payload.get("dataset_prefix", "")
@@ -644,8 +735,7 @@ export TMPDIR="$SCRDIR"
             "n_chunks": n_chunks,
             "save_layers": save_layers,
             "embedding_model": self.config.embedding_model,
-            "embedding_method": self.config.embedding_method,
-            "per_residue_mutation_pooling": self.config.per_residue_mutation_pooling,
+            "embedding_type": self.config.embedding_type,
             "local_or_disk": "disk",
             "save_dir": self.config.save_dir,
             "dataset_name": self.config.dataset_name,
@@ -697,8 +787,7 @@ cd {Path.cwd()}
         runner = object.__new__(esmDMS)
         runner.config = ESMDMSConfig(
             embedding_model=payload["embedding_model"],
-            embedding_method=payload["embedding_method"],
-            per_residue_mutation_pooling=payload["per_residue_mutation_pooling"],
+            embedding_type=payload.get("embedding_type", "per_residue"),
             local_or_disk=payload["local_or_disk"],
             save_dir=payload["save_dir"],
             dataset_name=payload["dataset_name"],
@@ -753,24 +842,18 @@ cd {Path.cwd()}
             layers = range(first_embedding.shape[layer_axis])
         else:
             layers = [layer]
-        allow_per_residue = (
-            payload is not None
-            and payload.get("embedding_method") == "per_residue"
-            and not payload.get("per_residue_mutation_pooling", False)
-        )
-
         for layer_value in layers:
-            layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=allow_per_residue)
+            layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=True)
             if self._use_memory():
                 self.sequence_to_features[self._embedding_key(layer_value)] = layer_embeddings
             if save_layers and self._use_disk():
-                self._save_pickle(layer_embeddings, self._embedding_path(layer_value))
+                self._save_pickle(layer_embeddings, self._base_embedding_path(layer_value))
 
         return merged
         
 
 
-    def load_embeddings(self, layer: str) -> dict[str, np.ndarray]:
+    def load_embeddings(self, layer: str | int, embedding_type: EmbeddingType | None = None) -> dict[str, np.ndarray]:
         """
         Load embeddings from disk if they exist.
 
@@ -780,27 +863,39 @@ cd {Path.cwd()}
             A dictionary mapping sequence indices to their corresponding embeddings, or None if no saved embeddings are found.
         """
 
-        key = self._embedding_key(layer)
+        embedding_type = self._embedding_type(embedding_type)
+        key = self._feature_key("none", layer, embedding_type)
         if self._use_memory() and self.sequence_to_features.get(key) is not None:
             print("Embeddings already exist in memory. Returning existing embeddings.")
             return self.sequence_to_features[key]
 
         if self._use_memory() and self.sequence_to_embeddings:
-            layer_embeddings = self._select_layer(self.sequence_to_embeddings, layer)
+            per_residue_embeddings = self._select_layer(self.sequence_to_embeddings, layer, allow_per_residue=True)
+            layer_embeddings = self._derive_embedding_type(per_residue_embeddings, embedding_type)
             self.sequence_to_features[key] = layer_embeddings
             if self._use_disk():
-                self._save_pickle(layer_embeddings, self._embedding_path(layer))
+                self._save_pickle(layer_embeddings, self._embedding_path(layer, embedding_type))
             return layer_embeddings
 
         if self._use_disk():
-            save_path = self._embedding_path(layer)
-            if save_path.is_file():
-                print(f"Loading embeddings from {save_path}")
+            save_path = self._embedding_path(layer, embedding_type)
+            if save_path.is_file() and embedding_type != "per_residue":
+                print(f"Loading {embedding_type} embeddings from {save_path}")
                 embeddings = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = embeddings
                 return embeddings
-            raise FileNotFoundError(f"No saved embeddings found at {save_path}. Run embed_all_sequences({layer!r}) first.")
+            base_path = self._base_embedding_path(layer)
+            if base_path.is_file():
+                print(f"Loading per-residue embeddings from {base_path}")
+                per_residue_embeddings = self._load_pickle(base_path)
+                embeddings = self._derive_embedding_type(per_residue_embeddings, embedding_type)
+                if self._use_memory():
+                    self.sequence_to_features[key] = embeddings
+                if embedding_type != "per_residue":
+                    self._save_pickle(embeddings, save_path)
+                return embeddings
+            raise FileNotFoundError(f"No saved per-residue embeddings found at {base_path}. Run embed_all_sequences({layer!r}) first.")
 
         raise ValueError("No embeddings found in memory. Run embed_all_sequences() before inference.")
 
@@ -828,8 +923,9 @@ cd {Path.cwd()}
 
 
     def create_feature_space(self, layer: str, 
-                            method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
-                            method_params: dict | None = None) -> dict[str, np.ndarray]:
+                            method: AbstractionMethod = 'none',
+                            method_params: dict | None = None,
+                            embedding_type: EmbeddingType | None = None) -> dict[str, np.ndarray]:
         """
         Create an abstraction of the embeddings using the specified method.
 
@@ -837,7 +933,7 @@ cd {Path.cwd()}
         -----------
         layer : str
             The layer from which to extract features.
-        method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
+        method : Literal['none', 'PCA', 'SAE', 'SPCA']
             The method to use for creating the abstraction.
         method_params : dict | None
             Parameters for the abstraction method.
@@ -847,19 +943,25 @@ cd {Path.cwd()}
         dict[str, np.ndarray]
             A dictionary mapping sequence indices to their corresponding features.
         """
-        if method == 'Embeddings':
+        embedding_type = self._embedding_type(embedding_type)
+        method = self._abstraction_type(method)
+        if method == 'none':
             print("No abstraction method specified. Using raw embeddings as features.")
-            return self.load_embeddings(layer)
+            features = self.load_embeddings(layer, embedding_type)
+            if self._use_disk():
+                self._save_pickle(features, self._feature_path(method, layer, embedding_type))
+            return features
 
-        embeddings = self.load_embeddings(layer)
-        key = self._feature_key(method, layer)
+        embeddings = self.load_embeddings(layer, embedding_type)
+        self._require_vector_features(embeddings, f"{method} abstraction with embedding_type={embedding_type!r}")
+        key = self._feature_key(method, layer, embedding_type)
 
         if self._use_memory() and self.sequence_to_features.get(key) is not None:
             print("Abstracted features already exist in memory. Returning existing features.")
             return self.sequence_to_features[key]
 
         if self._use_disk():
-            save_path = self._feature_path(method, layer)
+            save_path = self._feature_path(method, layer, embedding_type)
             if save_path.is_file():
                 print(f"Abstracted already saved in {save_path}")
                 abstracted_features = self._load_pickle(save_path)
@@ -874,15 +976,16 @@ cd {Path.cwd()}
         if self._use_memory():
             self.sequence_to_features[key] = abstracted_features
         if self._use_disk():
-            self._save_pickle(abstracted_features, self._feature_path(method, layer))
+            self._save_pickle(abstracted_features, self._feature_path(method, layer, embedding_type))
         return abstracted_features
 
 
     def _create_feature_space(self, embeddings: dict[str, np.ndarray], 
-                        method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+                        method: AbstractionMethod = 'none',
                         method_params: dict | None = None) -> dict[str, np.ndarray]:
         # Placeholder for abstraction implementation
-        if method == 'Embeddings':
+        method = self._abstraction_type(method)
+        if method == 'none':
             return embeddings
         elif method == 'PCA':
             # Implement PCA abstraction here
@@ -1232,7 +1335,8 @@ cd {Path.cwd()}
 
 
     def _load_abstracted_features(self, layer: str, 
-                                    method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'], 
+                                    method: AbstractionMethod | str,
+                                    embedding_type: EmbeddingType | None,
                                     method_params: dict | None) -> dict[str, np.ndarray]:
         """
         Load abstracted features from disk if they exist.
@@ -1241,7 +1345,7 @@ cd {Path.cwd()}
         -----------
         layer : str
             The layer from which to extract features.
-        method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
+        method : Literal['none', 'PCA', 'SAE', 'SPCA']
             The method used for abstraction.
         method_params : dict | None
             Parameters for the abstraction method.
@@ -1251,17 +1355,19 @@ cd {Path.cwd()}
         dict[str, np.ndarray] | None
             A dictionary mapping sequence indices to their corresponding abstracted features, or None if no saved features are found.
         """
-        if method == 'Embeddings':
+        embedding_type = self._embedding_type(embedding_type)
+        method = self._abstraction_type(method)
+        if method == 'none':
             print("No abstraction method specified. Using raw embeddings as features.")
-            return self.load_embeddings(layer)
+            return self.load_embeddings(layer, embedding_type)
 
-        key = self._feature_key(method, layer)
+        key = self._feature_key(method, layer, embedding_type)
         if self._use_memory() and self.sequence_to_features.get(key) is not None:
             print("Abstracted features already exist in memory. Returning existing features.")
             return self.sequence_to_features[key]
 
         if self._use_disk():
-            save_path = self._feature_path(method, layer)
+            save_path = self._feature_path(method, layer, embedding_type)
             if save_path.is_file():
                 print(f"Loading abstracted features from {save_path}")
                 abstracted_features = self._load_pickle(save_path)
@@ -1269,7 +1375,7 @@ cd {Path.cwd()}
                     self.sequence_to_features[key] = abstracted_features
                 return abstracted_features
 
-        return self.create_feature_space(layer, method, method_params)
+        return self.create_feature_space(layer, method, method_params, embedding_type)
 
     @staticmethod
     def _normalize_features(features, norm_scheme):
@@ -1283,18 +1389,18 @@ cd {Path.cwd()}
 
     def _feature_input_path(
         self,
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'],
+        abstraction_method: AbstractionMethod | str,
         layer: str | int,
+        embedding_type: EmbeddingType | None = None,
     ) -> Path:
-        if abstraction_method == "Embeddings":
-            return self._embedding_path(layer)
-        return self._feature_path(abstraction_method, layer)
+        return self._feature_path(abstraction_method, layer, embedding_type)
 
     def create_inference_job(
         self,
         layer: str | int,
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        abstraction_method: AbstractionMethod = 'none',
         abstraction_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
         job_dir: str | Path | None = None,
         job_name: str = "esm_infer",
         partition: str = "dept_cpu",
@@ -1317,16 +1423,18 @@ cd {Path.cwd()}
             raise ValueError("Run process_raw_data() before creating an inference job.")
 
         abstraction_params = abstraction_params or {}
+        embedding_type = self._embedding_type(embedding_type)
+        abstraction_method = self._abstraction_type(abstraction_method)
         norm_scheme = abstraction_params.get("norm_scheme", "none")
-        feature_path = self._feature_input_path(abstraction_method, layer)
+        feature_path = self._feature_input_path(abstraction_method, layer, embedding_type)
         if not feature_path.is_file():
             raise FileNotFoundError(
                 f"No saved features found at {feature_path}. "
                 f"Create or save the {abstraction_method} features for layer={layer!r} before running an inference job."
             )
 
-        output_path = self._inference_path(abstraction_method, layer, norm_scheme)
-        inference_job_dir = self._inference_job_dir(layer, abstraction_method, norm_scheme, job_dir)
+        output_path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
+        inference_job_dir = self._inference_job_dir(layer, abstraction_method, norm_scheme, embedding_type, job_dir)
         logs_dir = inference_job_dir / "logs"
         logs_dir.mkdir(exist_ok=True)
 
@@ -1334,6 +1442,8 @@ cd {Path.cwd()}
             "sequence_dataframe": self.sequence_dataframe,
             "feature_path": str(feature_path),
             "output_path": str(output_path),
+            "embedding_type": embedding_type,
+            "abstraction_method": abstraction_method,
             "norm_scheme": norm_scheme,
         }
         payload_path = self._inference_payload_path(inference_job_dir)
@@ -1397,6 +1507,7 @@ export TMPDIR="$SCRDIR"
         norm_scheme = payload["norm_scheme"]
 
         seq_to_features = esmDMS._load_pickle(feature_path)
+        esmDMS._require_vector_features(seq_to_features, "Inference")
         if norm_scheme is not None and norm_scheme != "none":
             seq_ids = list(seq_to_features)
             features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
@@ -1418,9 +1529,9 @@ export TMPDIR="$SCRDIR"
 
     #TODO: add parameters for model type (linear, non-linear) and regularization scheme (L2, L1, ElasticNet)
     def run_feature_inference(self, layer: str,
-                              abstraction_method: Literal['Embeddings', 'PCA', 
-                                                          'SAE', 'SPCA'],
-                              abstraction_params: dict | None = None) -> InferenceResult: 
+                              abstraction_method: AbstractionMethod = 'none',
+                              abstraction_params: dict | None = None,
+                              embedding_type: EmbeddingType | None = None) -> InferenceResult: 
         """
         Run the abstracted features through the popDMS framework to calculate selection coefficients and fitness.
 
@@ -1428,7 +1539,7 @@ export TMPDIR="$SCRDIR"
         -----------
         layer : str | None
             The layer from which to extract features.
-        abstraction_method : Literal['Embeddings', 'PCA', 'SAE', 'SPCA']
+        abstraction_method : Literal['none', 'PCA', 'SAE', 'SPCA']
             The method used for feature abstraction.
         abstraction_params : dict | None
             Parameters for the abstraction method.
@@ -1452,10 +1563,12 @@ export TMPDIR="$SCRDIR"
             raise ValueError("Sequence dataframe is not available. Please run process_raw_data() first.")
 
         abstraction_params = abstraction_params or {}
+        embedding_type = self._embedding_type(embedding_type)
+        abstraction_method = self._abstraction_type(abstraction_method)
         norm_scheme = abstraction_params.get('norm_scheme', 'none')
         if self._use_disk():
             # check if the features are already saved to disk
-            save_path = self._inference_path(abstraction_method, layer, norm_scheme)
+            save_path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
             if save_path.is_file():
                 print(f"Loading inference results from {save_path}")
                 return self._load_pickle(save_path)
@@ -1463,7 +1576,8 @@ export TMPDIR="$SCRDIR"
                 print(f"No saved inference results found at {save_path}. Running inference and saving results.")
         
         # load features, seq_to_features type = dict[str, np.ndarray]
-        seq_to_features = self._load_abstracted_features(layer, abstraction_method, abstraction_params)
+        seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, abstraction_params)
+        self._require_vector_features(seq_to_features, "Inference")
         if norm_scheme is not None and norm_scheme != "none":
             seq_ids = list(seq_to_features)
             features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
@@ -1473,34 +1587,44 @@ export TMPDIR="$SCRDIR"
         inf_result = mini_infer_esm(self.sequence_dataframe, seq_to_features)
         if self._use_disk():
             self._save_inference_results(inf_result, layer, 
-                                         abstraction_method, norm_scheme)
+                                         abstraction_method, norm_scheme, embedding_type)
         if self._use_memory():
-            self.inference_results[self._inference_key(layer, abstraction_method, norm_scheme)] = inf_result
+            self.inference_results[self._inference_key(layer, abstraction_method, norm_scheme, embedding_type)] = inf_result
         return inf_result
 
 
-    def _save_inference_results(self, results: dict, layer: str, abstraction_method: str, norm_scheme: str) -> None:
+    def _save_inference_results(
+        self,
+        results: dict,
+        layer: str,
+        abstraction_method: str,
+        norm_scheme: str,
+        embedding_type: str | None = None,
+    ) -> None:
         if self.config.save_dir is None:
             raise ValueError("save_dir must be specified in the configuration to save inference results to disk.")
         
-        save_path = self._inference_path(abstraction_method, layer, norm_scheme)
+        save_path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
         self._save_pickle(results, save_path)
 
     def load_inference_results(
         self,
         layer: str | int,
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        abstraction_method: AbstractionMethod = 'none',
         norm_scheme: str = "none",
+        embedding_type: EmbeddingType | None = None,
     ) -> InferenceResult:
         """
         Load inference results from memory or disk for a layer/method/norm tuple.
         """
-        key = self._inference_key(str(layer), abstraction_method, norm_scheme)
+        embedding_type = self._embedding_type(embedding_type)
+        abstraction_method = self._abstraction_type(abstraction_method)
+        key = self._inference_key(str(layer), abstraction_method, norm_scheme, embedding_type)
         if self._use_memory() and key in self.inference_results:
             return self.inference_results[key]
 
         if self._use_disk():
-            path = self._inference_path(abstraction_method, layer, norm_scheme)
+            path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
             if path.is_file():
                 result = self._load_pickle(path)
                 if self._use_memory():
@@ -1509,7 +1633,7 @@ export TMPDIR="$SCRDIR"
 
         raise FileNotFoundError(
             f"No inference results found for layer={layer}, "
-            f"abstraction_method={abstraction_method}, norm_scheme={norm_scheme}."
+            f"embedding_type={embedding_type}, abstraction_method={abstraction_method}, norm_scheme={norm_scheme}."
         )
 
     @staticmethod
@@ -1532,10 +1656,12 @@ export TMPDIR="$SCRDIR"
     def _features_for_inference(
         self,
         layer: str | int,
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'],
+        abstraction_method: AbstractionMethod | str,
+        embedding_type: EmbeddingType | None,
         norm_scheme: str,
     ) -> tuple[list, np.ndarray]:
-        seq_to_features = self._load_abstracted_features(layer, abstraction_method, {"norm_scheme": norm_scheme})
+        seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, {"norm_scheme": norm_scheme})
+        self._require_vector_features(seq_to_features, "Inference plotting")
         seq_ids = list(seq_to_features)
         features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
         if norm_scheme is not None and norm_scheme != "none":
@@ -1598,7 +1724,8 @@ export TMPDIR="$SCRDIR"
     def plot_rep_sel_comps(
         self,
         layer: str | int,
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        abstraction_method: AbstractionMethod = 'none',
+        embedding_type: EmbeddingType | None = None,
         norm_scheme: str = "none",
         label: str | None = None,
         output_path: str | Path | None = None,
@@ -1607,7 +1734,7 @@ export TMPDIR="$SCRDIR"
         """
         Plot replicate-vs-replicate inferred selection coefficients for a saved result.
         """
-        result = self.load_inference_results(layer, abstraction_method, norm_scheme)
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme, embedding_type)
         title_label = label or abstraction_method
         title = f"{title_label} selection coefficients, {self._layer_label(layer)}"
         return self._plot_rep_scatter_grid(result.s, title, "selection coefficient", output_path, max_cols)
@@ -1615,8 +1742,9 @@ export TMPDIR="$SCRDIR"
     def plot_rep_fit_comps(
         self,
         layer: str | int,
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        abstraction_method: AbstractionMethod = 'none',
         norm_scheme: str = "none",
+        embedding_type: EmbeddingType | None = None,
         label: str | None = None,
         output_path: str | Path | None = None,
         max_cols: int = 3,
@@ -1624,8 +1752,8 @@ export TMPDIR="$SCRDIR"
         """
         Plot replicate-vs-replicate inferred sequence fitness for a saved result.
         """
-        result = self.load_inference_results(layer, abstraction_method, norm_scheme)
-        _, features = self._features_for_inference(layer, abstraction_method, norm_scheme)
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme, embedding_type)
+        _, features = self._features_for_inference(layer, abstraction_method, embedding_type, norm_scheme)
         rep_fitness = np.asarray([features @ result.s[rep_idx] for rep_idx in range(result.s.shape[0])])
         title_label = label or abstraction_method
         title = f"{title_label} inferred fitness, {self._layer_label(layer)}"
@@ -1634,8 +1762,9 @@ export TMPDIR="$SCRDIR"
     def plot_avg_rep_correlations_by_layer(
         self,
         layers: list[str | int],
-        abstraction_method: Literal['Embeddings', 'PCA', 'SAE', 'SPCA'] = 'Embeddings',
+        abstraction_method: AbstractionMethod = 'none',
         norm_scheme: str = "none",
+        embedding_type: EmbeddingType | None = None,
         comparison: Literal["selection", "fitness"] = "selection",
         label: str | None = None,
         output_path: str | Path | None = None,
@@ -1646,11 +1775,11 @@ export TMPDIR="$SCRDIR"
         sns.set_theme(style="darkgrid")
         rows = []
         for layer in layers:
-            result = self.load_inference_results(layer, abstraction_method, norm_scheme)
+            result = self.load_inference_results(layer, abstraction_method, norm_scheme, embedding_type)
             if comparison == "selection":
                 rep_values = result.s
             elif comparison == "fitness":
-                _, features = self._features_for_inference(layer, abstraction_method, norm_scheme)
+                _, features = self._features_for_inference(layer, abstraction_method, embedding_type, norm_scheme)
                 rep_values = np.asarray([features @ result.s[rep_idx] for rep_idx in range(result.s.shape[0])])
             else:
                 raise ValueError("comparison must be either 'selection' or 'fitness'.")
