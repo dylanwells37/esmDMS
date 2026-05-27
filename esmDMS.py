@@ -623,8 +623,9 @@ export TMPDIR="$SCRDIR"
         """
         batch_dir = self._batch_dir(job_dir)
         payload_path = self._batch_payload_path(batch_dir)
+        payload = self._load_pickle(payload_path) if payload_path.is_file() else None
         if payload_path.is_file() and n_chunks is None:
-            n_chunks = self._load_pickle(payload_path)["n_chunks"]
+            n_chunks = payload["n_chunks"]
         if n_chunks is None:
             chunk_files = sorted(batch_dir.glob(f"{self._dataset_prefix()}embeddings_chunk_*.pkl"))
         else:
@@ -649,9 +650,14 @@ export TMPDIR="$SCRDIR"
             layers = range(first_embedding.shape[layer_axis])
         else:
             layers = [layer]
+        allow_per_residue = (
+            payload is not None
+            and payload.get("embedding_method") == "per_residue"
+            and not payload.get("per_residue_mutation_pooling", False)
+        )
 
         for layer_value in layers:
-            layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=True)
+            layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=allow_per_residue)
             if self._use_memory():
                 self.sequence_to_features[self._embedding_key(layer_value)] = layer_embeddings
             if save_layers and self._use_disk():
