@@ -373,15 +373,12 @@ class esmDMS:
                 selected[seq_id] = embedding[layer_idx]
             elif embedding.ndim == 3:
                 layer_embedding = embedding[:, layer_idx, :]
-                if layer_embedding.shape[0] != 1 and not allow_per_residue:
+                if not allow_per_residue:
                     raise ValueError(
                         "Unpooled per-residue embeddings are not valid feature vectors for inference. "
                         "Use embedding_type='mutation_pooled' or add a feature abstraction that flattens them intentionally."
                     )
-                if allow_per_residue:
-                    selected[seq_id] = layer_embedding
-                else:
-                    selected[seq_id] = layer_embedding[0]
+                selected[seq_id] = layer_embedding
             else:
                 raise ValueError(f"Unsupported embedding shape for sequence {seq_id}: {embedding.shape}")
         return selected
@@ -450,6 +447,31 @@ class esmDMS:
                 "Use embedding_type='mutation_pooled' or embedding_type='mean_pool', or add an abstraction "
                 "that explicitly handles per-residue features."
             )
+
+    @staticmethod
+    def _drop_missing_features(
+        sequence_dataframe: pd.DataFrame | None,
+        seq_to_features: dict[str, np.ndarray],
+        context: str,
+    ) -> tuple[pd.DataFrame | None, dict[str, np.ndarray]]:
+        filtered_features = {
+            seq_id: feature
+            for seq_id, feature in seq_to_features.items()
+            if feature is not None
+        }
+        dropped_ids = set(seq_to_features) - set(filtered_features)
+        if dropped_ids:
+            print(f"{context}: dropping {len(dropped_ids)} sequence(s) with no mutation-site features.")
+
+        if sequence_dataframe is None:
+            return None, filtered_features
+
+        sequence_dataframe = sequence_dataframe[
+            sequence_dataframe["SequenceIndex"].isin(filtered_features)
+        ].copy()
+        if sequence_dataframe.empty:
+            raise ValueError(f"{context}: no sequence rows remain after filtering missing mutation-site features.")
+        return sequence_dataframe, filtered_features
 
     def load_reference_sequence(self):
         """
@@ -963,11 +985,13 @@ cd {Path.cwd()}
         if method == 'none':
             print("No abstraction method specified. Using raw embeddings as features.")
             features = self.load_embeddings(layer, embedding_type)
+            _, features = self._drop_missing_features(None, features, f"{embedding_type} features")
             if self._use_disk():
                 self._save_pickle(features, self._feature_path(method, layer, embedding_type))
             return features
 
         embeddings = self.load_embeddings(layer, embedding_type)
+        _, embeddings = self._drop_missing_features(None, embeddings, f"{method} abstraction")
         self._require_vector_features(embeddings, f"{method} abstraction with embedding_type={embedding_type!r}")
         key = self._feature_key(method, layer, embedding_type)
 
@@ -1444,11 +1468,6 @@ cd {Path.cwd()}
         feature_path = self._feature_input_path(abstraction_method, layer, embedding_type)
         if not feature_path.is_file():
             self.create_feature_space(layer, abstraction_method, abstraction_params, embedding_type)
-        if not feature_path.is_file():
-            raise FileNotFoundError(
-                f"No saved features found at {feature_path}. "
-                f"Create or save the {abstraction_method} features for layer={layer!r} before running an inference job."
-            )
 
         output_path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
         inference_job_dir = self._inference_job_dir(layer, abstraction_method, norm_scheme, embedding_type, job_dir)
@@ -1524,6 +1543,11 @@ export TMPDIR="$SCRDIR"
         norm_scheme = payload["norm_scheme"]
 
         seq_to_features = esmDMS._load_pickle(feature_path)
+        sequence_dataframe, seq_to_features = esmDMS._drop_missing_features(
+            sequence_dataframe,
+            seq_to_features,
+            "Inference",
+        )
         esmDMS._require_vector_features(seq_to_features, "Inference")
         if norm_scheme is not None and norm_scheme != "none":
             seq_ids = list(seq_to_features)
@@ -1594,6 +1618,11 @@ export TMPDIR="$SCRDIR"
         
         # load features, seq_to_features type = dict[str, np.ndarray]
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, abstraction_params)
+        sequence_dataframe, seq_to_features = self._drop_missing_features(
+            self.sequence_dataframe,
+            seq_to_features,
+            "Inference",
+        )
         self._require_vector_features(seq_to_features, "Inference")
         if norm_scheme is not None and norm_scheme != "none":
             seq_ids = list(seq_to_features)
@@ -1601,7 +1630,7 @@ export TMPDIR="$SCRDIR"
             features = self._normalize_features(features, norm_scheme)
             seq_to_features = dict(zip(seq_ids, features))
 
-        inf_result = mini_infer_esm(self.sequence_dataframe, seq_to_features)
+        inf_result = mini_infer_esm(sequence_dataframe, seq_to_features)
         if self._use_disk():
             self._save_inference_results(inf_result, layer, 
                                          abstraction_method, norm_scheme, embedding_type)
@@ -1678,6 +1707,7 @@ export TMPDIR="$SCRDIR"
         norm_scheme: str,
     ) -> tuple[list, np.ndarray]:
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, {"norm_scheme": norm_scheme})
+        _, seq_to_features = self._drop_missing_features(None, seq_to_features, "Inference plotting")
         self._require_vector_features(seq_to_features, "Inference plotting")
         seq_ids = list(seq_to_features)
         features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])

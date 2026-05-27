@@ -405,8 +405,7 @@ def _normalise_mutation_sites(value):
     return [int(v) for v in value]
 
 
-def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None,
-                    embedding_method="all_data", pool_mutations=False):
+def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None):
     """
     Embed protein sequences and return an annotated DataFrame.
 
@@ -453,10 +452,9 @@ def embed_dataframe(seq_df, esm_model, embed_zeroes=False, n_test=None,
 
     out = seq_df.copy()
     out["Embedding"] = out["ProteinSequence"].map(seq_to_emb)
-    out["EmbeddingMethod"] = embedding_method
-    out["PoolMutations"] = pool_mutations
+    out["EmbeddingMethod"] = "all_data"
     extra_cols = [c for c in ["MutationSites", "MutationSite", "MutationSiteIndex"] if c in out.columns]
-    return out[["ProteinSequence", *extra_cols, "EmbeddingMethod", "PoolMutations",
+    return out[["ProteinSequence", *extra_cols, "EmbeddingMethod",
                 "Generation", "Embedding", "Frequency", "Replicate"]]
 
     
@@ -552,7 +550,6 @@ def main():
     print(f"Protein         : {cfg['protein']}")
     print(f"ESM model       : {cfg['esm_model']}")
     print(f"embedding_method: {cfg['embedding_method']}")
-    print(f"pool_mutations  : {cfg['pool_mutations']}")
     print(f"embed_zeroes    : {cfg['embed_zeroes']}")
 
     if mavedb_mode:
@@ -612,9 +609,7 @@ def main():
     # --- Step 2: compute embeddings ---
     print("\n=== Step 2: Computing ESM embeddings ===")
     seq_df = embed_dataframe(seq_df, cfg["esm_model"], embed_zeroes=cfg["embed_zeroes"],
-                             n_test=args.n_test,
-                             embedding_method=cfg["embedding_method"],
-                             pool_mutations=cfg["pool_mutations"])
+                             n_test=args.n_test)
 
     # Append chunk suffix to output filename when running in array mode
     if args.n_chunks > 1:
