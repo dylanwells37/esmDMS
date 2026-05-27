@@ -614,6 +614,104 @@ export TMPDIR="$SCRDIR"
             shutil.copy2(scratch_path, final_path)
         return final_path
 
+    def create_embedding_batch_merge_job(
+        self,
+        job_dir: str | Path | None = None,
+        layer: str | int = "all",
+        n_chunks: int | None = None,
+        save_layers: bool = True,
+        job_name: str = "esm_embed_merge",
+        partition: str = "dept_cpu",
+        cpus_per_task: int = 1,
+        mem: str = "16G",
+        time: str = "01:00:00",
+        python_executable: str = "python3",
+        submit: bool = False,
+    ) -> dict[str, Path | str]:
+        """
+        Create a Slurm job that merges completed embedding chunk outputs.
+        """
+        if not self._use_disk():
+            raise ValueError("Embedding batch merge jobs require local_or_disk to be 'disk' or 'both'.")
+
+        batch_dir = self._batch_dir(job_dir)
+        logs_dir = batch_dir / "logs"
+        logs_dir.mkdir(exist_ok=True)
+
+        payload = {
+            "job_dir": str(batch_dir),
+            "layer": layer,
+            "n_chunks": n_chunks,
+            "save_layers": save_layers,
+            "embedding_model": self.config.embedding_model,
+            "embedding_method": self.config.embedding_method,
+            "per_residue_mutation_pooling": self.config.per_residue_mutation_pooling,
+            "local_or_disk": "disk",
+            "save_dir": self.config.save_dir,
+            "dataset_name": self.config.dataset_name,
+        }
+        payload_path = batch_dir / f"{self._dataset_prefix()}embedding_merge_payload.pkl"
+        self._save_pickle(payload, payload_path)
+
+        script_path = batch_dir / "submit_embedding_merge.sh"
+        script = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH -p {partition}
+#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --time={time}
+#SBATCH --mem={mem}
+#SBATCH --output={logs_dir}/merge-%j.out
+#SBATCH --error={logs_dir}/merge-%j.err
+
+set -euo pipefail
+cd {Path.cwd()}
+
+{python_executable} -c "import sys; sys.path.insert(0, r'{Path.cwd()}'); import popDMS; from esmDMS import esmDMS; esmDMS.run_embedding_batch_merge(r'{payload_path}')"
+"""
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        job_id = ""
+        if submit:
+            completed = subprocess.run(
+                ["sbatch", str(script_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            job_id = completed.stdout.strip()
+
+        return {
+            "batch_dir": batch_dir,
+            "payload_path": payload_path,
+            "script_path": script_path,
+            "job_id": job_id,
+        }
+
+    @staticmethod
+    def run_embedding_batch_merge(payload_path: str | Path) -> dict[str, np.ndarray]:
+        """
+        Worker entrypoint used by create_embedding_batch_merge_job().
+        """
+        payload = esmDMS._load_pickle(Path(payload_path))
+        runner = object.__new__(esmDMS)
+        runner.config = ESMDMSConfig(
+            embedding_model=payload["embedding_model"],
+            embedding_method=payload["embedding_method"],
+            per_residue_mutation_pooling=payload["per_residue_mutation_pooling"],
+            local_or_disk=payload["local_or_disk"],
+            save_dir=payload["save_dir"],
+            dataset_name=payload["dataset_name"],
+        )
+        runner.sequence_to_embeddings = {}
+        runner.sequence_to_features = {}
+        return runner.merge_embedding_batch_outputs(
+            job_dir=payload["job_dir"],
+            layer=payload["layer"],
+            n_chunks=payload["n_chunks"],
+            save_layers=payload["save_layers"],
+        )
+
     def merge_embedding_batch_outputs(
         self,
         job_dir: str | Path | None = None,
