@@ -316,6 +316,9 @@ class esmDMS:
         layer_idx = int(str(layer).replace("Layer_", ""))
         selected = {}
         for seq_id, embedding in embeddings.items():
+            if embedding is None and allow_per_residue:
+                selected[seq_id] = None
+                continue
             embedding = np.asarray(embedding)
             if embedding.ndim == 1:
                 selected[seq_id] = embedding
@@ -644,7 +647,9 @@ export TMPDIR="$SCRDIR"
         self.sequence_to_embeddings.update(merged)
         self._save_pickle(merged, self._merged_embeddings_path(batch_dir))
 
-        first_embedding = np.asarray(next(iter(merged.values())))
+        first_embedding = next((np.asarray(embedding) for embedding in merged.values() if embedding is not None), None)
+        if first_embedding is None:
+            raise ValueError("No non-empty embeddings found in merged batch outputs.")
         if layer == "all":
             layer_axis = 1 if first_embedding.ndim == 3 else 0
             layers = range(first_embedding.shape[layer_axis])
