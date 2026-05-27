@@ -308,7 +308,11 @@ class esmDMS:
     # ── Embedding layer selection ─────────────────────────────────────────
 
     @staticmethod
-    def _select_layer(embeddings: dict[str, np.ndarray], layer: str | int) -> dict[str, np.ndarray]:
+    def _select_layer(
+        embeddings: dict[str, np.ndarray],
+        layer: str | int,
+        allow_per_residue: bool = False,
+    ) -> dict[str, np.ndarray]:
         layer_idx = int(str(layer).replace("Layer_", ""))
         selected = {}
         for seq_id, embedding in embeddings.items():
@@ -319,12 +323,15 @@ class esmDMS:
                 selected[seq_id] = embedding[layer_idx]
             elif embedding.ndim == 3:
                 layer_embedding = embedding[:, layer_idx, :]
-                if layer_embedding.shape[0] != 1:
+                if layer_embedding.shape[0] != 1 and not allow_per_residue:
                     raise ValueError(
                         "Unpooled per-residue embeddings are not valid feature vectors for inference. "
                         "Set per_residue_mutation_pooling=True or add a feature abstraction that flattens them intentionally."
                     )
-                selected[seq_id] = layer_embedding[0]
+                if allow_per_residue and layer_embedding.shape[0] != 1:
+                    selected[seq_id] = layer_embedding
+                else:
+                    selected[seq_id] = layer_embedding[0]
             else:
                 raise ValueError(f"Unsupported embedding shape for sequence {seq_id}: {embedding.shape}")
         return selected
@@ -636,14 +643,15 @@ export TMPDIR="$SCRDIR"
         self.sequence_to_embeddings.update(merged)
         self._save_pickle(merged, self._merged_embeddings_path(batch_dir))
 
-        first_embedding = next(iter(merged.values()))
+        first_embedding = np.asarray(next(iter(merged.values())))
         if layer == "all":
-            layers = range(np.asarray(first_embedding).shape[0])
+            layer_axis = 1 if first_embedding.ndim == 3 else 0
+            layers = range(first_embedding.shape[layer_axis])
         else:
             layers = [layer]
 
         for layer_value in layers:
-            layer_embeddings = self._select_layer(merged, layer_value)
+            layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=True)
             if self._use_memory():
                 self.sequence_to_features[self._embedding_key(layer_value)] = layer_embeddings
             if save_layers and self._use_disk():
