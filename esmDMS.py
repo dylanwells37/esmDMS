@@ -610,6 +610,63 @@ class esmDMS:
             raise ValueError(f"{context}: no sequence rows remain after filtering missing mutation-site features.")
         return sequence_dataframe, filtered_features
 
+    @staticmethod
+    def _per_residue_feature_id(seq_id, residue_idx: int) -> str:
+        return f"{seq_id}__residue_{residue_idx}"
+
+    @classmethod
+    def _expand_per_residue_features_for_inference(
+        cls,
+        sequence_dataframe: pd.DataFrame,
+        seq_to_features: dict[str, np.ndarray],
+    ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+        """
+        Convert sequence-level rows with multiple mutation-site residue embeddings
+        into residue-level pseudo-individuals for raw per_residue inference.
+        """
+        expanded_features = {}
+        feature_counts = {}
+        feature_keys = {}
+        for seq_id, feature in seq_to_features.items():
+            if feature is None:
+                continue
+            feature = np.asarray(feature)
+            if feature.ndim == 1:
+                feature = feature.reshape(1, -1)
+            if feature.ndim != 2:
+                raise ValueError(
+                    f"Raw per_residue inference requires one matrix per sequence, "
+                    f"but sequence {seq_id} has feature shape {feature.shape}."
+                )
+            feature_counts[seq_id] = feature.shape[0]
+            feature_keys[seq_id] = seq_id
+            for residue_idx, residue_feature in enumerate(feature):
+                expanded_features[cls._per_residue_feature_id(seq_id, residue_idx)] = residue_feature
+
+        if not expanded_features:
+            raise ValueError("Inference: no residue-level per_residue features are available.")
+
+        expanded_rows = []
+        for _, row in sequence_dataframe.iterrows():
+            seq_id = row["SequenceIndex"]
+            n_residues = feature_counts.get(seq_id)
+            feature_seq_id = feature_keys.get(seq_id)
+            if n_residues is None and not isinstance(seq_id, str):
+                n_residues = feature_counts.get(str(seq_id))
+                feature_seq_id = feature_keys.get(str(seq_id))
+            if n_residues is None:
+                continue
+            for residue_idx in range(n_residues):
+                expanded_row = row.to_dict()
+                expanded_row["ParentSequenceIndex"] = seq_id
+                expanded_row["ResidueFeatureIndex"] = residue_idx
+                expanded_row["SequenceIndex"] = cls._per_residue_feature_id(feature_seq_id, residue_idx)
+                expanded_rows.append(expanded_row)
+
+        if not expanded_rows:
+            raise ValueError("Inference: no sequence rows matched residue-level per_residue features.")
+        return pd.DataFrame(expanded_rows).reset_index(drop=True), expanded_features
+
     def load_reference_sequence(self):
         """
         Load the reference sequence for the input DMS data.
@@ -1863,6 +1920,11 @@ export TMPDIR="$SCRDIR"
         seq_to_features = esmDMS._load_pickle(feature_path)
         if abstraction_method == "none" and embedding_type == "mutation_pooled":
             seq_to_features = esmDMS._pool_per_residue_features(seq_to_features)
+        if abstraction_method == "none" and embedding_type == "per_residue":
+            sequence_dataframe, seq_to_features = esmDMS._expand_per_residue_features_for_inference(
+                sequence_dataframe,
+                seq_to_features,
+            )
         sequence_dataframe, seq_to_features = esmDMS._drop_missing_features(
             sequence_dataframe,
             seq_to_features,
@@ -1938,8 +2000,15 @@ export TMPDIR="$SCRDIR"
         
         # load features, seq_to_features type = dict[str, np.ndarray]
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, abstraction_params)
+        if abstraction_method == "none" and embedding_type == "per_residue":
+            sequence_dataframe, seq_to_features = self._expand_per_residue_features_for_inference(
+                self.sequence_dataframe,
+                seq_to_features,
+            )
+        else:
+            sequence_dataframe = self.sequence_dataframe
         sequence_dataframe, seq_to_features = self._drop_missing_features(
-            self.sequence_dataframe,
+            sequence_dataframe,
             seq_to_features,
             "Inference",
         )
@@ -2029,7 +2098,14 @@ export TMPDIR="$SCRDIR"
     ) -> tuple[list, np.ndarray]:
         method_params = dict(abstraction_params or {})
         method_params.setdefault("norm_scheme", norm_scheme)
+        embedding_type = self._embedding_type(embedding_type)
+        abstraction_method = self._abstraction_type(abstraction_method)
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, method_params)
+        if abstraction_method == "none" and embedding_type == "per_residue":
+            _, seq_to_features = self._expand_per_residue_features_for_inference(
+                self.sequence_dataframe,
+                seq_to_features,
+            )
         _, seq_to_features = self._drop_missing_features(None, seq_to_features, "Inference plotting")
         self._require_vector_features(seq_to_features, "Inference plotting")
         seq_ids = list(seq_to_features)
