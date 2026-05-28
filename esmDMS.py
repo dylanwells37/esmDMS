@@ -313,6 +313,9 @@ class esmDMS:
     def _batch_chunk_path(self, batch_dir: Path, chunk_idx: int) -> Path:
         return batch_dir / f"{self._dataset_prefix()}embeddings_chunk_{chunk_idx}.pkl"
 
+    def _batch_feature_chunk_path(self, batch_dir: Path, chunk_idx: int, embedding_type: str) -> Path:
+        return batch_dir / f"{self._dataset_prefix()}{embedding_type}_embeddings_chunk_{chunk_idx}.pkl"
+
     def _merged_embeddings_path(self, batch_dir: Path) -> Path:
         return batch_dir / f"{self._dataset_prefix()}merged_sequence_embeddings.pkl"
 
@@ -528,7 +531,7 @@ class esmDMS:
             self._save_pickle(per_residue, self._embedding_path(layer, "per_residue"))
 
     @classmethod
-    def _build_feature_chunk(
+    def _build_feature_chunks(
         cls,
         embeddings: dict[str, np.ndarray],
         layer: str | int,
@@ -544,18 +547,17 @@ class esmDMS:
         else:
             layers = [layer]
 
-        features_by_layer = {}
+        feature_chunks = {"mean_pool": {}, "per_residue": {}}
         for layer_value in layers:
             layer_embeddings = cls._select_layer(embeddings, layer_value, allow_per_residue=True)
-            features_by_layer[cls._layer_label(layer_value)] = {
-                "mean_pool": cls._derive_mean_pool_features(layer_embeddings),
-                "per_residue": cls._derive_per_residue_features(layer_embeddings, sequence_to_mutation_sites),
-            }
+            layer_label = cls._layer_label(layer_value)
+            feature_chunks["mean_pool"][layer_label] = cls._derive_mean_pool_features(layer_embeddings)
+            feature_chunks["per_residue"][layer_label] = cls._derive_per_residue_features(
+                layer_embeddings,
+                sequence_to_mutation_sites,
+            )
 
-        return {
-            "format": "esmDMS_embedding_features_v1",
-            "features_by_layer": features_by_layer,
-        }
+        return feature_chunks
 
     @staticmethod
     def _require_vector_features(seq_to_features: dict[str, np.ndarray], context: str) -> None:
@@ -731,9 +733,11 @@ class esmDMS:
         """
         Create a Slurm array job that embeds this dataset's processed protein sequences.
 
-        Run process_raw_data() first. Each array task writes one chunk to
-        scratch, then copies embeddings_chunk_<idx>.pkl back to job_dir. After
-        the jobs finish, call merge_embedding_batch_outputs(job_dir).
+        Run process_raw_data() first. Each array task writes separate
+        mean_pool_embeddings_chunk_<idx>.pkl and
+        per_residue_embeddings_chunk_<idx>.pkl files to scratch, then copies
+        them back to job_dir. After the jobs finish, call
+        merge_embedding_batch_outputs(job_dir).
         Set max_active_jobs to limit concurrently active Slurm array tasks.
         """
         if not self._use_disk():
@@ -821,7 +825,7 @@ export TMPDIR="$SCRDIR"
         payload_path: str | Path,
         chunk_idx: int,
         scratch_dir: str | Path | None = None,
-    ) -> Path:
+    ) -> dict[str, Path] | Path:
         """
         Worker entrypoint used by create_embedding_batch_job().
         """
@@ -845,11 +849,37 @@ export TMPDIR="$SCRDIR"
             prot_seq = payload["sequence_to_protein_sequence"][seq_id]
             out[seq_id] = embed_sequence(prot_seq, tokenizer, model)
         if payload.get("sequence_to_mutation_sites") is not None:
-            out = esmDMS._build_feature_chunk(
+            feature_chunks = esmDMS._build_feature_chunks(
                 out,
                 payload.get("layer", "all"),
                 payload["sequence_to_mutation_sites"],
             )
+            written_paths = {}
+            for embedding_type, features_by_layer in feature_chunks.items():
+                chunk_payload = {
+                    "format": "esmDMS_embedding_feature_chunk_v2",
+                    "embedding_type": embedding_type,
+                    "features_by_layer": features_by_layer,
+                }
+                final_path = (
+                    Path(payload["batch_dir"])
+                    / f"{payload.get('dataset_prefix', '')}{embedding_type}_embeddings_chunk_{chunk_idx}.pkl"
+                )
+                if scratch_dir is None:
+                    scratch_path = final_path
+                else:
+                    scratch_path = (
+                        Path(scratch_dir)
+                        / "esm_embed_saves"
+                        / f"{payload.get('dataset_prefix', '')}{embedding_type}_embeddings_chunk_{chunk_idx}.pkl"
+                    )
+                    scratch_path.parent.mkdir(parents=True, exist_ok=True)
+                with scratch_path.open("wb") as f:
+                    pickle.dump(chunk_payload, f)
+                if scratch_path != final_path:
+                    shutil.copy2(scratch_path, final_path)
+                written_paths[embedding_type] = final_path
+            return written_paths
 
         dataset_prefix = payload.get("dataset_prefix", "")
         final_path = Path(payload["batch_dir"]) / f"{dataset_prefix}embeddings_chunk_{chunk_idx}.pkl"
@@ -977,6 +1007,68 @@ cd {Path.cwd()}
         payload = self._load_pickle(payload_path) if payload_path.is_file() else None
         if payload_path.is_file() and n_chunks is None:
             n_chunks = payload["n_chunks"]
+        if payload is not None and payload.get("embedding_type") == "derived_features":
+            if getattr(self, "sequence_to_mutation_sites", None) is None:
+                self.sequence_to_mutation_sites = payload.get("sequence_to_mutation_sites")
+
+            feature_types = ("mean_pool", "per_residue")
+            if n_chunks is None:
+                feature_chunk_files = {
+                    embedding_type: sorted(
+                        batch_dir.glob(f"{self._dataset_prefix()}{embedding_type}_embeddings_chunk_*.pkl")
+                    )
+                    for embedding_type in feature_types
+                }
+            else:
+                feature_chunk_files = {
+                    embedding_type: [
+                        self._batch_feature_chunk_path(batch_dir, idx, embedding_type)
+                        for idx in range(n_chunks)
+                    ]
+                    for embedding_type in feature_types
+                }
+
+            missing_feature_chunks = [
+                path
+                for chunk_paths in feature_chunk_files.values()
+                for path in chunk_paths
+                if not path.is_file()
+            ]
+            legacy_chunk_files = [
+                self._batch_chunk_path(batch_dir, idx) for idx in range(n_chunks or 0)
+            ]
+            has_legacy_chunks = legacy_chunk_files and all(path.is_file() for path in legacy_chunk_files)
+            if missing_feature_chunks and not has_legacy_chunks:
+                raise FileNotFoundError(f"Missing embedding feature chunk files: {missing_feature_chunks}")
+
+            if not missing_feature_chunks:
+                merged_features = {}
+                for embedding_type, chunk_paths in feature_chunk_files.items():
+                    if not chunk_paths:
+                        raise FileNotFoundError(
+                            f"No {embedding_type} embedding chunk files found in {batch_dir}."
+                        )
+                    for path in chunk_paths:
+                        chunk = self._load_pickle(path)
+                        if not (
+                            isinstance(chunk, dict)
+                            and chunk.get("format") == "esmDMS_embedding_feature_chunk_v2"
+                            and chunk.get("embedding_type") == embedding_type
+                        ):
+                            raise ValueError(f"Unexpected {embedding_type} feature chunk format in {path}.")
+                        for layer_label, seq_to_features in chunk["features_by_layer"].items():
+                            merged_features.setdefault(layer_label, {"mean_pool": {}, "per_residue": {}})
+                            merged_features[layer_label][embedding_type].update(seq_to_features)
+
+                for layer_label, layer_features in merged_features.items():
+                    if self._use_memory():
+                        self.sequence_to_features[self._feature_key("none", layer_label, "mean_pool")] = layer_features["mean_pool"]
+                        self.sequence_to_features[self._feature_key("none", layer_label, "per_residue")] = layer_features["per_residue"]
+                    if save_layers and self._use_disk():
+                        self._save_pickle(layer_features["mean_pool"], self._embedding_path(layer_label, "mean_pool"))
+                        self._save_pickle(layer_features["per_residue"], self._embedding_path(layer_label, "per_residue"))
+                return merged_features
+
         if n_chunks is None:
             chunk_files = sorted(batch_dir.glob(f"{self._dataset_prefix()}embeddings_chunk_*.pkl"))
         else:
@@ -1671,9 +1763,14 @@ cd {Path.cwd()}
         embedding_type = self._embedding_type(embedding_type)
         abstraction_method = self._abstraction_type(abstraction_method)
         norm_scheme = abstraction_params.get("norm_scheme", "none")
-        feature_path = self._feature_input_path(abstraction_method, layer, embedding_type)
-        if not feature_path.is_file():
-            self.create_feature_space(layer, abstraction_method, abstraction_params, embedding_type)
+        if abstraction_method == "none" and embedding_type == "mutation_pooled":
+            feature_path = self._embedding_path(layer, "per_residue")
+            if not feature_path.is_file():
+                self.load_embeddings(layer, embedding_type)
+        else:
+            feature_path = self._feature_input_path(abstraction_method, layer, embedding_type)
+            if not feature_path.is_file():
+                self.create_feature_space(layer, abstraction_method, abstraction_params, embedding_type)
 
         output_path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
         inference_job_dir = self._inference_job_dir(layer, abstraction_method, norm_scheme, embedding_type, job_dir)
@@ -1746,9 +1843,13 @@ export TMPDIR="$SCRDIR"
         sequence_dataframe = payload["sequence_dataframe"]
         feature_path = Path(payload["feature_path"])
         output_path = Path(payload["output_path"])
+        embedding_type = payload.get("embedding_type")
+        abstraction_method = payload.get("abstraction_method", "none")
         norm_scheme = payload["norm_scheme"]
 
         seq_to_features = esmDMS._load_pickle(feature_path)
+        if abstraction_method == "none" and embedding_type == "mutation_pooled":
+            seq_to_features = esmDMS._pool_per_residue_features(seq_to_features)
         sequence_dataframe, seq_to_features = esmDMS._drop_missing_features(
             sequence_dataframe,
             seq_to_features,
