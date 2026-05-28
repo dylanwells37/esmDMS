@@ -281,6 +281,17 @@ class esmDMS:
             return "none"
         return method
 
+    @staticmethod
+    def _abstraction_base_method(method: str) -> str:
+        method = esmDMS._abstraction_type(method)
+        if method.startswith("PCA"):
+            return "PCA"
+        if method.startswith("SAE"):
+            return "SAE"
+        if method.startswith("SPCA"):
+            return "SPCA"
+        return method
+
     def _embedding_type(self, embedding_type: str | None = None) -> str:
         embedding_type = embedding_type or self.config.embedding_type
         if embedding_type in {"mutation_site", "mutation_pool", "pooled"}:
@@ -1322,15 +1333,16 @@ cd {Path.cwd()}
                         method_params: dict | None = None) -> dict[str, np.ndarray]:
         # Placeholder for abstraction implementation
         method = self._abstraction_type(method)
-        if method == 'none':
+        base_method = self._abstraction_base_method(method)
+        if base_method == 'none':
             return embeddings
-        elif method == 'PCA':
+        elif base_method == 'PCA':
             # Implement PCA abstraction here
             return self._pca_abstraction(embeddings, method_params)
-        elif method == 'SAE':
+        elif base_method == 'SAE':
             # Implement SAE abstraction here
             return self._sae_abstraction(embeddings, method_params)
-        elif method == 'SPCA':
+        elif base_method == 'SPCA':
             # Implement SPCA abstraction here
             return self._spca_abstraction(embeddings, method_params)
         else:
@@ -1529,6 +1541,7 @@ cd {Path.cwd()}
         layer: str | int,
         method_params: dict | None = None,
         output_path: str | Path | None = None,
+        save: bool = True,
     ) -> plt.Figure:
         """
         Visualise SAE reconstruction quality for a trained model.
@@ -1552,6 +1565,8 @@ cd {Path.cwd()}
             Override where the figure is saved.  When None the figure is saved
             to the SAE model directory (disk mode) and / or shown interactively
             (local mode), matching the local_or_disk setting.
+        save : bool
+            When False, return the figure without saving it to disk.
         """
         params = dict(method_params or {})
         sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
@@ -1656,7 +1671,7 @@ cd {Path.cwd()}
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(output_path, bbox_inches="tight", dpi=150)
-        else:
+        elif save:
             if self._use_disk():
                 default_path = (
                     self._sae_model_dir()
@@ -1665,8 +1680,6 @@ cd {Path.cwd()}
                 self._sae_model_dir().mkdir(parents=True, exist_ok=True)
                 fig.savefig(default_path, bbox_inches="tight", dpi=150)
                 print(f"SAE visualization saved to {default_path}")
-            if self._use_memory():
-                plt.show()
 
         return fig
 
@@ -2012,8 +2025,11 @@ export TMPDIR="$SCRDIR"
         abstraction_method: AbstractionMethod | str,
         embedding_type: EmbeddingType | None,
         norm_scheme: str,
+        abstraction_params: dict | None = None,
     ) -> tuple[list, np.ndarray]:
-        seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, {"norm_scheme": norm_scheme})
+        method_params = dict(abstraction_params or {})
+        method_params.setdefault("norm_scheme", norm_scheme)
+        seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, method_params)
         _, seq_to_features = self._drop_missing_features(None, seq_to_features, "Inference plotting")
         self._require_vector_features(seq_to_features, "Inference plotting")
         seq_ids = list(seq_to_features)
@@ -2021,6 +2037,158 @@ export TMPDIR="$SCRDIR"
         if norm_scheme is not None and norm_scheme != "none":
             features = self._normalize_features(features, norm_scheme)
         return seq_ids, features
+
+    def _fitness_for_method(
+        self,
+        layer: str | int,
+        abstraction_method: AbstractionMethod | str,
+        embedding_type: EmbeddingType | None,
+        norm_scheme: str,
+        abstraction_params: dict | None = None,
+    ) -> dict:
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme, embedding_type)
+        seq_ids, features = self._features_for_inference(
+            layer,
+            abstraction_method,
+            embedding_type,
+            norm_scheme,
+            abstraction_params,
+        )
+        if getattr(result, "s_joint", None) is not None:
+            fitness = features @ result.s_joint
+        else:
+            fitness = np.asarray([features @ result.s[rep_idx] for rep_idx in range(result.s.shape[0])]).mean(axis=0)
+        return dict(zip(seq_ids, fitness))
+
+    @staticmethod
+    def _paired_fitness_values(left_fitness: dict, right_fitness: dict) -> tuple[np.ndarray, np.ndarray, list]:
+        common_ids = [seq_id for seq_id in left_fitness if seq_id in right_fitness]
+        if not common_ids:
+            raise ValueError("No shared sequence IDs found between the two fitness mappings.")
+        left_values = np.asarray([left_fitness[seq_id] for seq_id in common_ids], dtype=float)
+        right_values = np.asarray([right_fitness[seq_id] for seq_id in common_ids], dtype=float)
+        return left_values, right_values, common_ids
+
+    def plot_fitness_method_comparison(
+        self,
+        layer: str | int,
+        left_abstraction_method: AbstractionMethod | str,
+        right_abstraction_method: AbstractionMethod | str,
+        left_abstraction_params: dict | None = None,
+        right_abstraction_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
+        norm_scheme: str = "none",
+        left_label: str | None = None,
+        right_label: str | None = None,
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, dict]:
+        """
+        Scatter inferred sequence fitness from one feature method against another.
+        """
+        left_fitness = self._fitness_for_method(
+            layer,
+            left_abstraction_method,
+            embedding_type,
+            norm_scheme,
+            left_abstraction_params,
+        )
+        right_fitness = self._fitness_for_method(
+            layer,
+            right_abstraction_method,
+            embedding_type,
+            norm_scheme,
+            right_abstraction_params,
+        )
+        left_values, right_values, common_ids = self._paired_fitness_values(left_fitness, right_fitness)
+        rho = self._safe_corr(left_values, right_values, spearmanr)
+
+        left_label = left_label or self._abstraction_type(left_abstraction_method)
+        right_label = right_label or self._abstraction_type(right_abstraction_method)
+
+        sns.set_theme(style="darkgrid")
+        fig, ax = plt.subplots(figsize=(5.5, 5.0))
+        sns.scatterplot(x=left_values, y=right_values, ax=ax, s=18, alpha=0.6, edgecolor=None)
+        finite = np.isfinite(left_values) & np.isfinite(right_values)
+        if finite.any():
+            lo = min(np.min(left_values[finite]), np.min(right_values[finite]))
+            hi = max(np.max(left_values[finite]), np.max(right_values[finite]))
+            pad = (hi - lo) * 0.05 if hi > lo else 1.0
+            lo -= pad
+            hi += pad
+            ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1, color="black", alpha=0.7)
+            ax.set_xlim(lo, hi)
+            ax.set_ylim(lo, hi)
+        ax.set_xlabel(f"{left_label} inferred fitness")
+        ax.set_ylabel(f"{right_label} inferred fitness")
+        ax.set_title(f"{self._layer_label(layer)} fitness comparison\nSpearman rho={rho:.3f}, n={len(common_ids)}")
+        fig.tight_layout()
+        if output_path is not None:
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+
+        stats = {
+            "layer": layer,
+            "left_method": self._abstraction_type(left_abstraction_method),
+            "right_method": self._abstraction_type(right_abstraction_method),
+            "spearman_rho": rho,
+            "n_sequences": len(common_ids),
+        }
+        return fig, stats
+
+    def plot_fitness_method_correlation_by_layer(
+        self,
+        layers: list[str | int],
+        left_abstraction_method: AbstractionMethod | str,
+        right_abstraction_method: AbstractionMethod | str,
+        left_abstraction_params: dict | None = None,
+        right_abstraction_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
+        norm_scheme: str = "none",
+        left_label: str | None = None,
+        right_label: str | None = None,
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, pd.DataFrame]:
+        """
+        Plot Spearman rho between two methods' inferred fitness across layers.
+        """
+        rows = []
+        for layer in layers:
+            left_fitness = self._fitness_for_method(
+                layer,
+                left_abstraction_method,
+                embedding_type,
+                norm_scheme,
+                left_abstraction_params,
+            )
+            right_fitness = self._fitness_for_method(
+                layer,
+                right_abstraction_method,
+                embedding_type,
+                norm_scheme,
+                right_abstraction_params,
+            )
+            left_values, right_values, common_ids = self._paired_fitness_values(left_fitness, right_fitness)
+            rows.append({
+                "layer": layer,
+                "spearman_rho": self._safe_corr(left_values, right_values, spearmanr),
+                "n_sequences": len(common_ids),
+            })
+
+        corr_df = pd.DataFrame(rows)
+        left_label = left_label or self._abstraction_type(left_abstraction_method)
+        right_label = right_label or self._abstraction_type(right_abstraction_method)
+
+        sns.set_theme(style="darkgrid")
+        fig, ax = plt.subplots(figsize=(max(6, len(corr_df) * 0.45), 4))
+        ax.plot(corr_df["layer"], corr_df["spearman_rho"], marker="o")
+        ax.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_ylim(-1, 1)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Spearman rho")
+        ax.set_title(f"{left_label} vs {right_label} inferred fitness by layer")
+        fig.tight_layout()
+        if output_path is not None:
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        return fig, corr_df
 
     def _plot_rep_scatter_grid(
         self,
