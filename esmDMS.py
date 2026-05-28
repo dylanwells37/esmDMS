@@ -413,9 +413,7 @@ class esmDMS:
                     "Run process_raw_data() before deriving mutation-site features."
                 )
 
-            mutation_sites = self.sequence_to_mutation_sites.get(seq_id)
-            if mutation_sites is None and isinstance(seq_id, np.integer):
-                mutation_sites = self.sequence_to_mutation_sites.get(int(seq_id))
+            mutation_sites = self._lookup_mutation_sites(self.sequence_to_mutation_sites, seq_id)
             if mutation_sites is None:
                 raise KeyError(f"No mutation-site mapping found for sequence {seq_id}.")
             if not mutation_sites:
@@ -432,6 +430,132 @@ class esmDMS:
             else:
                 derived[seq_id] = mutation_embeddings.mean(axis=0)
         return derived
+
+    @staticmethod
+    def _lookup_mutation_sites(sequence_to_mutation_sites: dict, seq_id) -> list[int] | None:
+        candidates = [seq_id]
+        if isinstance(seq_id, np.integer):
+            candidates.append(int(seq_id))
+        else:
+            try:
+                candidates.append(int(seq_id))
+            except (TypeError, ValueError):
+                pass
+        candidates.append(str(seq_id))
+        for candidate in candidates:
+            if candidate in sequence_to_mutation_sites:
+                return sequence_to_mutation_sites[candidate]
+        return None
+
+    @classmethod
+    def _derive_mean_pool_features(cls, layer_embeddings: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        mean_pool = {}
+        for seq_id, embedding in layer_embeddings.items():
+            if embedding is None:
+                mean_pool[seq_id] = None
+                continue
+            embedding = np.asarray(embedding)
+            if embedding.ndim != 2:
+                raise ValueError(
+                    f"Cannot mean-pool embedding for sequence {seq_id} with shape {embedding.shape}."
+                )
+            mean_pool[seq_id] = embedding.mean(axis=0)
+        return mean_pool
+
+    @classmethod
+    def _derive_per_residue_features(
+        cls,
+        layer_embeddings: dict[str, np.ndarray],
+        sequence_to_mutation_sites: dict,
+    ) -> dict[str, np.ndarray]:
+        if sequence_to_mutation_sites is None:
+            raise ValueError(
+                "Cannot derive per_residue embeddings without sequence_to_mutation_sites. "
+                "Run process_raw_data() before deriving mutation-site features."
+            )
+        per_residue = {}
+        for seq_id, embedding in layer_embeddings.items():
+            if embedding is None:
+                per_residue[seq_id] = None
+                continue
+            embedding = np.asarray(embedding)
+            if embedding.ndim != 2:
+                raise ValueError(
+                    f"Cannot select mutation-site residues for sequence {seq_id} with shape {embedding.shape}."
+                )
+            mutation_sites = cls._lookup_mutation_sites(sequence_to_mutation_sites, seq_id)
+            if mutation_sites is None:
+                raise KeyError(f"No mutation-site mapping found for sequence {seq_id}.")
+            if not mutation_sites:
+                per_residue[seq_id] = None
+                continue
+            if max(mutation_sites) >= embedding.shape[0] or min(mutation_sites) < 0:
+                raise ValueError(
+                    f"Mutation sites {mutation_sites} are out of bounds for sequence {seq_id} "
+                    f"with length {embedding.shape[0]}."
+                )
+            per_residue[seq_id] = embedding[mutation_sites]
+        return per_residue
+
+    @staticmethod
+    def _pool_per_residue_features(per_residue_embeddings: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        pooled = {}
+        for seq_id, embedding in per_residue_embeddings.items():
+            if embedding is None:
+                pooled[seq_id] = None
+                continue
+            embedding = np.asarray(embedding)
+            if embedding.ndim == 1:
+                pooled[seq_id] = embedding
+            elif embedding.ndim == 2:
+                pooled[seq_id] = embedding.mean(axis=0)
+            else:
+                raise ValueError(
+                    f"Cannot mutation-pool per-residue embedding for sequence {seq_id} "
+                    f"with shape {embedding.shape}."
+                )
+        return pooled
+
+    def _save_layer_feature_caches(self, layer_embeddings: dict[str, np.ndarray], layer: str | int) -> None:
+        mean_pool = self._derive_mean_pool_features(layer_embeddings)
+        per_residue = self._derive_per_residue_features(layer_embeddings, self.sequence_to_mutation_sites)
+
+        if self._use_memory():
+            self.sequence_to_features[self._feature_key("none", layer, "mean_pool")] = mean_pool
+            self.sequence_to_features[self._feature_key("none", layer, "per_residue")] = per_residue
+        if self._use_disk():
+            self._save_pickle(mean_pool, self._embedding_path(layer, "mean_pool"))
+            self._save_pickle(per_residue, self._embedding_path(layer, "per_residue"))
+
+    @classmethod
+    def _build_feature_chunk(
+        cls,
+        embeddings: dict[str, np.ndarray],
+        layer: str | int,
+        sequence_to_mutation_sites: dict,
+    ) -> dict:
+        first_embedding = next((np.asarray(embedding) for embedding in embeddings.values() if embedding is not None), None)
+        if first_embedding is None:
+            raise ValueError("No non-empty embeddings were created.")
+
+        if layer == "all":
+            layer_axis = 1 if first_embedding.ndim == 3 else 0
+            layers = range(first_embedding.shape[layer_axis])
+        else:
+            layers = [layer]
+
+        features_by_layer = {}
+        for layer_value in layers:
+            layer_embeddings = cls._select_layer(embeddings, layer_value, allow_per_residue=True)
+            features_by_layer[cls._layer_label(layer_value)] = {
+                "mean_pool": cls._derive_mean_pool_features(layer_embeddings),
+                "per_residue": cls._derive_per_residue_features(layer_embeddings, sequence_to_mutation_sites),
+            }
+
+        return {
+            "format": "esmDMS_embedding_features_v1",
+            "features_by_layer": features_by_layer,
+        }
 
     @staticmethod
     def _require_vector_features(seq_to_features: dict[str, np.ndarray], context: str) -> None:
@@ -565,10 +689,15 @@ class esmDMS:
 
     def embed_all_sequences(self, layer: str = "all") -> None:
         """
-        Embed all sequences in the sequence dataframe and save the embeddings to disk if specified in the configuration.
+        Embed all sequences and cache compact derived features by layer.
+
+        Disk caches are written as separate mean_pool and mutation-site
+        per_residue files. mutation_pooled is derived from per_residue on load.
         """
         if self.sequence_dataframe is None:
             raise ValueError("Sequence dataframe is not available. Please run process_raw_data() first.")
+        if self.sequence_to_mutation_sites is None:
+            raise ValueError("Mutation-site mapping is not available. Please run process_raw_data() first.")
 
         seq_ids = sorted(self.sequence_dataframe['SequenceIndex'].unique())
         embeddings = self.embed_sequences(seq_ids)
@@ -580,18 +709,10 @@ class esmDMS:
         if layer == 'all':
             for l in range(n_layers):
                 layer_embeddings = self._select_layer(embeddings, l, allow_per_residue=True)
-                if self._use_memory():
-                    self.sequence_to_features[self._embedding_key(l)] = layer_embeddings
-                if self._use_disk():
-                    save_path = self._base_embedding_path(l)
-                    self._save_pickle(layer_embeddings, save_path)
+                self._save_layer_feature_caches(layer_embeddings, l)
         else:
             layer_embeddings = self._select_layer(embeddings, layer, allow_per_residue=True)
-            if self._use_memory():
-                self.sequence_to_features[self._embedding_key(layer)] = layer_embeddings
-            if self._use_disk():
-                save_path = self._base_embedding_path(layer)
-                self._save_pickle(layer_embeddings, save_path)
+            self._save_layer_feature_caches(layer_embeddings, layer)
 
     def create_embedding_batch_job(
         self,
@@ -617,7 +738,7 @@ class esmDMS:
         """
         if not self._use_disk():
             raise ValueError("Embedding batch jobs require local_or_disk to be 'disk' or 'both'.")
-        if self.sequence_dataframe is None or self.sequence_to_protein_sequence is None:
+        if self.sequence_dataframe is None or self.sequence_to_protein_sequence is None or self.sequence_to_mutation_sites is None:
             raise ValueError("Run process_raw_data() before creating an embedding batch job.")
         if n_chunks < 1:
             raise ValueError("n_chunks must be at least 1.")
@@ -636,10 +757,14 @@ class esmDMS:
             "sequence_to_protein_sequence": {
                 seq_id: self.sequence_to_protein_sequence[seq_id] for seq_id in seq_ids
             },
+            "sequence_to_mutation_sites": {
+                seq_id: self.sequence_to_mutation_sites[seq_id] for seq_id in seq_ids
+            },
             "embedding_model": self.config.embedding_model,
-            "embedding_type": "all_data",
+            "embedding_type": "derived_features",
             "dataset_name": self.config.dataset_name,
             "dataset_prefix": self._dataset_prefix(),
+            "layer": "all",
             "n_chunks": n_chunks,
             "max_active_jobs": max_active_jobs,
             "batch_dir": str(batch_dir),
@@ -719,6 +844,12 @@ export TMPDIR="$SCRDIR"
         for seq_id in chunks[chunk_idx].tolist():
             prot_seq = payload["sequence_to_protein_sequence"][seq_id]
             out[seq_id] = embed_sequence(prot_seq, tokenizer, model)
+        if payload.get("sequence_to_mutation_sites") is not None:
+            out = esmDMS._build_feature_chunk(
+                out,
+                payload.get("layer", "all"),
+                payload["sequence_to_mutation_sites"],
+            )
 
         dataset_prefix = payload.get("dataset_prefix", "")
         final_path = Path(payload["batch_dir"]) / f"{dataset_prefix}embeddings_chunk_{chunk_idx}.pkl"
@@ -821,6 +952,7 @@ cd {Path.cwd()}
             save_dir=payload["save_dir"],
             dataset_name=payload["dataset_name"],
         )
+        runner.sequence_to_mutation_sites = None
         runner.sequence_to_embeddings = {}
         runner.sequence_to_features = {}
         return runner.merge_embedding_batch_outputs(
@@ -856,12 +988,39 @@ cd {Path.cwd()}
         if missing:
             raise FileNotFoundError(f"Missing embedding chunk files: {missing}")
 
-        merged = {}
-        for path in chunk_files:
-            merged.update(self._load_pickle(path))
+        if getattr(self, "sequence_to_mutation_sites", None) is None and payload is not None:
+            self.sequence_to_mutation_sites = payload.get("sequence_to_mutation_sites")
 
-        self.sequence_to_embeddings.update(merged)
-        self._save_pickle(merged, self._merged_embeddings_path(batch_dir))
+        merged = {}
+        feature_chunks = []
+        for path in chunk_files:
+            chunk = self._load_pickle(path)
+            if isinstance(chunk, dict) and chunk.get("format") == "esmDMS_embedding_features_v1":
+                feature_chunks.append(chunk)
+            else:
+                merged.update(chunk)
+
+        if feature_chunks:
+            merged_features = {}
+            for chunk in feature_chunks:
+                for layer_label, layer_features in chunk["features_by_layer"].items():
+                    merged_features.setdefault(layer_label, {"mean_pool": {}, "per_residue": {}})
+                    merged_features[layer_label]["mean_pool"].update(layer_features["mean_pool"])
+                    merged_features[layer_label]["per_residue"].update(layer_features["per_residue"])
+
+            for layer_label, layer_features in merged_features.items():
+                if self._use_memory():
+                    self.sequence_to_features[self._feature_key("none", layer_label, "mean_pool")] = layer_features["mean_pool"]
+                    self.sequence_to_features[self._feature_key("none", layer_label, "per_residue")] = layer_features["per_residue"]
+                if save_layers and self._use_disk():
+                    self._save_pickle(layer_features["mean_pool"], self._embedding_path(layer_label, "mean_pool"))
+                    self._save_pickle(layer_features["per_residue"], self._embedding_path(layer_label, "per_residue"))
+
+            if not merged:
+                return merged_features
+
+        if self._use_memory():
+            self.sequence_to_embeddings.update(merged)
 
         first_embedding = next((np.asarray(embedding) for embedding in merged.values() if embedding is not None), None)
         if first_embedding is None:
@@ -873,10 +1032,13 @@ cd {Path.cwd()}
             layers = [layer]
         for layer_value in layers:
             layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=True)
-            if self._use_memory():
-                self.sequence_to_features[self._embedding_key(layer_value)] = layer_embeddings
             if save_layers and self._use_disk():
-                self._save_pickle(layer_embeddings, self._base_embedding_path(layer_value))
+                self._save_layer_feature_caches(layer_embeddings, layer_value)
+            elif self._use_memory():
+                mean_pool = self._derive_mean_pool_features(layer_embeddings)
+                per_residue = self._derive_per_residue_features(layer_embeddings, self.sequence_to_mutation_sites)
+                self.sequence_to_features[self._feature_key("none", layer_value, "mean_pool")] = mean_pool
+                self.sequence_to_features[self._feature_key("none", layer_value, "per_residue")] = per_residue
 
         return merged
         
@@ -898,25 +1060,57 @@ cd {Path.cwd()}
             print("Embeddings already exist in memory. Returning existing embeddings.")
             return self.sequence_to_features[key]
 
+        per_residue_key = self._feature_key("none", layer, "per_residue")
+        if embedding_type == "mutation_pooled":
+            if self._use_memory() and self.sequence_to_features.get(per_residue_key) is not None:
+                embeddings = self._pool_per_residue_features(self.sequence_to_features[per_residue_key])
+                self.sequence_to_features[key] = embeddings
+                return embeddings
+
+            if self._use_disk():
+                per_residue_path = self._embedding_path(layer, "per_residue")
+                if per_residue_path.is_file():
+                    print(f"Loading per_residue embeddings from {per_residue_path}")
+                    per_residue_embeddings = self._load_pickle(per_residue_path)
+                    embeddings = self._pool_per_residue_features(per_residue_embeddings)
+                    if self._use_memory():
+                        self.sequence_to_features[per_residue_key] = per_residue_embeddings
+                        self.sequence_to_features[key] = embeddings
+                    return embeddings
+
         base_key = self._embedding_key(layer)
         if self._use_memory() and self.sequence_to_features.get(base_key) is not None:
-            embeddings = self._derive_embedding_type(self.sequence_to_features[base_key], embedding_type)
+            if embedding_type == "mutation_pooled":
+                per_residue_embeddings = self._derive_embedding_type(self.sequence_to_features[base_key], "per_residue")
+                embeddings = self._pool_per_residue_features(per_residue_embeddings)
+                self.sequence_to_features[per_residue_key] = per_residue_embeddings
+                if self._use_disk():
+                    self._save_pickle(per_residue_embeddings, self._embedding_path(layer, "per_residue"))
+            else:
+                embeddings = self._derive_embedding_type(self.sequence_to_features[base_key], embedding_type)
+                if self._use_disk():
+                    self._save_pickle(embeddings, self._embedding_path(layer, embedding_type))
             self.sequence_to_features[key] = embeddings
-            if self._use_disk():
-                self._save_pickle(embeddings, self._embedding_path(layer, embedding_type))
             return embeddings
 
         if self._use_memory() and self.sequence_to_embeddings:
             all_data_embeddings = self._select_layer(self.sequence_to_embeddings, layer, allow_per_residue=True)
-            layer_embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
+            if embedding_type == "mutation_pooled":
+                per_residue_embeddings = self._derive_embedding_type(all_data_embeddings, "per_residue")
+                layer_embeddings = self._pool_per_residue_features(per_residue_embeddings)
+                self.sequence_to_features[per_residue_key] = per_residue_embeddings
+                if self._use_disk():
+                    self._save_pickle(per_residue_embeddings, self._embedding_path(layer, "per_residue"))
+            else:
+                layer_embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
+                if self._use_disk():
+                    self._save_pickle(layer_embeddings, self._embedding_path(layer, embedding_type))
             self.sequence_to_features[key] = layer_embeddings
-            if self._use_disk():
-                self._save_pickle(layer_embeddings, self._embedding_path(layer, embedding_type))
             return layer_embeddings
 
         if self._use_disk():
             save_path = self._embedding_path(layer, embedding_type)
-            if save_path.is_file():
+            if embedding_type != "mutation_pooled" and save_path.is_file():
                 print(f"Loading {embedding_type} embeddings from {save_path}")
                 embeddings = self._load_pickle(save_path)
                 if self._use_memory():
@@ -926,13 +1120,25 @@ cd {Path.cwd()}
             if base_path.is_file():
                 print(f"Loading all-data embeddings from {base_path}")
                 all_data_embeddings = self._load_pickle(base_path)
-                embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
+                if embedding_type == "mutation_pooled":
+                    per_residue_embeddings = self._derive_embedding_type(all_data_embeddings, "per_residue")
+                    embeddings = self._pool_per_residue_features(per_residue_embeddings)
+                    self._save_pickle(per_residue_embeddings, self._embedding_path(layer, "per_residue"))
+                else:
+                    embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
+                    self._save_pickle(embeddings, save_path)
                 if self._use_memory():
                     self.sequence_to_features[base_key] = all_data_embeddings
+                    if embedding_type == "mutation_pooled":
+                        self.sequence_to_features[per_residue_key] = per_residue_embeddings
                     self.sequence_to_features[key] = embeddings
-                self._save_pickle(embeddings, save_path)
                 return embeddings
-            raise FileNotFoundError(f"No saved all-data embeddings found at {base_path}. Run embed_all_sequences({layer!r}) first.")
+            if embedding_type == "mutation_pooled":
+                raise FileNotFoundError(
+                    f"No saved per_residue embeddings found at {self._embedding_path(layer, 'per_residue')} "
+                    f"and no legacy all-data embeddings found at {base_path}. Run embed_all_sequences({layer!r}) first."
+                )
+            raise FileNotFoundError(f"No saved {embedding_type} embeddings found at {save_path}. Run embed_all_sequences({layer!r}) first.")
 
         raise ValueError("No embeddings found in memory. Run embed_all_sequences() before inference.")
 
@@ -986,7 +1192,7 @@ cd {Path.cwd()}
             print("No abstraction method specified. Using raw embeddings as features.")
             features = self.load_embeddings(layer, embedding_type)
             _, features = self._drop_missing_features(None, features, f"{embedding_type} features")
-            if self._use_disk():
+            if self._use_disk() and embedding_type != "mutation_pooled":
                 self._save_pickle(features, self._feature_path(method, layer, embedding_type))
             return features
 
