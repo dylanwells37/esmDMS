@@ -1217,7 +1217,7 @@ cd {Path.cwd()}
         embedding_type = self._embedding_type(embedding_type)
         key = self._feature_key("none", layer, embedding_type)
         if self._use_memory() and self.sequence_to_features.get(key) is not None:
-            print("Embeddings already exist in memory. Returning existing embeddings.")
+            #print("Embeddings already exist in memory. Returning existing embeddings.")
             return self.sequence_to_features[key]
 
         per_residue_key = self._feature_key("none", layer, "per_residue")
@@ -1230,7 +1230,7 @@ cd {Path.cwd()}
             if self._use_disk():
                 per_residue_path = self._embedding_path(layer, "per_residue")
                 if per_residue_path.is_file():
-                    print(f"Loading per_residue embeddings from {per_residue_path}")
+                    #print(f"Loading per_residue embeddings from {per_residue_path}")
                     per_residue_embeddings = self._load_pickle(per_residue_path)
                     embeddings = self._pool_per_residue_features(per_residue_embeddings)
                     if self._use_memory():
@@ -1271,14 +1271,14 @@ cd {Path.cwd()}
         if self._use_disk():
             save_path = self._embedding_path(layer, embedding_type)
             if embedding_type != "mutation_pooled" and save_path.is_file():
-                print(f"Loading {embedding_type} embeddings from {save_path}")
+                #print(f"Loading {embedding_type} embeddings from {save_path}")
                 embeddings = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = embeddings
                 return embeddings
             base_path = self._base_embedding_path(layer)
             if base_path.is_file():
-                print(f"Loading all-data embeddings from {base_path}")
+                #print(f"Loading all-data embeddings from {base_path}")
                 all_data_embeddings = self._load_pickle(base_path)
                 if embedding_type == "mutation_pooled":
                     per_residue_embeddings = self._derive_embedding_type(all_data_embeddings, "per_residue")
@@ -1349,7 +1349,7 @@ cd {Path.cwd()}
         embedding_type = self._embedding_type(embedding_type)
         method = self._abstraction_type(method)
         if method == 'none':
-            print("No abstraction method specified. Using raw embeddings as features.")
+            #print("No abstraction method specified. Using raw embeddings as features.")
             features = self.load_embeddings(layer, embedding_type)
             _, features = self._drop_missing_features(None, features, f"{embedding_type} features")
             if self._use_disk() and embedding_type != "mutation_pooled":
@@ -1362,19 +1362,19 @@ cd {Path.cwd()}
         key = self._feature_key(method, layer, embedding_type)
 
         if self._use_memory() and self.sequence_to_features.get(key) is not None:
-            print("Abstracted features already exist in memory. Returning existing features.")
+            #print("Abstracted features already exist in memory. Returning existing features.")
             return self.sequence_to_features[key]
 
         if self._use_disk():
             save_path = self._feature_path(method, layer, embedding_type)
             if save_path.is_file():
-                print(f"Abstracted already saved in {save_path}")
+                #print(f"Abstracted already saved in {save_path}")
                 abstracted_features = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = abstracted_features
                 return abstracted_features
 
-        print("No abstracted features found. Creating new features.")
+        #print("No abstracted features found. Creating new features.")
         _params = dict(method_params or {})
         _params.setdefault("_layer", layer)
         abstracted_features = self._create_feature_space(embeddings, method, _params)
@@ -1765,18 +1765,19 @@ cd {Path.cwd()}
         embedding_type = self._embedding_type(embedding_type)
         method = self._abstraction_type(method)
         if method == 'none':
-            print("No abstraction method specified. Using raw embeddings as features.")
+            #print("No abstraction method specified. Using raw embeddings as features.")
             return self.load_embeddings(layer, embedding_type)
 
         key = self._feature_key(method, layer, embedding_type)
         if self._use_memory() and self.sequence_to_features.get(key) is not None:
-            print("Abstracted features already exist in memory. Returning existing features.")
+            #print("Abstracted features already exist in memory. Returning existing features.")
+            return self.sequence_to_features[key]
             return self.sequence_to_features[key]
 
         if self._use_disk():
             save_path = self._feature_path(method, layer, embedding_type)
             if save_path.is_file():
-                print(f"Loading abstracted features from {save_path}")
+                #print(f"Loading abstracted features from {save_path}")
                 abstracted_features = self._load_pickle(save_path)
                 if self._use_memory():
                     self.sequence_to_features[key] = abstracted_features
@@ -1993,10 +1994,11 @@ export TMPDIR="$SCRDIR"
             # check if the features are already saved to disk
             save_path = self._inference_path(abstraction_method, layer, norm_scheme, embedding_type)
             if save_path.is_file():
-                print(f"Loading inference results from {save_path}")
+                #print(f"Loading inference results from {save_path}")
                 return self._load_pickle(save_path)
             else:
-                print(f"No saved inference results found at {save_path}. Running inference and saving results.")
+                #print(f"No saved inference results found at {save_path}. Running inference and saving results.")
+                pass
         
         # load features, seq_to_features type = dict[str, np.ndarray]
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, abstraction_params)

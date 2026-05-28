@@ -16,12 +16,9 @@ from transformers import AutoModel, AutoTokenizer
 
 import psutil
 
-# Project directory
-PROJECT_DIR = "/net/dali/home/barton/dhw28/popDMS/esmDMS"
+# Project directory is the root of the repository, assumed to be the parent of the current file's directory
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# check if the project directory exists, if not, try the alternative path
-if not os.path.isdir(PROJECT_DIR):
-    PROJECT_DIR = "/Users/dylanwells/popDMS/esmDMS"
 
 sys.path.insert(0, PROJECT_DIR)
 
