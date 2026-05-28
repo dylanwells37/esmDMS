@@ -357,14 +357,33 @@ class esmDMS:
     def _sae_model_dir(self) -> Path:
         return self._save_dir() / "sae_models"
 
-    def _sae_tag(self, layer: str | int, n_features: int, sparsity_coeff: float) -> str:
-        return f"{self._dataset_prefix()}sae_{self._layer_label(layer)}_{n_features}_{sparsity_coeff}"
+    def _sae_tag(
+        self,
+        layer: str | int,
+        n_features: int,
+        sparsity_coeff: float,
+        embedding_type: str | None = None,
+    ) -> str:
+        embedding_part = f"{self._embedding_type(embedding_type)}_" if embedding_type is not None else ""
+        return f"{self._dataset_prefix()}{embedding_part}sae_{self._layer_label(layer)}_{n_features}_{sparsity_coeff}"
 
-    def _sae_model_path(self, layer: str | int, n_features: int, sparsity_coeff: float) -> Path:
-        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff)}_model.pt"
+    def _sae_model_path(
+        self,
+        layer: str | int,
+        n_features: int,
+        sparsity_coeff: float,
+        embedding_type: str | None = None,
+    ) -> Path:
+        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type)}_model.pt"
 
-    def _sae_viz_path(self, layer: str | int, n_features: int, sparsity_coeff: float) -> Path:
-        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff)}_viz_data.pkl"
+    def _sae_viz_path(
+        self,
+        layer: str | int,
+        n_features: int,
+        sparsity_coeff: float,
+        embedding_type: str | None = None,
+    ) -> Path:
+        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type)}_viz_data.pkl"
 
     # ── Embedding layer selection ─────────────────────────────────────────
 
@@ -611,37 +630,103 @@ class esmDMS:
         return sequence_dataframe, filtered_features
 
     @staticmethod
-    def _per_residue_feature_id(seq_id, residue_idx: int) -> str:
-        return f"{seq_id}__residue_{residue_idx}"
+    def _per_residue_feature_id(seq_id, mutation_site: int) -> str:
+        return f"{seq_id}__site_{mutation_site}"
+
+    @staticmethod
+    def _parse_per_residue_feature_id(feature_id) -> tuple[str, int] | None:
+        feature_id = str(feature_id)
+        for sep in ("__site_", "__residue_"):
+            if sep not in feature_id:
+                continue
+            parent_id, site = feature_id.rsplit(sep, 1)
+            try:
+                return parent_id, int(site)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _seq_id_lookup_keys(seq_id) -> tuple:
+        keys = [seq_id, str(seq_id)]
+        if isinstance(seq_id, np.integer):
+            keys.append(int(seq_id))
+        else:
+            try:
+                keys.append(int(seq_id))
+            except (TypeError, ValueError):
+                pass
+        deduped = []
+        for key in keys:
+            if key not in deduped:
+                deduped.append(key)
+        return tuple(deduped)
+
+    @classmethod
+    def _expand_per_residue_feature_vectors(
+        cls,
+        seq_to_features: dict,
+        sequence_to_mutation_sites: dict | None = None,
+    ) -> tuple[dict[str, np.ndarray], dict]:
+        expanded_features = {}
+        parent_to_feature_ids = {}
+
+        def register_parent(parent_id, feature_id):
+            for key in cls._seq_id_lookup_keys(parent_id):
+                parent_to_feature_ids.setdefault(key, []).append(feature_id)
+
+        for seq_id, feature in seq_to_features.items():
+            if feature is None:
+                continue
+            feature = np.asarray(feature)
+            if feature.ndim == 1:
+                parsed = cls._parse_per_residue_feature_id(seq_id)
+                expanded_features[seq_id] = feature
+                if parsed is None:
+                    register_parent(seq_id, seq_id)
+                else:
+                    parent_id, _ = parsed
+                    register_parent(parent_id, seq_id)
+                continue
+            if feature.ndim != 2:
+                raise ValueError(
+                    f"per_residue features require vectors or matrices, "
+                    f"but sequence {seq_id} has feature shape {feature.shape}."
+                )
+
+            mutation_sites = None
+            if sequence_to_mutation_sites is not None:
+                mutation_sites = cls._lookup_mutation_sites(sequence_to_mutation_sites, seq_id)
+            if mutation_sites is None:
+                mutation_sites = list(range(feature.shape[0]))
+            if len(mutation_sites) != feature.shape[0]:
+                raise ValueError(
+                    f"Sequence {seq_id} has {feature.shape[0]} per_residue vectors but "
+                    f"{len(mutation_sites)} mutation-site labels."
+                )
+
+            for row_idx, residue_feature in enumerate(feature):
+                feature_id = cls._per_residue_feature_id(seq_id, mutation_sites[row_idx])
+                expanded_features[feature_id] = residue_feature
+                register_parent(seq_id, feature_id)
+
+        return expanded_features, parent_to_feature_ids
 
     @classmethod
     def _expand_per_residue_features_for_inference(
         cls,
         sequence_dataframe: pd.DataFrame,
         seq_to_features: dict[str, np.ndarray],
+        sequence_to_mutation_sites: dict | None = None,
     ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
         """
         Convert sequence-level rows with multiple mutation-site residue embeddings
         into residue-level pseudo-individuals for raw per_residue inference.
         """
-        expanded_features = {}
-        feature_counts = {}
-        feature_keys = {}
-        for seq_id, feature in seq_to_features.items():
-            if feature is None:
-                continue
-            feature = np.asarray(feature)
-            if feature.ndim == 1:
-                feature = feature.reshape(1, -1)
-            if feature.ndim != 2:
-                raise ValueError(
-                    f"Raw per_residue inference requires one matrix per sequence, "
-                    f"but sequence {seq_id} has feature shape {feature.shape}."
-                )
-            feature_counts[seq_id] = feature.shape[0]
-            feature_keys[seq_id] = seq_id
-            for residue_idx, residue_feature in enumerate(feature):
-                expanded_features[cls._per_residue_feature_id(seq_id, residue_idx)] = residue_feature
+        expanded_features, parent_to_feature_ids = cls._expand_per_residue_feature_vectors(
+            seq_to_features,
+            sequence_to_mutation_sites,
+        )
 
         if not expanded_features:
             raise ValueError("Inference: no residue-level per_residue features are available.")
@@ -649,18 +734,21 @@ class esmDMS:
         expanded_rows = []
         for _, row in sequence_dataframe.iterrows():
             seq_id = row["SequenceIndex"]
-            n_residues = feature_counts.get(seq_id)
-            feature_seq_id = feature_keys.get(seq_id)
-            if n_residues is None and not isinstance(seq_id, str):
-                n_residues = feature_counts.get(str(seq_id))
-                feature_seq_id = feature_keys.get(str(seq_id))
-            if n_residues is None:
+            feature_ids = None
+            for key in cls._seq_id_lookup_keys(seq_id):
+                if key in parent_to_feature_ids:
+                    feature_ids = parent_to_feature_ids[key]
+                    break
+            if feature_ids is None:
                 continue
-            for residue_idx in range(n_residues):
+            for residue_idx, feature_id in enumerate(feature_ids):
                 expanded_row = row.to_dict()
                 expanded_row["ParentSequenceIndex"] = seq_id
                 expanded_row["ResidueFeatureIndex"] = residue_idx
-                expanded_row["SequenceIndex"] = cls._per_residue_feature_id(feature_seq_id, residue_idx)
+                parsed = cls._parse_per_residue_feature_id(feature_id)
+                if parsed is not None:
+                    expanded_row["MutationSite"] = parsed[1]
+                expanded_row["SequenceIndex"] = feature_id
                 expanded_rows.append(expanded_row)
 
         if not expanded_rows:
@@ -1358,6 +1446,11 @@ cd {Path.cwd()}
 
         embeddings = self.load_embeddings(layer, embedding_type)
         _, embeddings = self._drop_missing_features(None, embeddings, f"{method} abstraction")
+        if embedding_type == "per_residue":
+            embeddings, _ = self._expand_per_residue_feature_vectors(
+                embeddings,
+                self.sequence_to_mutation_sites,
+            )
         self._require_vector_features(embeddings, f"{method} abstraction with embedding_type={embedding_type!r}")
         key = self._feature_key(method, layer, embedding_type)
 
@@ -1377,6 +1470,7 @@ cd {Path.cwd()}
         #print("No abstracted features found. Creating new features.")
         _params = dict(method_params or {})
         _params.setdefault("_layer", layer)
+        _params.setdefault("_embedding_type", embedding_type)
         abstracted_features = self._create_feature_space(embeddings, method, _params)
         if self._use_memory():
             self.sequence_to_features[key] = abstracted_features
@@ -1443,6 +1537,7 @@ cd {Path.cwd()}
         """
         params = method_params or {}
         layer = params.get("_layer", "unknown")
+        embedding_type = params.get("_embedding_type")
 
         # ── Hyper-parameters ──────────────────────────────────────────────
         sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
@@ -1543,7 +1638,7 @@ cd {Path.cwd()}
             sae_dir = self._sae_model_dir()
             sae_dir.mkdir(parents=True, exist_ok=True)
 
-            model_path = self._sae_model_path(layer, n_features, sparsity_coeff)
+            model_path = self._sae_model_path(layer, n_features, sparsity_coeff, embedding_type)
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -1568,7 +1663,7 @@ cd {Path.cwd()}
                 "test_losses": test_losses,
                 "active_mask": active_mask,
             }
-            self._save_pickle(viz_data, self._sae_viz_path(layer, n_features, sparsity_coeff))
+            self._save_pickle(viz_data, self._sae_viz_path(layer, n_features, sparsity_coeff, embedding_type))
 
         return result
 
@@ -1597,6 +1692,7 @@ cd {Path.cwd()}
         self,
         layer: str | int,
         method_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
         output_path: str | Path | None = None,
         save: bool = True,
     ) -> plt.Figure:
@@ -1626,14 +1722,20 @@ cd {Path.cwd()}
             When False, return the figure without saving it to disk.
         """
         params = dict(method_params or {})
+        embedding_type = self._embedding_type(embedding_type or params.get("_embedding_type"))
         sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
 
         # Resolve n_features: need input_dim to compute the default.
-        embeddings = self.load_embeddings(layer)
+        embeddings = self.load_embeddings(layer, embedding_type)
+        if embedding_type == "per_residue":
+            embeddings, _ = self._expand_per_residue_feature_vectors(
+                embeddings,
+                self.sequence_to_mutation_sites,
+            )
         input_dim = next(iter(embeddings.values())).shape[0]
         n_features: int = params.get("n_features", input_dim * 2)
 
-        viz_path = self._sae_viz_path(layer, n_features, sparsity_coeff)
+        viz_path = self._sae_viz_path(layer, n_features, sparsity_coeff, embedding_type)
         if not viz_path.is_file():
             raise FileNotFoundError(
                 f"No SAE visualisation data found at {viz_path}. "
@@ -1732,7 +1834,7 @@ cd {Path.cwd()}
             if self._use_disk():
                 default_path = (
                     self._sae_model_dir()
-                    / f"{self._sae_tag(layer, n_features, sparsity_coeff)}_viz.png"
+                    / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type)}_viz.png"
                 )
                 self._sae_model_dir().mkdir(parents=True, exist_ok=True)
                 fig.savefig(default_path, bbox_inches="tight", dpi=150)
@@ -1855,6 +1957,7 @@ cd {Path.cwd()}
             "embedding_type": embedding_type,
             "abstraction_method": abstraction_method,
             "norm_scheme": norm_scheme,
+            "sequence_to_mutation_sites": self.sequence_to_mutation_sites,
         }
         payload_path = self._inference_payload_path(inference_job_dir)
         self._save_pickle(payload, payload_path)
@@ -1921,10 +2024,11 @@ export TMPDIR="$SCRDIR"
         seq_to_features = esmDMS._load_pickle(feature_path)
         if abstraction_method == "none" and embedding_type == "mutation_pooled":
             seq_to_features = esmDMS._pool_per_residue_features(seq_to_features)
-        if abstraction_method == "none" and embedding_type == "per_residue":
+        if embedding_type == "per_residue":
             sequence_dataframe, seq_to_features = esmDMS._expand_per_residue_features_for_inference(
                 sequence_dataframe,
                 seq_to_features,
+                payload.get("sequence_to_mutation_sites"),
             )
         sequence_dataframe, seq_to_features = esmDMS._drop_missing_features(
             sequence_dataframe,
@@ -2002,10 +2106,11 @@ export TMPDIR="$SCRDIR"
         
         # load features, seq_to_features type = dict[str, np.ndarray]
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, abstraction_params)
-        if abstraction_method == "none" and embedding_type == "per_residue":
+        if embedding_type == "per_residue":
             sequence_dataframe, seq_to_features = self._expand_per_residue_features_for_inference(
                 self.sequence_dataframe,
                 seq_to_features,
+                self.sequence_to_mutation_sites,
             )
         else:
             sequence_dataframe = self.sequence_dataframe
@@ -2103,10 +2208,11 @@ export TMPDIR="$SCRDIR"
         embedding_type = self._embedding_type(embedding_type)
         abstraction_method = self._abstraction_type(abstraction_method)
         seq_to_features = self._load_abstracted_features(layer, abstraction_method, embedding_type, method_params)
-        if abstraction_method == "none" and embedding_type == "per_residue":
+        if embedding_type == "per_residue":
             _, seq_to_features = self._expand_per_residue_features_for_inference(
                 self.sequence_dataframe,
                 seq_to_features,
+                self.sequence_to_mutation_sites,
             )
         _, seq_to_features = self._drop_missing_features(None, seq_to_features, "Inference plotting")
         self._require_vector_features(seq_to_features, "Inference plotting")
