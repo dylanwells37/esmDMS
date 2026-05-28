@@ -2190,6 +2190,108 @@ export TMPDIR="$SCRDIR"
             fig.savefig(output_path, bbox_inches="tight", dpi=150)
         return fig, corr_df
 
+    def analyze_method_fitness_consistency_by_layer(
+        self,
+        layers: list[str | int],
+        method_specs: list[dict],
+        norm_scheme: str = "none",
+        ensure_inference: bool = False,
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, pd.DataFrame, pd.DataFrame]:
+        """
+        Compare methods by cross-replicate inferred-fitness Spearman rho.
+
+        method_specs entries may include:
+            label, abstraction_method, abstraction_params, embedding_type
+        """
+        detail_rows = []
+        summary_rows = []
+
+        for spec in method_specs:
+            method = spec.get("abstraction_method", "none")
+            params = dict(spec.get("abstraction_params") or {})
+            params.setdefault("norm_scheme", norm_scheme)
+            embedding_type = self._embedding_type(spec.get("embedding_type"))
+            label = spec.get("label") or f"{embedding_type}:{self._abstraction_type(method)}"
+
+            for layer in layers:
+                if ensure_inference:
+                    result = self.run_feature_inference(
+                        layer=layer,
+                        abstraction_method=method,
+                        abstraction_params=params,
+                        embedding_type=embedding_type,
+                    )
+                else:
+                    result = self.load_inference_results(
+                        layer=layer,
+                        abstraction_method=method,
+                        norm_scheme=norm_scheme,
+                        embedding_type=embedding_type,
+                    )
+
+                _, features = self._features_for_inference(
+                    layer,
+                    method,
+                    embedding_type,
+                    norm_scheme,
+                    params,
+                )
+                rep_fitness = np.asarray([features @ result.s[rep_idx] for rep_idx in range(result.s.shape[0])])
+                pair_rows = []
+                for rep_i, rep_j in self._rep_pairs(rep_fitness.shape[0]):
+                    rho = self._safe_corr(rep_fitness[rep_i], rep_fitness[rep_j], spearmanr)
+                    row = {
+                        "label": label,
+                        "layer": layer,
+                        "rep_i": rep_i + 1,
+                        "rep_j": rep_j + 1,
+                        "spearman_rho": rho,
+                        "n_sequences": rep_fitness.shape[1],
+                        "embedding_type": embedding_type,
+                        "abstraction_method": self._abstraction_type(method),
+                    }
+                    detail_rows.append(row)
+                    pair_rows.append(row)
+
+                pair_rhos = [row["spearman_rho"] for row in pair_rows]
+                summary_rows.append({
+                    "label": label,
+                    "layer": layer,
+                    "mean_spearman_rho": np.nanmean(pair_rhos) if pair_rhos else np.nan,
+                    "median_spearman_rho": np.nanmedian(pair_rhos) if pair_rhos else np.nan,
+                    "n_pairs": len(pair_rows),
+                    "n_sequences": rep_fitness.shape[1],
+                    "embedding_type": embedding_type,
+                    "abstraction_method": self._abstraction_type(method),
+                })
+
+        summary_df = pd.DataFrame(summary_rows)
+        detail_df = pd.DataFrame(detail_rows)
+        if summary_df.empty:
+            raise ValueError("No method consistency rows were created.")
+
+        sns.set_theme(style="darkgrid")
+        fig, ax = plt.subplots(figsize=(max(7, len(layers) * 0.6), 4.8))
+        sns.lineplot(
+            data=summary_df,
+            x="layer",
+            y="mean_spearman_rho",
+            hue="label",
+            marker="o",
+            ax=ax,
+        )
+        ax.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_ylim(-1, 1)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Mean pairwise fitness Spearman rho")
+        ax.set_title("Cross-replicate inferred-fitness consistency by method")
+        ax.legend(title="Method", bbox_to_anchor=(1.02, 1), loc="upper left")
+        fig.tight_layout()
+        if output_path is not None:
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        return fig, summary_df, detail_df
+
     def _plot_rep_scatter_grid(
         self,
         rep_values: np.ndarray,
