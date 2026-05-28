@@ -404,13 +404,15 @@ class esmDMS:
         embedding_type: str | None = None,
         sparsity_mode: str = "normal",
         k: int | None = None,
+        run_label: str | None = None,
     ) -> str:
         embedding_part = f"{self._embedding_type(embedding_type)}_" if embedding_type is not None else ""
         # Only suffix when non-default so existing 'normal'-mode caches keep their filenames.
         mode_part = f"_{sparsity_mode}_k{k}" if sparsity_mode != "normal" else ""
+        run_part = f"_{run_label}" if run_label else ""
         return (
             f"{self._dataset_prefix()}{embedding_part}sae_"
-            f"{self._layer_label(layer)}_{n_features}_{sparsity_coeff}{mode_part}"
+            f"{self._layer_label(layer)}_{n_features}_{sparsity_coeff}{mode_part}{run_part}"
         )
 
     def _sae_model_path(
@@ -421,9 +423,10 @@ class esmDMS:
         embedding_type: str | None = None,
         sparsity_mode: str = "normal",
         k: int | None = None,
+        run_label: str | None = None,
     ) -> Path:
         return self._sae_model_dir() / (
-            f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k)}_model.pt"
+            f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label)}_model.pt"
         )
 
     def _sae_viz_path(
@@ -434,9 +437,10 @@ class esmDMS:
         embedding_type: str | None = None,
         sparsity_mode: str = "normal",
         k: int | None = None,
+        run_label: str | None = None,
     ) -> Path:
         return self._sae_model_dir() / (
-            f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k)}_viz_data.pkl"
+            f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label)}_viz_data.pkl"
         )
 
     # ── Embedding layer selection ─────────────────────────────────────────
@@ -1604,6 +1608,7 @@ cd {Path.cwd()}
         seed: int = params.get("seed", 42)
         sparsity_mode: SparsityMode = params.get("sparsity_mode", "normal")
         k: int | None = params.get("k")
+        run_label: str | None = params.get("run_label")
         if sparsity_mode in {"topk", "batchtopk"} and (k is None or k <= 0):
             raise ValueError(
                 f"sparsity_mode={sparsity_mode!r} requires a positive integer 'k' in method_params."
@@ -1712,7 +1717,7 @@ cd {Path.cwd()}
             sae_dir.mkdir(parents=True, exist_ok=True)
 
             model_path = self._sae_model_path(
-                layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k
+                layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label
             )
             torch.save(
                 {
@@ -1743,7 +1748,13 @@ cd {Path.cwd()}
             self._save_pickle(
                 viz_data,
                 self._sae_viz_path(
-                    layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k
+                    layer,
+                    n_features,
+                    sparsity_coeff,
+                    embedding_type,
+                    sparsity_mode,
+                    k,
+                    run_label,
                 ),
             )
 
@@ -1808,6 +1819,7 @@ cd {Path.cwd()}
         sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
         sparsity_mode: str = params.get("sparsity_mode", "normal")
         k: int | None = params.get("k")
+        run_label: str | None = params.get("run_label")
 
         # Resolve n_features: need input_dim to compute the default.
         embeddings = self.load_embeddings(layer, embedding_type)
@@ -1820,7 +1832,7 @@ cd {Path.cwd()}
         n_features: int = params.get("n_features", input_dim * 2)
 
         viz_path = self._sae_viz_path(
-            layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k
+            layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label
         )
         if not viz_path.is_file():
             raise FileNotFoundError(
@@ -1920,7 +1932,7 @@ cd {Path.cwd()}
             if self._use_disk():
                 default_path = (
                     self._sae_model_dir()
-                    / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k)}_viz.png"
+                    / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label)}_viz.png"
                 )
                 self._sae_model_dir().mkdir(parents=True, exist_ok=True)
                 fig.savefig(default_path, bbox_inches="tight", dpi=150)
