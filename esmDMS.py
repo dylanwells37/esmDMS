@@ -110,6 +110,9 @@ DMSInput = CellularDMSInput | ViralDMSInput
 ## SPARSE AUTOENCODER ########################################################
 
 
+SparsityMode = Literal["normal", "topk", "batchtopk"]
+
+
 class SparseAutoencoder(torch.nn.Module):
     """
     Simple sparse autoencoder: Linear+ReLU encoder, linear decoder (no bias).
@@ -120,14 +123,36 @@ class SparseAutoencoder(torch.nn.Module):
     The decoder columns are optionally kept at unit norm throughout training to
     prevent feature collapse (standard SAE practice).
 
-    Loss = MSE(x, x_hat) + sparsity_coeff * mean(|z|)
+    Sparsity is enforced via ``sparsity_mode``:
+      - 'normal':    activations are unconstrained inside the module; sparsity
+                     comes from an L1 penalty added to the loss outside.
+      - 'topk':      per sample, keep only the top-k activations (others → 0).
+      - 'batchtopk': across the whole batch, keep only the top k * batch_size
+                     activations (others → 0).
     """
 
-    def __init__(self, input_dim: int, n_features: int, normalize_decoder: bool = True):
+    def __init__(
+        self,
+        input_dim: int,
+        n_features: int,
+        normalize_decoder: bool = True,
+        sparsity_mode: SparsityMode = "normal",
+        k: int | None = None,
+    ):
         super().__init__()
+        if sparsity_mode not in {"normal", "topk", "batchtopk"}:
+            raise ValueError(
+                f"sparsity_mode must be one of 'normal', 'topk', 'batchtopk'; got {sparsity_mode!r}"
+            )
+        if sparsity_mode in {"topk", "batchtopk"} and (k is None or k <= 0):
+            raise ValueError(
+                f"sparsity_mode={sparsity_mode!r} requires a positive integer k."
+            )
         self.encoder = torch.nn.Linear(input_dim, n_features)
         self.decoder = torch.nn.Linear(n_features, input_dim, bias=False)
         self.normalize_decoder = normalize_decoder
+        self.sparsity_mode = sparsity_mode
+        self.k = k
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -144,7 +169,21 @@ class SparseAutoencoder(torch.nn.Module):
             self.decoder.weight.div_(norms)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(self.encoder(x))
+        z = torch.relu(self.encoder(x))
+        if self.sparsity_mode == "topk":
+            k = min(self.k, z.shape[-1])
+            _, topk_idx = z.topk(k, dim=-1)
+            mask = torch.zeros_like(z)
+            mask.scatter_(-1, topk_idx, 1.0)
+            z = z * mask
+        elif self.sparsity_mode == "batchtopk":
+            flat = z.reshape(-1)
+            total_k = min(self.k * z.shape[0], flat.numel())
+            _, topk_idx = flat.topk(total_k)
+            mask = torch.zeros_like(flat)
+            mask.scatter_(0, topk_idx, 1.0)
+            z = (flat * mask).view_as(z)
+        return z
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.encode(x)
@@ -363,9 +402,16 @@ class esmDMS:
         n_features: int,
         sparsity_coeff: float,
         embedding_type: str | None = None,
+        sparsity_mode: str = "normal",
+        k: int | None = None,
     ) -> str:
         embedding_part = f"{self._embedding_type(embedding_type)}_" if embedding_type is not None else ""
-        return f"{self._dataset_prefix()}{embedding_part}sae_{self._layer_label(layer)}_{n_features}_{sparsity_coeff}"
+        # Only suffix when non-default so existing 'normal'-mode caches keep their filenames.
+        mode_part = f"_{sparsity_mode}_k{k}" if sparsity_mode != "normal" else ""
+        return (
+            f"{self._dataset_prefix()}{embedding_part}sae_"
+            f"{self._layer_label(layer)}_{n_features}_{sparsity_coeff}{mode_part}"
+        )
 
     def _sae_model_path(
         self,
@@ -373,8 +419,12 @@ class esmDMS:
         n_features: int,
         sparsity_coeff: float,
         embedding_type: str | None = None,
+        sparsity_mode: str = "normal",
+        k: int | None = None,
     ) -> Path:
-        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type)}_model.pt"
+        return self._sae_model_dir() / (
+            f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k)}_model.pt"
+        )
 
     def _sae_viz_path(
         self,
@@ -382,8 +432,12 @@ class esmDMS:
         n_features: int,
         sparsity_coeff: float,
         embedding_type: str | None = None,
+        sparsity_mode: str = "normal",
+        k: int | None = None,
     ) -> Path:
-        return self._sae_model_dir() / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type)}_viz_data.pkl"
+        return self._sae_model_dir() / (
+            f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k)}_viz_data.pkl"
+        )
 
     # ── Embedding layer selection ─────────────────────────────────────────
 
@@ -1548,6 +1602,12 @@ cd {Path.cwd()}
         normalize_decoder: bool = params.get("normalize_decoder", True)
         activity_threshold: float = params.get("activity_threshold", 1e-3)
         seed: int = params.get("seed", 42)
+        sparsity_mode: SparsityMode = params.get("sparsity_mode", "normal")
+        k: int | None = params.get("k")
+        if sparsity_mode in {"topk", "batchtopk"} and (k is None or k <= 0):
+            raise ValueError(
+                f"sparsity_mode={sparsity_mode!r} requires a positive integer 'k' in method_params."
+            )
 
         # ── Build data matrix ─────────────────────────────────────────────
         seq_ids = list(embeddings.keys())
@@ -1567,7 +1627,13 @@ cd {Path.cwd()}
         X_test = torch.from_numpy(X[test_idx]).to(device) if len(test_idx) else None
 
         # ── Model + optimizer ─────────────────────────────────────────────
-        model = SparseAutoencoder(input_dim, n_features, normalize_decoder).to(device)
+        model = SparseAutoencoder(
+            input_dim,
+            n_features,
+            normalize_decoder,
+            sparsity_mode=sparsity_mode,
+            k=k,
+        ).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
         # ── Training loop ─────────────────────────────────────────────────
@@ -1582,7 +1648,11 @@ cd {Path.cwd()}
                 batch = X_train[epoch_perm[start : start + batch_size]]
                 optimizer.zero_grad()
                 x_hat, z = model(batch)
-                loss = torch.nn.functional.mse_loss(x_hat, batch) + sparsity_coeff * z.abs().mean()
+                loss = torch.nn.functional.mse_loss(x_hat, batch)
+                # In topk / batchtopk modes the encoder masks activations directly,
+                # so the L1 penalty is redundant and is omitted (standard TopK-SAE recipe).
+                if sparsity_mode == "normal":
+                    loss = loss + sparsity_coeff * z.abs().mean()
                 loss.backward()
                 optimizer.step()
                 if normalize_decoder:
@@ -1641,13 +1711,17 @@ cd {Path.cwd()}
             sae_dir = self._sae_model_dir()
             sae_dir.mkdir(parents=True, exist_ok=True)
 
-            model_path = self._sae_model_path(layer, n_features, sparsity_coeff, embedding_type)
+            model_path = self._sae_model_path(
+                layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k
+            )
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "input_dim": input_dim,
                     "n_features": n_features,
                     "normalize_decoder": normalize_decoder,
+                    "sparsity_mode": sparsity_mode,
+                    "k": k,
                     "active_mask": active_mask,
                     "params": params,
                 },
@@ -1666,7 +1740,12 @@ cd {Path.cwd()}
                 "test_losses": test_losses,
                 "active_mask": active_mask,
             }
-            self._save_pickle(viz_data, self._sae_viz_path(layer, n_features, sparsity_coeff, embedding_type))
+            self._save_pickle(
+                viz_data,
+                self._sae_viz_path(
+                    layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k
+                ),
+            )
 
         return result
 
@@ -1727,6 +1806,8 @@ cd {Path.cwd()}
         params = dict(method_params or {})
         embedding_type = self._embedding_type(embedding_type or params.get("_embedding_type"))
         sparsity_coeff: float = params.get("sparsity_coeff", 1e-3)
+        sparsity_mode: str = params.get("sparsity_mode", "normal")
+        k: int | None = params.get("k")
 
         # Resolve n_features: need input_dim to compute the default.
         embeddings = self.load_embeddings(layer, embedding_type)
@@ -1738,7 +1819,9 @@ cd {Path.cwd()}
         input_dim = next(iter(embeddings.values())).shape[0]
         n_features: int = params.get("n_features", input_dim * 2)
 
-        viz_path = self._sae_viz_path(layer, n_features, sparsity_coeff, embedding_type)
+        viz_path = self._sae_viz_path(
+            layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k
+        )
         if not viz_path.is_file():
             raise FileNotFoundError(
                 f"No SAE visualisation data found at {viz_path}. "
@@ -1837,7 +1920,7 @@ cd {Path.cwd()}
             if self._use_disk():
                 default_path = (
                     self._sae_model_dir()
-                    / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type)}_viz.png"
+                    / f"{self._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k)}_viz.png"
                 )
                 self._sae_model_dir().mkdir(parents=True, exist_ok=True)
                 fig.savefig(default_path, bbox_inches="tight", dpi=150)
