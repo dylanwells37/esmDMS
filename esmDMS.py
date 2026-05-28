@@ -1615,19 +1615,22 @@ cd {Path.cwd()}
         X_recon = X_recon_t.cpu().numpy()      # (n_samples, input_dim)
 
         # ── Identify active neurons ───────────────────────────────────────
-        mean_act = Z_all.mean(axis=0)
-        active_mask = mean_act > activity_threshold
+        # Keep only neurons whose activation frequency is strictly in (0, 1):
+        # exclude both fully-sparse (never fires) and fully-dense (always fires) features.
+        act_freq = (Z_all > 0).mean(axis=0)
+        active_mask = (act_freq > 0.0) & (act_freq < 1.0)
         if not active_mask.any():
             print(
-                "Warning: no neurons exceeded the activity threshold. "
+                "Warning: no neurons had activation frequency strictly between 0 and 1. "
                 "Falling back to the top 10% most active neurons."
             )
+            mean_act = Z_all.mean(axis=0)
             active_mask = mean_act >= np.percentile(mean_act, 90)
 
         n_active = int(active_mask.sum())
         print(
             f"SAE: {n_active}/{n_features} neurons active "
-            f"(threshold={activity_threshold}, layer={layer})"
+            f"(0 < activation frequency < 1, layer={layer})"
         )
         Z_active = Z_all[:, active_mask]       # (n_samples, n_active)
 
