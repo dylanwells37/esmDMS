@@ -30,11 +30,14 @@ from popDMS import mini_infer_esm, InferenceResult
 
 
 EmbeddingModel = Literal[
-    "esm2_t6_8M_UR50D",
-    "esm2_t12_35M_UR50D",
-    "esm2_t30_150M_UR50D",
-    "esm2_t33_650M_UR50D",
-    "esm2_t36_3B_UR50D",
+    "facebook/esm2_t6_8M_UR50D",
+    "facebook/esm2_t12_35M_UR50D",
+    "facebook/esm2_t30_150M_UR50D",
+    "facebook/esm2_t33_650M_UR50D",
+    "facebook/esm2_t36_3B_UR50D",
+    "biohub/ESMC-300M",
+    "biohub/ESMC-600M",
+    "biohub/ESMC-6B",
 ]
 
 EmbeddingType = Literal["per_residue", "mutation_pooled", "mean_pool"]
@@ -44,7 +47,7 @@ AbstractionMethod = Literal["none", "PCA", "SAE", "SPCA"]
 
 @dataclass(frozen=True)
 class ESMDMSConfig:
-    embedding_model: EmbeddingModel = "esm2_t33_650M_UR50D"
+    embedding_model: EmbeddingModel = "facebook/esm2_t33_650M_UR50D"
     embedding_type: EmbeddingType = "per_residue"
     embedding_method: str | None = None
     local_or_disk: Literal['local', 'disk', 'both'] = 'local'
@@ -276,8 +279,8 @@ class esmDMS:
             return ""
         return f"{self.config.dataset_name}_"
 
-    def _base_embedding_path(self, layer: str | int) -> Path:
-        return self._save_dir() / f"{self._dataset_prefix()}{self.config.embedding_model}_all_data_{self._layer_label(layer)}_embeddings.pkl"
+    def _model_cache_label(self) -> str:
+        return self.config.embedding_model.replace("/", "__")
 
     def _embedding_path(self, layer: str | int, embedding_type: str | None = None) -> Path:
         embedding_type = self._embedding_type(embedding_type)
@@ -287,7 +290,7 @@ class esmDMS:
         embedding_type = self._embedding_type(embedding_type)
         abstraction_type = self._abstraction_type(method)
         return self._save_dir() / (
-            f"{self._dataset_prefix()}{self.config.embedding_model}_{embedding_type}_{abstraction_type}_"
+            f"{self._dataset_prefix()}{self._model_cache_label()}_{embedding_type}_{abstraction_type}_"
             f"{self._layer_label(layer)}_seq_to_features.pkl"
         )
 
@@ -301,7 +304,7 @@ class esmDMS:
         embedding_type = self._embedding_type(embedding_type)
         abstraction_type = self._abstraction_type(abstraction_method)
         return self._save_dir() / (
-            f"{self._dataset_prefix()}{self.config.embedding_model}_{embedding_type}_{abstraction_type}_"
+            f"{self._dataset_prefix()}{self._model_cache_label()}_{embedding_type}_{abstraction_type}_"
             f"{self._layer_label(layer)}_{norm_scheme}_inference_results.pkl"
         )
 
@@ -353,7 +356,7 @@ class esmDMS:
         if job_dir is not None:
             batch_dir = Path(job_dir)
         else:
-            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self.config.embedding_model}_all_data"
+            batch_dir = self._save_dir() / "embedding_batches" / f"{self._dataset_prefix()}{self._model_cache_label()}_all_data"
         batch_dir.mkdir(parents=True, exist_ok=True)
         return batch_dir
 
@@ -383,7 +386,7 @@ class esmDMS:
             inference_job_dir = (
                 self._save_dir()
                 / "inference_jobs"
-                / f"{self._dataset_prefix()}{self.config.embedding_model}_{self._embedding_type(embedding_type)}_{self._abstraction_type(abstraction_method)}_{self._layer_label(layer)}_{norm_scheme}"
+                / f"{self._dataset_prefix()}{self._model_cache_label()}_{self._embedding_type(embedding_type)}_{self._abstraction_type(abstraction_method)}_{self._layer_label(layer)}_{norm_scheme}"
             )
         inference_job_dir.mkdir(parents=True, exist_ok=True)
         return inference_job_dir
@@ -490,7 +493,7 @@ class esmDMS:
             embedding = np.asarray(embedding)
             if embedding.ndim != 2:
                 raise ValueError(
-                    f"Cannot derive {embedding_type} from all-data layer embedding shape {embedding.shape} "
+                    f"Cannot derive {embedding_type} from layer embedding shape {embedding.shape} "
                     f"for sequence {seq_id}."
                 )
 
@@ -881,7 +884,7 @@ class esmDMS:
         dict[str, np.ndarray]
             A dictionary mapping sequence indices to their corresponding embeddings.
         """
-        esm_model = f"facebook/{self.config.embedding_model}"
+        esm_model = f"{self.config.embedding_model}"
 
         tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
         model = AutoModel.from_pretrained(esm_model)
@@ -1053,7 +1056,7 @@ export TMPDIR="$SCRDIR"
         if chunk_idx < 0 or chunk_idx >= n_chunks:
             raise ValueError(f"chunk_idx must be between 0 and {n_chunks - 1}.")
 
-        esm_model = f"facebook/{payload['embedding_model']}"
+        esm_model = f"{payload['embedding_model']}"
         tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
         model = AutoModel.from_pretrained(esm_model)
         model.eval()
@@ -1248,40 +1251,35 @@ cd {Path.cwd()}
                 for path in chunk_paths
                 if not path.is_file()
             ]
-            legacy_chunk_files = [
-                self._batch_chunk_path(batch_dir, idx) for idx in range(n_chunks or 0)
-            ]
-            has_legacy_chunks = legacy_chunk_files and all(path.is_file() for path in legacy_chunk_files)
-            if missing_feature_chunks and not has_legacy_chunks:
+            if missing_feature_chunks:
                 raise FileNotFoundError(f"Missing embedding feature chunk files: {missing_feature_chunks}")
 
-            if not missing_feature_chunks:
-                merged_features = {}
-                for embedding_type, chunk_paths in feature_chunk_files.items():
-                    if not chunk_paths:
-                        raise FileNotFoundError(
-                            f"No {embedding_type} embedding chunk files found in {batch_dir}."
-                        )
-                    for path in chunk_paths:
-                        chunk = self._load_pickle(path)
-                        if not (
-                            isinstance(chunk, dict)
-                            and chunk.get("format") == "esmDMS_embedding_feature_chunk_v2"
-                            and chunk.get("embedding_type") == embedding_type
-                        ):
-                            raise ValueError(f"Unexpected {embedding_type} feature chunk format in {path}.")
-                        for layer_label, seq_to_features in chunk["features_by_layer"].items():
-                            merged_features.setdefault(layer_label, {"mean_pool": {}, "per_residue": {}})
-                            merged_features[layer_label][embedding_type].update(seq_to_features)
+            merged_features = {}
+            for embedding_type, chunk_paths in feature_chunk_files.items():
+                if not chunk_paths:
+                    raise FileNotFoundError(
+                        f"No {embedding_type} embedding chunk files found in {batch_dir}."
+                    )
+                for path in chunk_paths:
+                    chunk = self._load_pickle(path)
+                    if not (
+                        isinstance(chunk, dict)
+                        and chunk.get("format") == "esmDMS_embedding_feature_chunk_v2"
+                        and chunk.get("embedding_type") == embedding_type
+                    ):
+                        raise ValueError(f"Unexpected {embedding_type} feature chunk format in {path}.")
+                    for layer_label, seq_to_features in chunk["features_by_layer"].items():
+                        merged_features.setdefault(layer_label, {"mean_pool": {}, "per_residue": {}})
+                        merged_features[layer_label][embedding_type].update(seq_to_features)
 
-                for layer_label, layer_features in merged_features.items():
-                    if self._use_memory():
-                        self.sequence_to_features[self._feature_key("none", layer_label, "mean_pool")] = layer_features["mean_pool"]
-                        self.sequence_to_features[self._feature_key("none", layer_label, "per_residue")] = layer_features["per_residue"]
-                    if save_layers and self._use_disk():
-                        self._save_pickle(layer_features["mean_pool"], self._embedding_path(layer_label, "mean_pool"))
-                        self._save_pickle(layer_features["per_residue"], self._embedding_path(layer_label, "per_residue"))
-                return merged_features
+            for layer_label, layer_features in merged_features.items():
+                if self._use_memory():
+                    self.sequence_to_features[self._feature_key("none", layer_label, "mean_pool")] = layer_features["mean_pool"]
+                    self.sequence_to_features[self._feature_key("none", layer_label, "per_residue")] = layer_features["per_residue"]
+                if save_layers and self._use_disk():
+                    self._save_pickle(layer_features["mean_pool"], self._embedding_path(layer_label, "mean_pool"))
+                    self._save_pickle(layer_features["per_residue"], self._embedding_path(layer_label, "per_residue"))
+            return merged_features
 
         if n_chunks is None:
             chunk_files = sorted(batch_dir.glob(f"{self._dataset_prefix()}embeddings_chunk_*.pkl"))
@@ -1298,53 +1296,12 @@ cd {Path.cwd()}
             self.sequence_to_mutation_sites = payload.get("sequence_to_mutation_sites")
 
         merged = {}
-        feature_chunks = []
         for path in chunk_files:
             chunk = self._load_pickle(path)
-            if isinstance(chunk, dict) and chunk.get("format") == "esmDMS_embedding_features_v1":
-                feature_chunks.append(chunk)
-            else:
-                merged.update(chunk)
-
-        if feature_chunks:
-            merged_features = {}
-            for chunk in feature_chunks:
-                for layer_label, layer_features in chunk["features_by_layer"].items():
-                    merged_features.setdefault(layer_label, {"mean_pool": {}, "per_residue": {}})
-                    merged_features[layer_label]["mean_pool"].update(layer_features["mean_pool"])
-                    merged_features[layer_label]["per_residue"].update(layer_features["per_residue"])
-
-            for layer_label, layer_features in merged_features.items():
-                if self._use_memory():
-                    self.sequence_to_features[self._feature_key("none", layer_label, "mean_pool")] = layer_features["mean_pool"]
-                    self.sequence_to_features[self._feature_key("none", layer_label, "per_residue")] = layer_features["per_residue"]
-                if save_layers and self._use_disk():
-                    self._save_pickle(layer_features["mean_pool"], self._embedding_path(layer_label, "mean_pool"))
-                    self._save_pickle(layer_features["per_residue"], self._embedding_path(layer_label, "per_residue"))
-
-            if not merged:
-                return merged_features
+            merged.update(chunk)
 
         if self._use_memory():
             self.sequence_to_embeddings.update(merged)
-
-        first_embedding = next((np.asarray(embedding) for embedding in merged.values() if embedding is not None), None)
-        if first_embedding is None:
-            raise ValueError("No non-empty embeddings found in merged batch outputs.")
-        if layer == "all":
-            layer_axis = 1 if first_embedding.ndim == 3 else 0
-            layers = range(first_embedding.shape[layer_axis])
-        else:
-            layers = [layer]
-        for layer_value in layers:
-            layer_embeddings = self._select_layer(merged, layer_value, allow_per_residue=True)
-            if save_layers and self._use_disk():
-                self._save_layer_feature_caches(layer_embeddings, layer_value)
-            elif self._use_memory():
-                mean_pool = self._derive_mean_pool_features(layer_embeddings)
-                per_residue = self._derive_per_residue_features(layer_embeddings, self.sequence_to_mutation_sites)
-                self.sequence_to_features[self._feature_key("none", layer_value, "mean_pool")] = mean_pool
-                self.sequence_to_features[self._feature_key("none", layer_value, "per_residue")] = per_residue
 
         return merged
         
@@ -1422,27 +1379,10 @@ cd {Path.cwd()}
                 if self._use_memory():
                     self.sequence_to_features[key] = embeddings
                 return embeddings
-            base_path = self._base_embedding_path(layer)
-            if base_path.is_file():
-                #print(f"Loading all-data embeddings from {base_path}")
-                all_data_embeddings = self._load_pickle(base_path)
-                if embedding_type == "mutation_pooled":
-                    per_residue_embeddings = self._derive_embedding_type(all_data_embeddings, "per_residue")
-                    embeddings = self._pool_per_residue_features(per_residue_embeddings)
-                    self._save_pickle(per_residue_embeddings, self._embedding_path(layer, "per_residue"))
-                else:
-                    embeddings = self._derive_embedding_type(all_data_embeddings, embedding_type)
-                    self._save_pickle(embeddings, save_path)
-                if self._use_memory():
-                    self.sequence_to_features[base_key] = all_data_embeddings
-                    if embedding_type == "mutation_pooled":
-                        self.sequence_to_features[per_residue_key] = per_residue_embeddings
-                    self.sequence_to_features[key] = embeddings
-                return embeddings
             if embedding_type == "mutation_pooled":
                 raise FileNotFoundError(
-                    f"No saved per_residue embeddings found at {self._embedding_path(layer, 'per_residue')} "
-                    f"and no legacy all-data embeddings found at {base_path}. Run embed_all_sequences({layer!r}) first."
+                    f"No saved per_residue embeddings found at {self._embedding_path(layer, 'per_residue')}. "
+                    f"Run embed_all_sequences({layer!r}) first."
                 )
             raise FileNotFoundError(f"No saved {embedding_type} embeddings found at {save_path}. Run embed_all_sequences({layer!r}) first.")
 
