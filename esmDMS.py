@@ -906,21 +906,31 @@ class esmDMS:
         for codon, aa in CODON2AA.items():
             aa_to_codons.setdefault(aa, []).append(codon)
 
-        aa_list = list(reference_aa_sequence)
-        mutation_sites = set()
+        # Group substitutions by codon so that multi-nucleotide variants within
+        # a single codon are resolved against the same wildtype codon candidate.
+        by_codon: dict[int, dict[int, tuple[str, str]]] = {}
         for nuc_pos, ref_nuc, alt_nuc in substitutions:
             aa_idx = nuc_pos // 3
             codon_phase = nuc_pos % 3
-            if aa_idx < 0 or aa_idx >= len(aa_list):
+            if aa_idx < 0 or aa_idx >= len(reference_aa_sequence):
                 return None, None, "position_out_of_range"
+            phase_map = by_codon.setdefault(aa_idx, {})
+            existing = phase_map.get(codon_phase)
+            if existing is not None and existing != (ref_nuc, alt_nuc):
+                return None, None, "conflicting_substitutions_at_same_codon_position"
+            phase_map[codon_phase] = (ref_nuc, alt_nuc)
 
+        aa_list = list(reference_aa_sequence)
+        mutation_sites = set()
+        for aa_idx, phase_map in by_codon.items():
             wt_aa = reference_aa_sequence[aa_idx]
             alt_aas = set()
             for codon in aa_to_codons.get(wt_aa, []):
-                if codon[codon_phase] != ref_nuc:
+                if any(codon[phase] != ref_nuc for phase, (ref_nuc, _) in phase_map.items()):
                     continue
                 mut_codon = list(codon)
-                mut_codon[codon_phase] = alt_nuc
+                for phase, (_, alt_nuc) in phase_map.items():
+                    mut_codon[phase] = alt_nuc
                 alt_aas.add(CODON2AA.get("".join(mut_codon), "X"))
 
             if not alt_aas:
@@ -940,23 +950,47 @@ class esmDMS:
 
     @staticmethod
     def _count_column_specs(df: pd.DataFrame) -> list[dict]:
-        day_rep_re = re.compile(r"^count_day(?P<generation>\d+)_rep(?P<replicate>\d+)$")
+        day_rep_re = re.compile(r"^count_day(?P<day>\d+)_rep(?P<replicate>\d+)$")
         legacy_re = re.compile(r"^(.+)_c_(\d+)$")
 
-        specs = []
+        day_rep_matches = []
         for col in df.columns:
             match = day_rep_re.match(col)
             if match:
-                rep_idx = int(match.group("replicate"))
-                specs.append({
+                day_rep_matches.append({
                     "column": col,
-                    "replicate": rep_idx,
-                    "replicate_name": f"rep{rep_idx}",
-                    "generation": int(match.group("generation")),
+                    "replicate": int(match.group("replicate")),
+                    "day": int(match.group("day")),
                 })
 
-        if specs:
+        if day_rep_matches:
+            # count_library is the pre-selection (generation 0) baseline, shared
+            # across replicates. The remaining count_day{N}_rep{M} columns are
+            # ordered by day and remapped to generations 1, 2, ..., N so that
+            # the trapezoidal time integration uses the library as t=0.
+            unique_days = sorted({entry["day"] for entry in day_rep_matches})
+            day_to_generation = {day: idx + 1 for idx, day in enumerate(unique_days)}
+            replicate_indices = sorted({entry["replicate"] for entry in day_rep_matches})
+
+            specs = []
+            if "count_library" in df.columns:
+                for rep_idx in replicate_indices:
+                    specs.append({
+                        "column": "count_library",
+                        "replicate": rep_idx,
+                        "replicate_name": f"rep{rep_idx}",
+                        "generation": 0,
+                    })
+            for entry in day_rep_matches:
+                specs.append({
+                    "column": entry["column"],
+                    "replicate": entry["replicate"],
+                    "replicate_name": f"rep{entry['replicate']}",
+                    "generation": day_to_generation[entry["day"]],
+                })
             return sorted(specs, key=lambda x: (x["replicate"], x["generation"], x["column"]))
+
+        specs = []
 
         legacy_seen = {}
         for col in df.columns:
