@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import pickle
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -16,14 +18,18 @@ from scipy.stats import pearsonr, spearmanr
 from transformers import AutoModel, AutoTokenizer
 
 from embedding_scripts.embed_sequences import (
+    CODON2AA,
     get_reference_nuc_sequence,
     build_sequence_dataframe_mavedb,
     get_reference_sequence_from_wildtypes,
     build_sequence_dataframe,
-    embed_sequence
+    embed_sequence,
+    parse_hgvs_nt,
+    apply_substitutions,
+    translate_nuc_sequence,
 )
 
-from popDMS import mini_infer_esm, InferenceResult
+from popDMS import mini_infer_esm, infer_gamma_range, InferenceResult
 
 
 ## TYPE DEFINITIONS #################################
@@ -40,8 +46,8 @@ EmbeddingModel = Literal[
     "biohub/ESMC-6B",
 ]
 
-EmbeddingType = Literal["per_residue", "mutation_pooled", "mean_pool"]
-AbstractionMethod = Literal["none", "PCA", "SAE", "SPCA"]
+EmbeddingType = Literal["per_residue", "mutation_pooled", "mean_pool", "max_pool"]
+AbstractionMethod = Literal["none", "PCA", "SAE", "DeltaSAE", "SPCA"]
 
 ## CONFIGURATION AND INPUT CLASSES #################################
 
@@ -65,8 +71,12 @@ class ESMDMSConfig:
             object.__setattr__(self, "embedding_type", self.embedding_method)
         if self.embedding_type in {"mutation_site", "mutation_pool", "pooled"}:
             object.__setattr__(self, "embedding_type", "mutation_pooled")
-        if self.embedding_type not in {"per_residue", "mutation_pooled", "mean_pool"}:
-            raise ValueError("embedding_type must be one of 'per_residue', 'mutation_pooled', or 'mean_pool'.")
+        if self.embedding_type in {"mean_pooled", "mean"}:
+            object.__setattr__(self, "embedding_type", "mean_pool")
+        if self.embedding_type in {"max_pooled", "max"}:
+            object.__setattr__(self, "embedding_type", "max_pool")
+        if self.embedding_type not in {"per_residue", "mutation_pooled", "mean_pool", "max_pool"}:
+            raise ValueError("embedding_type must be one of 'per_residue', 'mutation_pooled', 'mean_pool', or 'max_pool'.")
         if self.dataset_name is not None:
             if not self.dataset_name:
                 raise ValueError("dataset_name must not be empty when specified.")
@@ -78,16 +88,28 @@ class ESMDMSConfig:
 class CellularDMSInput:
     reference_nuc_path: Path
     mavedb_csv_path: Path
+    scores_csv_path: Path | None = None
     use_replicates: list[str] | None = None
+    reference_kind: Literal["auto", "nucleotide", "protein"] = "auto"
+    primary_key: str = "hgvs_nt"
+    wildtype_key: str = "__wildtype__"
     kind: Literal['cellular'] = 'cellular'
 
     def __post_init__(self):
         object.__setattr__(self, 'reference_nuc_path', Path(self.reference_nuc_path))
         object.__setattr__(self, 'mavedb_csv_path', Path(self.mavedb_csv_path))
+        if self.scores_csv_path is not None:
+            object.__setattr__(self, 'scores_csv_path', Path(self.scores_csv_path))
         if not self.reference_nuc_path.is_file():
             raise ValueError(f"Reference nucleotide sequence path {self.reference_nuc_path} does not exist or is not a file.")
         if not self.mavedb_csv_path.is_file():
             raise ValueError(f"MaveDB CSV path {self.mavedb_csv_path} does not exist or is not a file.")
+        if self.scores_csv_path is not None and not self.scores_csv_path.is_file():
+            raise ValueError(f"MaveDB scores CSV path {self.scores_csv_path} does not exist or is not a file.")
+        if self.reference_kind not in {"auto", "nucleotide", "protein"}:
+            raise ValueError("reference_kind must be one of 'auto', 'nucleotide', or 'protein'.")
+        if not self.primary_key:
+            raise ValueError("primary_key must not be empty.")
 
 
 @dataclass(frozen=True)
@@ -247,6 +269,9 @@ class esmDMS:
         self.sequence_to_embeddings = {}
         self.sequence_to_features = {}
         self.inference_results = {}
+        self.reference_kind = None
+        self.sequence_metadata = None
+        self.scores_dataframe = None
 
     def _use_memory(self) -> bool:
         return self.config.local_or_disk in {"local", "both"}
@@ -328,6 +353,8 @@ class esmDMS:
         method = esmDMS._abstraction_type(method)
         if method.startswith("PCA"):
             return "PCA"
+        if method.startswith("DeltaSAE"):
+            return "DeltaSAE"
         if method.startswith("SAE"):
             return "SAE"
         if method.startswith("SPCA"):
@@ -338,8 +365,12 @@ class esmDMS:
         embedding_type = embedding_type or self.config.embedding_type
         if embedding_type in {"mutation_site", "mutation_pool", "pooled"}:
             return "mutation_pooled"
-        if embedding_type not in {"per_residue", "mutation_pooled", "mean_pool"}:
-            raise ValueError("embedding_type must be one of 'per_residue', 'mutation_pooled', or 'mean_pool'.")
+        if embedding_type in {"mean_pooled", "mean"}:
+            return "mean_pool"
+        if embedding_type in {"max_pooled", "max"}:
+            return "max_pool"
+        if embedding_type not in {"per_residue", "mutation_pooled", "mean_pool", "max_pool"}:
+            raise ValueError("embedding_type must be one of 'per_residue', 'mutation_pooled', 'mean_pool', or 'max_pool'.")
         return embedding_type
 
     @staticmethod
@@ -482,7 +513,7 @@ class esmDMS:
         layer_embeddings: dict[str, np.ndarray],
         embedding_type: str,
     ) -> dict[str, np.ndarray]:
-        if embedding_type not in {"per_residue", "mutation_pooled", "mean_pool"}:
+        if embedding_type not in {"per_residue", "mutation_pooled", "mean_pool", "max_pool"}:
             raise ValueError(f"Unsupported embedding_type: {embedding_type}")
 
         derived = {}
@@ -499,6 +530,9 @@ class esmDMS:
 
             if embedding_type == "mean_pool":
                 derived[seq_id] = embedding.mean(axis=0)
+                continue
+            if embedding_type == "max_pool":
+                derived[seq_id] = embedding.max(axis=0)
                 continue
 
             if self.sequence_to_mutation_sites is None:
@@ -557,6 +591,21 @@ class esmDMS:
         return mean_pool
 
     @classmethod
+    def _derive_max_pool_features(cls, layer_embeddings: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        max_pool = {}
+        for seq_id, embedding in layer_embeddings.items():
+            if embedding is None:
+                max_pool[seq_id] = None
+                continue
+            embedding = np.asarray(embedding)
+            if embedding.ndim != 2:
+                raise ValueError(
+                    f"Cannot max-pool embedding for sequence {seq_id} with shape {embedding.shape}."
+                )
+            max_pool[seq_id] = embedding.max(axis=0)
+        return max_pool
+
+    @classmethod
     def _derive_per_residue_features(
         cls,
         layer_embeddings: dict[str, np.ndarray],
@@ -612,13 +661,16 @@ class esmDMS:
 
     def _save_layer_feature_caches(self, layer_embeddings: dict[str, np.ndarray], layer: str | int) -> None:
         mean_pool = self._derive_mean_pool_features(layer_embeddings)
+        max_pool = self._derive_max_pool_features(layer_embeddings)
         per_residue = self._derive_per_residue_features(layer_embeddings, self.sequence_to_mutation_sites)
 
         if self._use_memory():
             self.sequence_to_features[self._feature_key("none", layer, "mean_pool")] = mean_pool
+            self.sequence_to_features[self._feature_key("none", layer, "max_pool")] = max_pool
             self.sequence_to_features[self._feature_key("none", layer, "per_residue")] = per_residue
         if self._use_disk():
             self._save_pickle(mean_pool, self._embedding_path(layer, "mean_pool"))
+            self._save_pickle(max_pool, self._embedding_path(layer, "max_pool"))
             self._save_pickle(per_residue, self._embedding_path(layer, "per_residue"))
 
     @classmethod
@@ -638,11 +690,12 @@ class esmDMS:
         else:
             layers = [layer]
 
-        feature_chunks = {"mean_pool": {}, "per_residue": {}}
+        feature_chunks = {"mean_pool": {}, "max_pool": {}, "per_residue": {}}
         for layer_value in layers:
             layer_embeddings = cls._select_layer(embeddings, layer_value, allow_per_residue=True)
             layer_label = cls._layer_label(layer_value)
             feature_chunks["mean_pool"][layer_label] = cls._derive_mean_pool_features(layer_embeddings)
+            feature_chunks["max_pool"][layer_label] = cls._derive_max_pool_features(layer_embeddings)
             feature_chunks["per_residue"][layer_label] = cls._derive_per_residue_features(
                 layer_embeddings,
                 sequence_to_mutation_sites,
@@ -816,18 +869,265 @@ class esmDMS:
             raise ValueError("Inference: no sequence rows matched residue-level per_residue features.")
         return pd.DataFrame(expanded_rows).reset_index(drop=True), expanded_features
 
+    # ── MaveDB parsing helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _read_sequence_file(path: str | Path) -> str:
+        with Path(path).open("r") as f:
+            return "".join(line.strip() for line in f if not line.startswith(">")).upper()
+
+    @staticmethod
+    def _detect_reference_kind(reference_sequence: str) -> Literal["nucleotide", "protein"]:
+        letters = set(reference_sequence.upper())
+        if letters and letters.issubset(set("ACGTUN")) and len(reference_sequence) % 3 == 0:
+            return "nucleotide"
+        return "protein"
+
+    @staticmethod
+    def _strip_hgvs_prefix(hgvs_nt: str) -> str:
+        hgvs_nt = str(hgvs_nt).strip()
+        if ":c." in hgvs_nt:
+            return "c." + hgvs_nt.split(":c.", 1)[1]
+        return hgvs_nt
+
+    @staticmethod
+    def _read_mavedb_csv(path: str | Path) -> pd.DataFrame:
+        with Path(path).open() as f:
+            content = "".join(line for line in f if not line.startswith("#"))
+        return pd.read_csv(io.StringIO(content))
+
+    @staticmethod
+    def _infer_aa_sequence_from_protein_reference(
+        reference_aa_sequence: str,
+        substitutions: list[tuple[int, str, str]],
+        skip_stop_codons: bool = True,
+    ) -> tuple[str | None, list[int] | None, str | None]:
+        aa_to_codons = {}
+        for codon, aa in CODON2AA.items():
+            aa_to_codons.setdefault(aa, []).append(codon)
+
+        aa_list = list(reference_aa_sequence)
+        mutation_sites = set()
+        for nuc_pos, ref_nuc, alt_nuc in substitutions:
+            aa_idx = nuc_pos // 3
+            codon_phase = nuc_pos % 3
+            if aa_idx < 0 or aa_idx >= len(aa_list):
+                return None, None, "position_out_of_range"
+
+            wt_aa = reference_aa_sequence[aa_idx]
+            alt_aas = set()
+            for codon in aa_to_codons.get(wt_aa, []):
+                if codon[codon_phase] != ref_nuc:
+                    continue
+                mut_codon = list(codon)
+                mut_codon[codon_phase] = alt_nuc
+                alt_aas.add(CODON2AA.get("".join(mut_codon), "X"))
+
+            if not alt_aas:
+                return None, None, "reference_nucleotide_incompatible_with_reference_aa"
+            if len(alt_aas) > 1:
+                return None, None, "ambiguous_protein_effect_from_protein_reference"
+
+            alt_aa = next(iter(alt_aas))
+            if skip_stop_codons and alt_aa == "*":
+                return None, None, "stop_codon"
+            if alt_aa != wt_aa:
+                aa_list[aa_idx] = alt_aa
+                mutation_sites.add(aa_idx)
+
+        aa_sequence = "".join(aa_list)
+        return aa_sequence, sorted(mutation_sites), None
+
+    @staticmethod
+    def _count_column_specs(df: pd.DataFrame) -> list[dict]:
+        day_rep_re = re.compile(r"^count_day(?P<generation>\d+)_rep(?P<replicate>\d+)$")
+        legacy_re = re.compile(r"^(.+)_c_(\d+)$")
+
+        specs = []
+        for col in df.columns:
+            match = day_rep_re.match(col)
+            if match:
+                rep_idx = int(match.group("replicate"))
+                specs.append({
+                    "column": col,
+                    "replicate": rep_idx,
+                    "replicate_name": f"rep{rep_idx}",
+                    "generation": int(match.group("generation")),
+                })
+
+        if specs:
+            return sorted(specs, key=lambda x: (x["replicate"], x["generation"], x["column"]))
+
+        legacy_seen = {}
+        for col in df.columns:
+            match = legacy_re.match(col)
+            if match:
+                legacy_seen.setdefault(match.group(1), {})[int(match.group(2))] = col
+        rep_name_to_idx = {name: idx + 1 for idx, name in enumerate(sorted(legacy_seen))}
+        for rep_name, gen_dict in legacy_seen.items():
+            for gen_idx, col in gen_dict.items():
+                specs.append({
+                    "column": col,
+                    "replicate": rep_name_to_idx[rep_name],
+                    "replicate_name": rep_name,
+                    "generation": gen_idx,
+                })
+        return sorted(specs, key=lambda x: (x["replicate"], x["generation"], x["column"]))
+
+    @staticmethod
+    def _replicate_selected(spec: dict, use_replicates: list[str] | None) -> bool:
+        if use_replicates is None:
+            return True
+        allowed = {str(rep) for rep in use_replicates}
+        return str(spec["replicate"]) in allowed or spec["replicate_name"] in allowed
+
+    def _build_sequence_dataframe_mavedb_primary_keyed(
+        self,
+        counts_csv_path: Path,
+        reference_sequence: str,
+        reference_kind: Literal["nucleotide", "protein"],
+        use_replicates: list[str] | None = None,
+        skip_stop_codons: bool = True,
+    ) -> tuple[pd.DataFrame, dict[str, str], dict[str, list[int]], pd.DataFrame]:
+        counts_df = self._read_mavedb_csv(counts_csv_path)
+        primary_key = self.input_data.primary_key
+        if primary_key not in counts_df.columns:
+            raise ValueError(f"MaveDB counts file must contain primary key column {primary_key!r}.")
+
+        count_specs = self._count_column_specs(counts_df)
+        if not count_specs:
+            raise ValueError(
+                "No supported count columns found. Expected count_day<day>_rep<rep> "
+                "or legacy columns ending in '_c_<generation>'."
+            )
+
+        if reference_kind == "nucleotide":
+            ref_nuc_seq = reference_sequence
+            ref_aa_seq = translate_nuc_sequence(ref_nuc_seq)
+        else:
+            ref_nuc_seq = None
+            ref_aa_seq = reference_sequence
+
+        records = []
+        sequence_to_protein_sequence = {self.input_data.wildtype_key: ref_aa_seq}
+        sequence_to_mutation_sites = {self.input_data.wildtype_key: []}
+        metadata_rows = [{
+            "SequenceIndex": self.input_data.wildtype_key,
+            primary_key: self.input_data.wildtype_key,
+            "accession": None,
+            "n_mutation_sites": 0,
+            "mutation_sites": [],
+            "parse_status": "wildtype_reference",
+        }]
+
+        skipped = {}
+        for _, row in counts_df.iterrows():
+            seq_id = str(row[primary_key])
+            hgvs_for_parse = self._strip_hgvs_prefix(seq_id)
+
+            if hgvs_for_parse == "_wt":
+                aa_seq = ref_aa_seq
+                mutation_sites = []
+                parse_status = "wildtype_row"
+            else:
+                substitutions = parse_hgvs_nt(hgvs_for_parse)
+                if not substitutions:
+                    skipped["unsupported_hgvs"] = skipped.get("unsupported_hgvs", 0) + 1
+                    continue
+
+                if reference_kind == "nucleotide":
+                    mut_nuc_seq = apply_substitutions(ref_nuc_seq, substitutions)
+                    if mut_nuc_seq is None:
+                        skipped["reference_nucleotide_mismatch"] = skipped.get("reference_nucleotide_mismatch", 0) + 1
+                        continue
+                    aa_seq = translate_nuc_sequence(mut_nuc_seq)
+                    if skip_stop_codons and "*" in aa_seq:
+                        skipped["stop_codon"] = skipped.get("stop_codon", 0) + 1
+                        continue
+                    mutation_sites = [
+                        i
+                        for i, (ref_aa, alt_aa) in enumerate(zip(ref_aa_seq, aa_seq))
+                        if ref_aa != alt_aa
+                    ]
+                    parse_status = "ok"
+                else:
+                    aa_seq, mutation_sites, reason = self._infer_aa_sequence_from_protein_reference(
+                        ref_aa_seq,
+                        substitutions,
+                        skip_stop_codons=skip_stop_codons,
+                    )
+                    if reason is not None:
+                        skipped[reason] = skipped.get(reason, 0) + 1
+                        continue
+                    parse_status = "ok"
+
+            sequence_to_protein_sequence[seq_id] = aa_seq
+            sequence_to_mutation_sites[seq_id] = mutation_sites
+            metadata_rows.append({
+                "SequenceIndex": seq_id,
+                primary_key: seq_id,
+                "accession": row.get("accession"),
+                "n_mutation_sites": len(mutation_sites),
+                "mutation_sites": mutation_sites,
+                "parse_status": parse_status,
+            })
+
+            for spec in count_specs:
+                if not self._replicate_selected(spec, use_replicates):
+                    continue
+                count = row.get(spec["column"])
+                frequency = float(count) if pd.notna(count) else 0.0
+                records.append({
+                    "SequenceIndex": seq_id,
+                    primary_key: seq_id,
+                    "Replicate": spec["replicate"],
+                    "ReplicateName": spec["replicate_name"],
+                    "Generation": spec["generation"],
+                    "Frequency": frequency,
+                    "CountColumn": spec["column"],
+                })
+
+        sequence_dataframe = pd.DataFrame(records)
+        if sequence_dataframe.empty:
+            raise ValueError("No MaveDB count rows remained after sequence reconstruction.")
+
+        metadata = pd.DataFrame(metadata_rows)
+        metadata.attrs["skipped_counts"] = skipped
+        metadata.attrs["reference_kind"] = reference_kind
+        return (
+            sequence_dataframe.reset_index(drop=True),
+            sequence_to_protein_sequence,
+            sequence_to_mutation_sites,
+            metadata,
+        )
+
+    def load_functional_scores(self) -> pd.DataFrame:
+        if self.input_data.kind != "cellular" or self.input_data.scores_csv_path is None:
+            raise ValueError("Functional score loading requires CellularDMSInput.scores_csv_path.")
+        scores = self._read_mavedb_csv(self.input_data.scores_csv_path)
+        primary_key = self.input_data.primary_key
+        if primary_key not in scores.columns:
+            raise ValueError(f"MaveDB scores file must contain primary key column {primary_key!r}.")
+        scores = scores.copy()
+        scores["SequenceIndex"] = scores[primary_key].astype(str)
+        self.scores_dataframe = scores
+        return scores
+
     def load_reference_sequence(self):
         """
         Load the reference sequence for the input DMS data.
         """
         if self.input_data.kind == 'cellular':
-            self.reference_sequence = get_reference_nuc_sequence(
-                self.input_data.reference_nuc_path
-            )
+            self.reference_sequence = self._read_sequence_file(self.input_data.reference_nuc_path)
+            reference_kind = self.input_data.reference_kind
+            if reference_kind == "auto":
+                reference_kind = self._detect_reference_kind(self.reference_sequence)
+            self.reference_kind = reference_kind
         elif self.input_data.kind == 'viral':
             self.reference_sequence = get_reference_sequence_from_wildtypes(
                 self.input_data.pre_files[0]
             )
+            self.reference_kind = "protein"
         else:
             raise ValueError(f"Unsupported DMS data kind: {self.input_data.kind}")
 
@@ -844,12 +1144,16 @@ class esmDMS:
                 self.sequence_dataframe,
                 self.sequence_to_protein_sequence,
                 self.sequence_to_mutation_sites,
-            ) = build_sequence_dataframe_mavedb(
+                self.sequence_metadata,
+            ) = self._build_sequence_dataframe_mavedb_primary_keyed(
                 self.input_data.mavedb_csv_path,
                 self.reference_sequence,
+                self.reference_kind,
                 self.input_data.use_replicates,
-                skip_stop_codons=drop_stop_codons
+                skip_stop_codons=drop_stop_codons,
             )
+            if self.input_data.scores_csv_path is not None:
+                self.load_functional_scores()
 
         elif self.input_data.kind == "viral":
             (
@@ -861,6 +1165,13 @@ class esmDMS:
                 self.input_data.post_files,
                 self.reference_sequence,
             )
+            self.sequence_metadata = pd.DataFrame({
+                "SequenceIndex": list(self.sequence_to_protein_sequence),
+                "mutation_sites": [
+                    self.sequence_to_mutation_sites[idx]
+                    for idx in self.sequence_to_protein_sequence
+                ],
+            })
 
         else:
             raise ValueError(f"Unsupported DMS data kind: {self.input_data.kind}")
@@ -918,7 +1229,7 @@ class esmDMS:
         if self.sequence_to_mutation_sites is None:
             raise ValueError("Mutation-site mapping is not available. Please run process_raw_data() first.")
 
-        seq_ids = sorted(self.sequence_dataframe['SequenceIndex'].unique())
+        seq_ids = sorted(self.sequence_to_protein_sequence, key=str)
         embeddings = self.embed_sequences(seq_ids)
 
         first_embedding = next((np.asarray(embedding) for embedding in embeddings.values() if embedding is not None), None)
@@ -970,7 +1281,7 @@ class esmDMS:
         logs_dir = batch_dir / "logs"
         logs_dir.mkdir(exist_ok=True)
 
-        seq_ids = [int(seq_id) for seq_id in sorted(self.sequence_dataframe["SequenceIndex"].unique())]
+        seq_ids = sorted(self.sequence_to_protein_sequence, key=str)
         if not seq_ids:
             raise ValueError("No sequences are available to embed.")
         payload = {
@@ -1228,7 +1539,7 @@ cd {Path.cwd()}
             if getattr(self, "sequence_to_mutation_sites", None) is None:
                 self.sequence_to_mutation_sites = payload.get("sequence_to_mutation_sites")
 
-            feature_types = ("mean_pool", "per_residue")
+            feature_types = ("mean_pool", "max_pool", "per_residue")
             if n_chunks is None:
                 feature_chunk_files = {
                     embedding_type: sorted(
@@ -1269,15 +1580,17 @@ cd {Path.cwd()}
                     ):
                         raise ValueError(f"Unexpected {embedding_type} feature chunk format in {path}.")
                     for layer_label, seq_to_features in chunk["features_by_layer"].items():
-                        merged_features.setdefault(layer_label, {"mean_pool": {}, "per_residue": {}})
+                        merged_features.setdefault(layer_label, {"mean_pool": {}, "max_pool": {}, "per_residue": {}})
                         merged_features[layer_label][embedding_type].update(seq_to_features)
 
             for layer_label, layer_features in merged_features.items():
                 if self._use_memory():
                     self.sequence_to_features[self._feature_key("none", layer_label, "mean_pool")] = layer_features["mean_pool"]
+                    self.sequence_to_features[self._feature_key("none", layer_label, "max_pool")] = layer_features["max_pool"]
                     self.sequence_to_features[self._feature_key("none", layer_label, "per_residue")] = layer_features["per_residue"]
                 if save_layers and self._use_disk():
                     self._save_pickle(layer_features["mean_pool"], self._embedding_path(layer_label, "mean_pool"))
+                    self._save_pickle(layer_features["max_pool"], self._embedding_path(layer_label, "max_pool"))
                     self._save_pickle(layer_features["per_residue"], self._embedding_path(layer_label, "per_residue"))
             return merged_features
 
@@ -1491,6 +1804,8 @@ cd {Path.cwd()}
         elif base_method == 'SAE':
             # Implement SAE abstraction here
             return self._sae_abstraction(embeddings, method_params)
+        elif base_method == 'DeltaSAE':
+            return self._delta_sae_abstraction(embeddings, method_params)
         elif base_method == 'SPCA':
             # Implement SPCA abstraction here
             return self._spca_abstraction(embeddings, method_params)
@@ -1549,6 +1864,7 @@ cd {Path.cwd()}
         sparsity_mode: SparsityMode = params.get("sparsity_mode", "normal")
         k: int | None = params.get("k")
         run_label: str | None = params.get("run_label")
+        pretrained_model_path: str | Path | None = params.get("pretrained_model_path")
         if sparsity_mode in {"topk", "batchtopk"} and (k is None or k <= 0):
             raise ValueError(
                 f"sparsity_mode={sparsity_mode!r} requires a positive integer 'k' in method_params."
@@ -1571,55 +1887,78 @@ cd {Path.cwd()}
         X_train = torch.from_numpy(X[train_idx]).to(device)
         X_test = torch.from_numpy(X[test_idx]).to(device) if len(test_idx) else None
 
-        # ── Model + optimizer ─────────────────────────────────────────────
-        model = SparseAutoencoder(
-            input_dim,
-            n_features,
-            normalize_decoder,
-            sparsity_mode=sparsity_mode,
-            k=k,
-        ).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-        # ── Training loop ─────────────────────────────────────────────────
         train_losses: list[float] = []
         test_losses: list[float] = []
-        for epoch in range(epochs):
-            model.train()
-            epoch_perm = torch.randperm(len(X_train), device=device)
-            epoch_loss = 0.0
-            n_batches = 0
-            for start in range(0, len(X_train), batch_size):
-                batch = X_train[epoch_perm[start : start + batch_size]]
-                optimizer.zero_grad()
-                x_hat, z = model(batch)
-                loss = torch.nn.functional.mse_loss(x_hat, batch)
-                # In topk / batchtopk modes the encoder masks activations directly,
-                # so the L1 penalty is redundant and is omitted (standard TopK-SAE recipe).
-                if sparsity_mode == "normal":
-                    loss = loss + sparsity_coeff * z.abs().mean()
-                loss.backward()
-                optimizer.step()
-                if normalize_decoder:
-                    model._renorm_decoder()
-                epoch_loss += loss.item()
-                n_batches += 1
-            train_losses.append(epoch_loss / max(n_batches, 1))
-
-            model.eval()
-            with torch.no_grad():
-                if X_test is not None:
-                    x_hat_t, _ = model(X_test)
-                    test_losses.append(torch.nn.functional.mse_loss(x_hat_t, X_test).item())
-                else:
-                    test_losses.append(float("nan"))
-
-            if (epoch + 1) % 50 == 0:
-                print(
-                    f"  SAE epoch {epoch + 1}/{epochs}  "
-                    f"train_loss={train_losses[-1]:.5f}  "
-                    f"test_loss={test_losses[-1]:.5f}"
+        checkpoint_active_mask = None
+        if pretrained_model_path is not None:
+            checkpoint = torch.load(Path(pretrained_model_path), map_location=device)
+            input_dim_ckpt = checkpoint.get("input_dim", input_dim)
+            if input_dim_ckpt != input_dim:
+                raise ValueError(
+                    f"Pretrained SAE input_dim={input_dim_ckpt} does not match embedding input_dim={input_dim}."
                 )
+            n_features = checkpoint.get("n_features", n_features)
+            normalize_decoder = checkpoint.get("normalize_decoder", normalize_decoder)
+            sparsity_mode = checkpoint.get("sparsity_mode", sparsity_mode)
+            k = checkpoint.get("k", k)
+            model = SparseAutoencoder(
+                input_dim,
+                n_features,
+                normalize_decoder,
+                sparsity_mode=sparsity_mode,
+                k=k,
+            ).to(device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            checkpoint_active_mask = checkpoint.get("active_mask")
+            print(f"Loaded pretrained SAE model from {pretrained_model_path}")
+        else:
+            # ── Model + optimizer ─────────────────────────────────────────
+            model = SparseAutoencoder(
+                input_dim,
+                n_features,
+                normalize_decoder,
+                sparsity_mode=sparsity_mode,
+                k=k,
+            ).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+            # ── Training loop ─────────────────────────────────────────────
+            for epoch in range(epochs):
+                model.train()
+                epoch_perm = torch.randperm(len(X_train), device=device)
+                epoch_loss = 0.0
+                n_batches = 0
+                for start in range(0, len(X_train), batch_size):
+                    batch = X_train[epoch_perm[start : start + batch_size]]
+                    optimizer.zero_grad()
+                    x_hat, z = model(batch)
+                    loss = torch.nn.functional.mse_loss(x_hat, batch)
+                    # In topk / batchtopk modes the encoder masks activations directly,
+                    # so the L1 penalty is redundant and is omitted (standard TopK-SAE recipe).
+                    if sparsity_mode == "normal":
+                        loss = loss + sparsity_coeff * z.abs().mean()
+                    loss.backward()
+                    optimizer.step()
+                    if normalize_decoder:
+                        model._renorm_decoder()
+                    epoch_loss += loss.item()
+                    n_batches += 1
+                train_losses.append(epoch_loss / max(n_batches, 1))
+
+                model.eval()
+                with torch.no_grad():
+                    if X_test is not None:
+                        x_hat_t, _ = model(X_test)
+                        test_losses.append(torch.nn.functional.mse_loss(x_hat_t, X_test).item())
+                    else:
+                        test_losses.append(float("nan"))
+
+                if (epoch + 1) % 50 == 0:
+                    print(
+                        f"  SAE epoch {epoch + 1}/{epochs}  "
+                        f"train_loss={train_losses[-1]:.5f}  "
+                        f"test_loss={test_losses[-1]:.5f}"
+                    )
 
         # ── Extract activations for all sequences ─────────────────────────
         model.eval()
@@ -1633,7 +1972,10 @@ cd {Path.cwd()}
         # Keep only neurons whose activation frequency is strictly in (0, 1):
         # exclude both fully-sparse (never fires) and fully-dense (always fires) features.
         act_freq = (Z_all > 0).mean(axis=0)
-        active_mask = (act_freq > 0.0) & (act_freq < 1.0)
+        if checkpoint_active_mask is not None:
+            active_mask = np.asarray(checkpoint_active_mask, dtype=bool)
+        else:
+            active_mask = (act_freq > 0.0) & (act_freq < 1.0)
         if not active_mask.any():
             print(
                 "Warning: no neurons had activation frequency strictly between 0 and 1. "
@@ -1701,6 +2043,33 @@ cd {Path.cwd()}
         return result
 
     #TODO Add a regular autoencoder abstraction as well
+
+    def _delta_sae_abstraction(self, embeddings: dict[str, np.ndarray], method_params: dict | None) -> dict[str, np.ndarray]:
+        """
+        Encode embeddings with an SAE and return each mutation's SAE activation
+        vector relative to the wildtype activation vector.
+        """
+        params = dict(method_params or {})
+        wildtype_key = params.get("wildtype_key")
+        if wildtype_key is None and self.input_data.kind == "cellular":
+            wildtype_key = self.input_data.wildtype_key
+        if wildtype_key is None:
+            raise ValueError("DeltaSAE requires a wildtype_key.")
+        if wildtype_key not in embeddings:
+            raise KeyError(
+                f"Wildtype key {wildtype_key!r} is not present in embeddings. "
+                "Run embeddings with the class-managed sequence_to_protein_sequence map."
+            )
+
+        sae_features = self._sae_abstraction(embeddings, params)
+        if wildtype_key not in sae_features:
+            raise KeyError(f"Wildtype key {wildtype_key!r} is not present in SAE features.")
+        wt_vector = np.asarray(sae_features[wildtype_key])
+        return {
+            seq_id: np.asarray(feature) - wt_vector
+            for seq_id, feature in sae_features.items()
+            if seq_id != wildtype_key
+        }
 
     def _spca_abstraction(self, embeddings: dict[str, np.ndarray], method_params: dict | None) -> dict[str, np.ndarray]:
         """
@@ -2215,6 +2584,239 @@ export TMPDIR="$SCRDIR"
             f"No inference results found for layer={layer}, "
             f"embedding_type={embedding_type}, abstraction_method={abstraction_method}, norm_scheme={norm_scheme}."
         )
+
+    def fitness_dataframe(
+        self,
+        layer: str | int,
+        abstraction_method: AbstractionMethod | str,
+        abstraction_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
+        norm_scheme: str = "none",
+        use_joint: bool = True,
+        baseline: float = 1.0,
+    ) -> pd.DataFrame:
+        """
+        Return inferred fitness for each mutation key.
+
+        Fitness is calculated as baseline + selection_coefficients dot features.
+        For DeltaSAE, the features are already mutant SAE activations minus the
+        wildtype SAE activation vector.
+        """
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme, embedding_type)
+        seq_ids, features = self._features_for_inference(
+            layer,
+            abstraction_method,
+            embedding_type,
+            norm_scheme,
+            abstraction_params,
+        )
+
+        rows = []
+        if use_joint and getattr(result, "s_joint", None) is not None:
+            fitness = baseline + features @ result.s_joint
+            rows.extend({
+                "SequenceIndex": seq_id,
+                "fitness": value,
+                "replicate": "joint",
+            } for seq_id, value in zip(seq_ids, fitness))
+        else:
+            for rep_idx in range(result.s.shape[0]):
+                fitness = baseline + features @ result.s[rep_idx]
+                rows.extend({
+                    "SequenceIndex": seq_id,
+                    "fitness": value,
+                    "replicate": rep_idx + 1,
+                } for seq_id, value in zip(seq_ids, fitness))
+        return pd.DataFrame(rows)
+
+    def plot_functional_score_comparison(
+        self,
+        layer: str | int,
+        abstraction_method: AbstractionMethod | str,
+        abstraction_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
+        norm_scheme: str = "none",
+        score_col: str = "score",
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, pd.DataFrame, dict]:
+        """
+        Compare inferred fitness against averaged MaveDB functional scores.
+        """
+        if self.scores_dataframe is None:
+            self.load_functional_scores()
+        if score_col not in self.scores_dataframe.columns:
+            raise ValueError(f"Score column {score_col!r} is not present in scores_dataframe.")
+
+        fitness_df = self.fitness_dataframe(
+            layer,
+            abstraction_method,
+            abstraction_params,
+            embedding_type,
+            norm_scheme,
+            use_joint=True,
+            baseline=1.0,
+        )
+        score_df = self.scores_dataframe[["SequenceIndex", score_col]].copy()
+        score_df = score_df.rename(columns={score_col: "functional_score"})
+        comparison_df = fitness_df[fitness_df["replicate"] == "joint"].merge(
+            score_df,
+            on="SequenceIndex",
+            how="inner",
+        )
+        comparison_df = comparison_df[
+            np.isfinite(comparison_df["fitness"]) & np.isfinite(comparison_df["functional_score"])
+        ].copy()
+        rho = self._safe_corr(comparison_df["fitness"], comparison_df["functional_score"], spearmanr)
+
+        sns.set_theme(style="darkgrid")
+        fig, ax = plt.subplots(figsize=(5.6, 5.0))
+        sns.scatterplot(
+            data=comparison_df,
+            x="functional_score",
+            y="fitness",
+            s=18,
+            alpha=0.6,
+            edgecolor=None,
+            ax=ax,
+        )
+        ax.set_xlabel(f"MaveDB functional score ({score_col})")
+        ax.set_ylabel("Inferred fitness")
+        ax.set_title(
+            f"{self._abstraction_type(abstraction_method)} {self._embedding_type(embedding_type)} "
+            f"{self._layer_label(layer)}\nSpearman rho={rho:.3f}, n={len(comparison_df)}"
+        )
+        fig.tight_layout()
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+
+        stats = {
+            "layer": layer,
+            "embedding_type": self._embedding_type(embedding_type),
+            "abstraction_method": self._abstraction_type(abstraction_method),
+            "score_col": score_col,
+            "spearman_rho": rho,
+            "n": len(comparison_df),
+        }
+        return fig, comparison_df, stats
+
+    def plot_regularization_curve(
+        self,
+        layer: str | int,
+        abstraction_method: AbstractionMethod | str,
+        abstraction_params: dict | None = None,
+        embedding_type: EmbeddingType | None = None,
+        norm_scheme: str = "none",
+        gamma_values: np.ndarray | None = None,
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, pd.DataFrame]:
+        """
+        Sweep gamma and plot replicate selection-coefficient consistency.
+        """
+        if self.sequence_dataframe is None:
+            raise ValueError("Sequence dataframe is not available. Please run process_raw_data() first.")
+        seq_to_features = self._load_abstracted_features(
+            layer,
+            abstraction_method,
+            embedding_type,
+            abstraction_params,
+        )
+        sequence_dataframe = self.sequence_dataframe
+        sequence_dataframe, seq_to_features = self._drop_missing_features(
+            sequence_dataframe,
+            seq_to_features,
+            "Regularization sweep",
+        )
+        self._require_vector_features(seq_to_features, "Regularization sweep")
+        if norm_scheme is not None and norm_scheme != "none":
+            seq_ids = list(seq_to_features)
+            features = np.asarray([seq_to_features[seq_id] for seq_id in seq_ids])
+            features = self._normalize_features(features, norm_scheme)
+            seq_to_features = dict(zip(seq_ids, features))
+
+        gamma_values, s_by_gamma, _ = infer_gamma_range(
+            sequence_dataframe,
+            seq_to_features,
+            gamma_values=gamma_values,
+        )
+        rows = []
+        for gamma_idx, gamma in enumerate(gamma_values):
+            pair_corrs = []
+            for rep_i, rep_j in self._rep_pairs(s_by_gamma.shape[1]):
+                rho = self._safe_corr(s_by_gamma[gamma_idx, rep_i], s_by_gamma[gamma_idx, rep_j], pearsonr)
+                pair_corrs.append(rho)
+                rows.append({
+                    "gamma": gamma,
+                    "rep_i": rep_i + 1,
+                    "rep_j": rep_j + 1,
+                    "pearson_r": rho,
+                })
+            rows.append({
+                "gamma": gamma,
+                "rep_i": "mean",
+                "rep_j": "mean",
+                "pearson_r": np.nanmean(pair_corrs) if pair_corrs else np.nan,
+            })
+        reg_df = pd.DataFrame(rows)
+
+        sns.set_theme(style="darkgrid")
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        mean_df = reg_df[reg_df["rep_i"] == "mean"]
+        ax.plot(mean_df["gamma"], mean_df["pearson_r"], marker="o", label="Mean pairwise r")
+        pair_df = reg_df[reg_df["rep_i"] != "mean"]
+        for (rep_i, rep_j), pair_rows in pair_df.groupby(["rep_i", "rep_j"]):
+            ax.plot(pair_rows["gamma"], pair_rows["pearson_r"], alpha=0.35, linewidth=1, label=f"Rep {rep_i} vs {rep_j}")
+        ax.set_xscale("log")
+        ax.set_ylim(-1, 1)
+        ax.set_xlabel("Regularization strength (gamma)")
+        ax.set_ylabel("Selection coefficient Pearson r")
+        ax.set_title(f"Regularization sweep, {self._layer_label(layer)}")
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+        fig.tight_layout()
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        return fig, reg_df
+
+    def plot_selection_coefficient_distribution(
+        self,
+        layer: str | int,
+        abstraction_method: AbstractionMethod | str,
+        embedding_type: EmbeddingType | None = None,
+        norm_scheme: str = "none",
+        joint: bool = True,
+        output_path: str | Path | None = None,
+    ) -> tuple[plt.Figure, pd.DataFrame]:
+        """
+        Plot the distribution of inferred selection coefficients.
+        """
+        result = self.load_inference_results(layer, abstraction_method, norm_scheme, embedding_type)
+        rows = []
+        if joint and getattr(result, "s_joint", None) is not None:
+            rows = [{"coefficient": value, "replicate": "joint"} for value in result.s_joint]
+        else:
+            for rep_idx in range(result.s.shape[0]):
+                rows.extend({
+                    "coefficient": value,
+                    "replicate": rep_idx + 1,
+                } for value in result.s[rep_idx])
+        coef_df = pd.DataFrame(rows)
+
+        sns.set_theme(style="darkgrid")
+        fig, ax = plt.subplots(figsize=(6.0, 4.2))
+        sns.histplot(data=coef_df, x="coefficient", hue="replicate", bins=60, kde=True, ax=ax)
+        ax.axvline(0, color="black", linewidth=1, linestyle="--", alpha=0.7)
+        ax.set_xlabel("Selection coefficient")
+        ax.set_ylabel("Feature count")
+        ax.set_title(f"Selection coefficient distribution, {self._layer_label(layer)}")
+        fig.tight_layout()
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        return fig, coef_df
 
     @staticmethod
     def _safe_corr(x, y, corr_fn):
