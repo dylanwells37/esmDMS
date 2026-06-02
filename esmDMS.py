@@ -1223,22 +1223,57 @@ class esmDMS:
         return "ESMC" in model_name or "esmc" in model_name.lower()
 
     @staticmethod
-    def _load_embedding_model(model_name: str):
+    def _resolve_torch_dtype(name: str | None):
+        if not name:
+            return None
+        key = str(name).lower()
+        if key in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if key in {"fp16", "float16", "half"}:
+            return torch.float16
+        if key in {"fp32", "float32"}:
+            return torch.float32
+        raise ValueError(f"Unknown torch_dtype: {name!r}")
+
+    @staticmethod
+    def _load_embedding_model(model_name: str, torch_dtype: str | None = None):
         """Load tokenizer + HF model, picking the right class for ESMC vs ESM2.
 
-        ESMC is published with an MLM head and large variants (e.g. 6B) need
-        accelerate-style sharding, so it is loaded via AutoModelForMaskedLM
-        with device_map="auto". ESM2 keeps the existing AutoModel path.
+        ESMC is published with an MLM head and is loaded via
+        AutoModelForMaskedLM. ESM2 keeps the existing AutoModel path.
 
-        HF_TOKEN (env var or module constant) is forwarded to from_pretrained
-        so gated checkpoints can be downloaded.
+        device_map="auto" is used only when CUDA is available — accelerate
+        leaves rotary inv_freq buffers on the meta device on MPS/CPU, which
+        raises at first forward. On MPS/CPU we load normally and move with
+        .to(device).
+
+        torch_dtype (arg or ESMDMS_TORCH_DTYPE env var) controls precision.
+        ESMC on CUDA defaults to bfloat16 so the 6B variant fits in ~12 GB.
+        HF_TOKEN is forwarded to from_pretrained for gated checkpoints.
         """
         token = HF_TOKEN or None
+        dtype_name = torch_dtype or os.environ.get("ESMDMS_TORCH_DTYPE")
+        dtype = esmDMS._resolve_torch_dtype(dtype_name)
+        is_esmc = esmDMS._is_esmc_model(model_name)
+        if dtype is None and is_esmc and torch.cuda.is_available():
+            dtype = torch.bfloat16
+
+        load_kwargs: dict = {"token": token}
+        if dtype is not None:
+            load_kwargs["torch_dtype"] = dtype
+
         tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False, token=token)
-        if esmDMS._is_esmc_model(model_name):
-            model = AutoModelForMaskedLM.from_pretrained(model_name, device_map="auto", token=token)
+        if is_esmc:
+            if torch.cuda.is_available():
+                model = AutoModelForMaskedLM.from_pretrained(
+                    model_name, device_map="auto", **load_kwargs
+                )
+            else:
+                model = AutoModelForMaskedLM.from_pretrained(model_name, **load_kwargs)
+                if torch.backends.mps.is_available():
+                    model = model.to("mps")
         else:
-            model = AutoModel.from_pretrained(model_name, token=token)
+            model = AutoModel.from_pretrained(model_name, **load_kwargs)
         model.eval()
         return tokenizer, model
 
@@ -1347,11 +1382,14 @@ class esmDMS:
         max_active_jobs: int | None = None,
         job_name: str = "esm_embed",
         partition: str = "dept_cpu",
+        gres: str | None = None,
         cpus_per_task: int = 4,
         mem: str = "16G",
         time: str = "06:00:00",
         python_executable: str = "python3",
         scratch_root: str | Path = "/scr",
+        hf_home: str | Path | None = None,
+        torch_dtype: str | None = None,
         submit: bool = False,
     ) -> dict[str, Path | str]:
         """
@@ -1363,6 +1401,11 @@ class esmDMS:
         them back to job_dir. After the jobs finish, call
         merge_embedding_batch_outputs(job_dir).
         Set max_active_jobs to limit concurrently active Slurm array tasks.
+
+        For GPU runs (e.g. ESMC-6B): set partition="dept_gpu" (or "any_gpu"),
+        gres="gpu:l40:1" (or "gpu:a100:1"), and an hf_home on shared storage
+        so array tasks share the downloaded weights. torch_dtype="bfloat16"
+        is the default for ESMC on CUDA.
         """
         if not self._use_disk():
             raise ValueError("Embedding batch jobs require local_or_disk to be 'disk' or 'both'.")
@@ -1405,10 +1448,17 @@ class esmDMS:
         array_spec = f"0-{n_chunks - 1}"
         if max_active_jobs is not None:
             array_spec = f"{array_spec}%{max_active_jobs}"
+        gres_line = f"#SBATCH --gres={gres}\n" if gres else ""
+        env_exports = []
+        if hf_home is not None:
+            env_exports.append(f"export HF_HOME={hf_home}")
+        if torch_dtype is not None:
+            env_exports.append(f"export ESMDMS_TORCH_DTYPE={torch_dtype}")
+        env_block = ("\n".join(env_exports) + "\n") if env_exports else ""
         script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH -p {partition}
-#SBATCH --cpus-per-task={cpus_per_task}
+{gres_line}#SBATCH --cpus-per-task={cpus_per_task}
 #SBATCH --time={time}
 #SBATCH --mem={mem}
 #SBATCH --array={array_spec}
@@ -1418,7 +1468,7 @@ class esmDMS:
 set -euo pipefail
 cd {Path.cwd()}
 
-SCRDIR={scratch_root}/${{SLURM_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}
+{env_block}SCRDIR={scratch_root}/${{SLURM_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}
 mkdir -p "$SCRDIR"
 export TMPDIR="$SCRDIR"
 
