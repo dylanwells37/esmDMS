@@ -15,7 +15,7 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import pearsonr, spearmanr
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 
 from embedding_scripts.embed_sequences import (
     CODON2AA,
@@ -23,7 +23,7 @@ from embedding_scripts.embed_sequences import (
     build_sequence_dataframe_mavedb,
     get_reference_sequence_from_wildtypes,
     build_sequence_dataframe,
-    embed_sequence,
+    pool_sequence_representation,
     parse_hgvs_nt,
     apply_substitutions,
     translate_nuc_sequence,
@@ -1211,6 +1211,47 @@ class esmDMS:
             raise ValueError(f"Unsupported DMS data kind: {self.input_data.kind}")
 
 
+    @staticmethod
+    def _is_esmc_model(model_name: str) -> bool:
+        return "ESMC" in model_name or "esmc" in model_name.lower()
+
+    @staticmethod
+    def _load_embedding_model(model_name: str):
+        """Load tokenizer + HF model, picking the right class for ESMC vs ESM2.
+
+        ESMC is published with an MLM head and large variants (e.g. 6B) need
+        accelerate-style sharding, so it is loaded via AutoModelForMaskedLM
+        with device_map="auto". ESM2 keeps the existing AutoModel path.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False)
+        if esmDMS._is_esmc_model(model_name):
+            model = AutoModelForMaskedLM.from_pretrained(model_name, device_map="auto")
+        else:
+            model = AutoModel.from_pretrained(model_name)
+        model.eval()
+        return tokenizer, model
+
+    @staticmethod
+    def _embed_sequence(sequence: str, tokenizer, model) -> np.ndarray:
+        """Embed one sequence, moving inputs to the model's device first.
+
+        Returns (num_layers, embedding_dim) of mean-pooled hidden states, matching
+        embed_scripts.embed_sequences.embed_sequence but device-safe for ESMC.
+        """
+        inputs = tokenizer(sequence, return_tensors="pt", add_special_tokens=True)
+        try:
+            device = model.device
+        except AttributeError:
+            device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+        layer_embeddings = [
+            pool_sequence_representation(layer, inputs)
+            for layer in outputs.hidden_states
+        ]
+        return np.vstack(layer_embeddings)
+
     def embed_sequences(self, seq_ids: list[str], out_path: str | None = None) -> dict[str, np.ndarray]:
         """
         Embed protein sequences using the specified ESM model and embedding method.
@@ -1231,15 +1272,13 @@ class esmDMS:
         """
         esm_model = f"{self.config.embedding_model}"
 
-        tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
-        model = AutoModel.from_pretrained(esm_model)
-        model.eval()
+        tokenizer, model = self._load_embedding_model(esm_model)
 
         seq_idx_to_embedding = {}
 
         for idx in seq_ids:
             prot_seq = self.sequence_to_protein_sequence[idx]
-            layer_embeddings = embed_sequence(prot_seq, tokenizer, model)
+            layer_embeddings = self._embed_sequence(prot_seq, tokenizer, model)
             seq_idx_to_embedding[idx] = layer_embeddings
 
         if self._use_memory():
@@ -1402,14 +1441,12 @@ export TMPDIR="$SCRDIR"
             raise ValueError(f"chunk_idx must be between 0 and {n_chunks - 1}.")
 
         esm_model = f"{payload['embedding_model']}"
-        tokenizer = AutoTokenizer.from_pretrained(esm_model, do_lower_case=False)
-        model = AutoModel.from_pretrained(esm_model)
-        model.eval()
+        tokenizer, model = esmDMS._load_embedding_model(esm_model)
 
         out = {}
         for seq_id in chunks[chunk_idx].tolist():
             prot_seq = payload["sequence_to_protein_sequence"][seq_id]
-            out[seq_id] = embed_sequence(prot_seq, tokenizer, model)
+            out[seq_id] = esmDMS._embed_sequence(prot_seq, tokenizer, model)
         if payload.get("sequence_to_mutation_sites") is not None:
             feature_chunks = esmDMS._build_feature_chunks(
                 out,
