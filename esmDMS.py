@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import pickle
 import re
 import shutil
@@ -8,6 +9,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+import time
+
+# Hugging Face access token for gated models (e.g. biohub/ESMC-6B).
+# Prefer the HF_TOKEN env var; fall back to the constant below if you must
+# paste the token directly. Do NOT commit a real token to the repo.
+HF_TOKEN: str | None = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
 
 import numpy as np
 import pandas as pd
@@ -1222,12 +1229,16 @@ class esmDMS:
         ESMC is published with an MLM head and large variants (e.g. 6B) need
         accelerate-style sharding, so it is loaded via AutoModelForMaskedLM
         with device_map="auto". ESM2 keeps the existing AutoModel path.
+
+        HF_TOKEN (env var or module constant) is forwarded to from_pretrained
+        so gated checkpoints can be downloaded.
         """
-        tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False)
+        token = HF_TOKEN or None
+        tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False, token=token)
         if esmDMS._is_esmc_model(model_name):
-            model = AutoModelForMaskedLM.from_pretrained(model_name, device_map="auto")
+            model = AutoModelForMaskedLM.from_pretrained(model_name, device_map="auto", token=token)
         else:
-            model = AutoModel.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name, token=token)
         model.eval()
         return tokenizer, model
 
@@ -1252,7 +1263,8 @@ class esmDMS:
         ]
         return np.vstack(layer_embeddings)
 
-    def embed_sequences(self, seq_ids: list[str], out_path: str | None = None) -> dict[str, np.ndarray]:
+    def embed_sequences(self, seq_ids: list[str], out_path: str | None = None,
+                        verbose: bool = False) -> dict[str, np.ndarray]:
         """
         Embed protein sequences using the specified ESM model and embedding method.
         This function will only embed the sequences in the parameter, I will
@@ -1276,10 +1288,16 @@ class esmDMS:
 
         seq_idx_to_embedding = {}
 
+        current_time = time.time()
         for idx in seq_ids:
             prot_seq = self.sequence_to_protein_sequence[idx]
             layer_embeddings = self._embed_sequence(prot_seq, tokenizer, model)
             seq_idx_to_embedding[idx] = layer_embeddings
+            if verbose:
+                elapsed = time.time() - current_time
+                print(f"Embedded sequence {idx} in {elapsed:.2f} seconds.")
+                current_time = time.time()
+
 
         if self._use_memory():
             self.sequence_to_embeddings.update(seq_idx_to_embedding)
@@ -1290,7 +1308,7 @@ class esmDMS:
         return seq_idx_to_embedding
     
 
-    def embed_all_sequences(self, layer: str = "all") -> None:
+    def embed_all_sequences(self, layer: str = "all", test_num: int | None = None) -> None:
         """
         Embed all sequences and cache compact derived features by layer.
 
@@ -1302,8 +1320,13 @@ class esmDMS:
         if self.sequence_to_mutation_sites is None:
             raise ValueError("Mutation-site mapping is not available. Please run process_raw_data() first.")
 
+        verbose = False
         seq_ids = sorted(self.sequence_to_protein_sequence, key=str)
-        embeddings = self.embed_sequences(seq_ids)
+        if test_num is not None:
+            seq_ids = seq_ids[:test_num]
+            verbose = True
+        
+        embeddings = self.embed_sequences(seq_ids, verbose=verbose)
 
         first_embedding = next((np.asarray(embedding) for embedding in embeddings.values() if embedding is not None), None)
         if first_embedding is None:
