@@ -1264,13 +1264,21 @@ class esmDMS:
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False, token=token)
         if is_esmc:
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                # Multi-GPU: shard across devices. accelerate handles meta->real
+                # initialization for all state-dict tensors.
                 model = AutoModelForMaskedLM.from_pretrained(
                     model_name, device_map="auto", **load_kwargs
                 )
             else:
+                # Single-GPU (or CPU/MPS): load normally and move. Avoids
+                # device_map="auto", which leaves ESMC's non-persistent rotary
+                # buffer (inv_freq) on the meta device because it isn't in the
+                # state dict for accelerate to materialize.
                 model = AutoModelForMaskedLM.from_pretrained(model_name, **load_kwargs)
-                if torch.backends.mps.is_available():
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+                elif torch.backends.mps.is_available():
                     model = model.to("mps")
         else:
             model = AutoModel.from_pretrained(model_name, **load_kwargs)
