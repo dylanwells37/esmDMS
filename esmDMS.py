@@ -1260,7 +1260,7 @@ class esmDMS:
 
         load_kwargs: dict = {"token": token}
         if dtype is not None:
-            load_kwargs["torch_dtype"] = dtype
+            load_kwargs["dtype"] = dtype
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False, token=token)
         if is_esmc:
