@@ -23,7 +23,8 @@ data
 testing
 plots/
 plots/*
-
+.venv*
+*logs*
 
 # Mac hidden files
 .DS_Store
