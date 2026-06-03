@@ -1,0 +1,44 @@
+warning: HF_TOKEN is unset; gated checkpoints will fail to download.
+/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:435: UserWarning: 
+    Found GPU0 NVIDIA TITAN X (Pascal) which is of cuda capability 6.1.
+    Minimum and Maximum cuda capability supported by this version of PyTorch is
+    (7.0) - (12.0)
+    
+  queued_call()
+/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:435: UserWarning: 
+    Please install PyTorch with a following CUDA
+    configurations:  12.6 following instructions at
+    https://pytorch.org/get-started/locally/
+    
+  queued_call()
+/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:435: UserWarning: 
+NVIDIA TITAN X (Pascal) with CUDA capability sm_61 is not compatible with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities sm_70 sm_75 sm_80 sm_86 sm_90 sm_100 sm_120.
+If you want to use the NVIDIA TITAN X (Pascal) GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+
+  queued_call()
+[transformers] You are using a model of type `esmc` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Traceback (most recent call last):
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/transformers/models/auto/configuration_auto.py", line 405, in from_pretrained
+    config_class = CONFIG_MAPPING[config_dict["model_type"]]
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/transformers/models/auto/configuration_auto.py", line 105, in __getitem__
+    raise KeyError(key)
+KeyError: 'esmc'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/job_scripts/esmc_smoke_test.py", line 49, in <module>
+    raise SystemExit(main())
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/job_scripts/esmc_smoke_test.py", line 38, in main
+    tokenizer, model = esmDMS._load_embedding_model(MODEL)
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/esmDMS.py", line 1268, in _load_embedding_model
+    model = AutoModelForMaskedLM.from_pretrained(
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/transformers/models/auto/auto_factory.py", line 339, in from_pretrained
+    config, kwargs = AutoConfig.from_pretrained(
+  File "/net/dali/home/barton/dhw28/popDMS/esmDMS/.venv/lib/python3.10/site-packages/transformers/models/auto/configuration_auto.py", line 407, in from_pretrained
+    raise ValueError(
+ValueError: The checkpoint you are trying to load has model type `esmc` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+
+You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`

@@ -6,3 +6,5 @@ scipy
 seaborn
 torch
 transformers
+xformers
+ipykernel
