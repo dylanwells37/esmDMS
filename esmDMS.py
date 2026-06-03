@@ -1292,8 +1292,9 @@ class esmDMS:
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = model(**inputs, output_hidden_states=True)
+        # numpy has no bfloat16 dtype, so cast each layer to fp32 before pooling.
         layer_embeddings = [
-            pool_sequence_representation(layer, inputs)
+            pool_sequence_representation(layer.float(), inputs)
             for layer in outputs.hidden_states
         ]
         return np.vstack(layer_embeddings)
@@ -1383,6 +1384,7 @@ class esmDMS:
         job_name: str = "esm_embed",
         partition: str = "dept_cpu",
         gres: str | None = None,
+        constraint: str | None = None,
         cpus_per_task: int = 4,
         mem: str = "16G",
         time: str = "06:00:00",
@@ -1403,9 +1405,13 @@ class esmDMS:
         Set max_active_jobs to limit concurrently active Slurm array tasks.
 
         For GPU runs (e.g. ESMC-6B): set partition="dept_gpu" (or "any_gpu"),
-        gres="gpu:l40:1" (or "gpu:a100:1"), and an hf_home on shared storage
-        so array tasks share the downloaded weights. torch_dtype="bfloat16"
-        is the default for ESMC on CUDA.
+        gres="gpu:1", constraint="L40|A100" (or "C8" for any Ampere+ card),
+        and an hf_home on shared storage so array tasks share the downloaded
+        weights. torch_dtype="bfloat16" is the default for ESMC on CUDA.
+
+        Note: this cluster encodes GPU model as a Slurm feature/constraint,
+        not as a typed GRES — use gres="gpu:N" + constraint="L40", not
+        gres="gpu:l40:N".
         """
         if not self._use_disk():
             raise ValueError("Embedding batch jobs require local_or_disk to be 'disk' or 'both'.")
@@ -1449,6 +1455,7 @@ class esmDMS:
         if max_active_jobs is not None:
             array_spec = f"{array_spec}%{max_active_jobs}"
         gres_line = f"#SBATCH --gres={gres}\n" if gres else ""
+        constraint_line = f"#SBATCH --constraint={constraint}\n" if constraint else ""
         env_exports = []
         if hf_home is not None:
             env_exports.append(f"export HF_HOME={hf_home}")
@@ -1458,7 +1465,7 @@ class esmDMS:
         script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH -p {partition}
-{gres_line}#SBATCH --cpus-per-task={cpus_per_task}
+{gres_line}{constraint_line}#SBATCH --cpus-per-task={cpus_per_task}
 #SBATCH --time={time}
 #SBATCH --mem={mem}
 #SBATCH --array={array_spec}
