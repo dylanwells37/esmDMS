@@ -2017,7 +2017,8 @@ cd {Path.cwd()}
     def create_feature_space(self, layer: str, 
                             method: AbstractionMethod = 'none',
                             method_params: dict | None = None,
-                            embedding_type: EmbeddingType | None = None) -> dict[str, np.ndarray]:
+                            embedding_type: EmbeddingType | None = None,
+                            force_recompute: bool = False) -> dict[str, np.ndarray]:
         """
         Create an abstraction of the embeddings using the specified method.
 
@@ -2025,16 +2026,20 @@ cd {Path.cwd()}
         -----------
         layer : str
             The layer from which to extract features.
-        method : Literal['none', 'PCA', 'SAE', 'SPCA']
+        method : Literal['none', 'PCA', 'SAE', 'DeltaSAE', 'SPCA']
             The method to use for creating the abstraction.
         method_params : dict | None
             Parameters for the abstraction method.
+        force_recompute : bool
+            If True, bypass cached abstracted features and recompute them.
 
         Returns:
         --------
         dict[str, np.ndarray]
             A dictionary mapping sequence indices to their corresponding features.
         """
+        _params = dict(method_params or {})
+        force_recompute = bool(force_recompute or _params.pop("force_recompute", False))
         embedding_type = self._embedding_type(embedding_type)
         method = self._abstraction_type(method)
         if method == 'none':
@@ -2055,11 +2060,11 @@ cd {Path.cwd()}
         self._require_vector_features(embeddings, f"{method} abstraction with embedding_type={embedding_type!r}")
         key = self._feature_key(method, layer, embedding_type)
 
-        if self._use_memory() and self.sequence_to_features.get(key) is not None:
+        if not force_recompute and self._use_memory() and self.sequence_to_features.get(key) is not None:
             #print("Abstracted features already exist in memory. Returning existing features.")
             return self.sequence_to_features[key]
 
-        if self._use_disk():
+        if not force_recompute and self._use_disk():
             save_path = self._feature_path(method, layer, embedding_type)
             if save_path.is_file():
                 #print(f"Abstracted already saved in {save_path}")
@@ -2069,7 +2074,6 @@ cd {Path.cwd()}
                 return abstracted_features
 
         #print("No abstracted features found. Creating new features.")
-        _params = dict(method_params or {})
         _params.setdefault("_layer", layer)
         _params.setdefault("_embedding_type", embedding_type)
         abstracted_features = self._create_feature_space(embeddings, method, _params)
@@ -2551,7 +2555,7 @@ cd {Path.cwd()}
         -----------
         layer : str
             The layer from which to extract features.
-        method : Literal['none', 'PCA', 'SAE', 'SPCA']
+        method : Literal['none', 'PCA', 'SAE', 'DeltaSAE', 'SPCA']
             The method used for abstraction.
         method_params : dict | None
             Parameters for the abstraction method.
@@ -2561,6 +2565,8 @@ cd {Path.cwd()}
         dict[str, np.ndarray] | None
             A dictionary mapping sequence indices to their corresponding abstracted features, or None if no saved features are found.
         """
+        params = dict(method_params or {})
+        force_recompute = bool(params.pop("force_recompute", False))
         embedding_type = self._embedding_type(embedding_type)
         method = self._abstraction_type(method)
         if method == 'none':
@@ -2568,12 +2574,11 @@ cd {Path.cwd()}
             return self.load_embeddings(layer, embedding_type)
 
         key = self._feature_key(method, layer, embedding_type)
-        if self._use_memory() and self.sequence_to_features.get(key) is not None:
+        if not force_recompute and self._use_memory() and self.sequence_to_features.get(key) is not None:
             #print("Abstracted features already exist in memory. Returning existing features.")
             return self.sequence_to_features[key]
-            return self.sequence_to_features[key]
 
-        if self._use_disk():
+        if not force_recompute and self._use_disk():
             save_path = self._feature_path(method, layer, embedding_type)
             if save_path.is_file():
                 #print(f"Loading abstracted features from {save_path}")
@@ -2582,7 +2587,7 @@ cd {Path.cwd()}
                     self.sequence_to_features[key] = abstracted_features
                 return abstracted_features
 
-        return self.create_feature_space(layer, method, method_params, embedding_type)
+        return self.create_feature_space(layer, method, params, embedding_type, force_recompute)
 
     @staticmethod
     def _normalize_features(features, norm_scheme):
