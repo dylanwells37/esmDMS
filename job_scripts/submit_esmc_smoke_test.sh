@@ -4,8 +4,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=C8
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=00:30:00
+#SBATCH --mem=24G
+#SBATCH --time=00:10:00
 #SBATCH --output=job_scripts/logs/esmc_smoke-%j.out
 #SBATCH --error=job_scripts/logs/esmc_smoke-%j.err
 
@@ -23,6 +23,9 @@
 set -euo pipefail
 mkdir -p job_scripts/logs
 
+source $HOME/miniforge3/etc/profile.d/conda.sh
+conda activate myproj
+
 # Pin HF cache to a shared location so we don't redownload per job. Edit
 # this path to point at your own scratch/home share.
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
@@ -31,7 +34,7 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export ESMDMS_TORCH_DTYPE="${ESMDMS_TORCH_DTYPE:-bfloat16}"
 
 # Set ESMC_MODEL=biohub/ESMC-6B to actually exercise the 6B path.
-export ESMC_MODEL="${ESMC_MODEL:-biohub/ESMC-6B}"
+export ESMC_MODEL="${ESMC_MODEL:-biohub/ESMC-600M}"
 
 # HF_TOKEN must be exported in your shell environment for gated models.
 if [ -z "${HF_TOKEN:-}" ]; then

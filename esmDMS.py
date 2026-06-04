@@ -30,7 +30,7 @@ from embedding_scripts.embed_sequences import (
     build_sequence_dataframe_mavedb,
     get_reference_sequence_from_wildtypes,
     build_sequence_dataframe,
-    pool_sequence_representation,
+    all_residue_representation,
     parse_hgvs_nt,
     apply_substitutions,
     translate_nuc_sequence,
@@ -1289,23 +1289,120 @@ class esmDMS:
     def _embed_sequence(sequence: str, tokenizer, model) -> np.ndarray:
         """Embed one sequence, moving inputs to the model's device first.
 
-        Returns (num_layers, embedding_dim) of mean-pooled hidden states, matching
-        embed_scripts.embed_sequences.embed_sequence but device-safe for ESMC.
+        Returns (num_residues, num_layers, embedding_dim) hidden states, matching
+        embedding_scripts.embed_sequences.embed_sequence but device-safe for ESMC.
         """
-        inputs = tokenizer(sequence, return_tensors="pt", add_special_tokens=True)
+        inputs = tokenizer(
+            sequence,
+            return_tensors="pt",
+            add_special_tokens=True,
+            return_special_tokens_mask=True,
+        )
         try:
             device = model.device
         except AttributeError:
             device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        model_inputs = {
+            key: value
+            for key, value in inputs.items()
+            if key != "special_tokens_mask"
+        }
         with torch.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
-        # numpy has no bfloat16 dtype, so cast each layer to fp32 before pooling.
+            outputs = model(**model_inputs, output_hidden_states=True)
+        # numpy has no bfloat16 dtype, so cast each layer to fp32 before exporting.
         layer_embeddings = [
-            pool_sequence_representation(layer.float(), inputs)
+            all_residue_representation(layer.float(), inputs)
             for layer in outputs.hidden_states
         ]
-        return np.vstack(layer_embeddings)
+        return np.stack(layer_embeddings, axis=1)
+
+    @staticmethod
+    def _embed_sequence_feature_chunks(
+        seq_id: str,
+        sequence: str,
+        tokenizer,
+        model,
+        mutation_sites: list[int],
+        layer: str | int = "all",
+    ) -> dict:
+        """Derive ESMC layer features without materializing all hidden states."""
+        if not (hasattr(model, "esmc") and hasattr(model.esmc, "embed")):
+            embeddings = {seq_id: esmDMS._embed_sequence(sequence, tokenizer, model)}
+            return esmDMS._build_feature_chunks(embeddings, layer, {seq_id: mutation_sites})
+
+        inputs = tokenizer(
+            sequence,
+            return_tensors="pt",
+            add_special_tokens=True,
+            return_special_tokens_mask=True,
+        )
+        try:
+            device = model.device
+        except AttributeError:
+            device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        attention_mask = inputs.get("attention_mask")
+        special_mask = inputs.get("special_tokens_mask")
+        if attention_mask is None:
+            residue_mask = torch.ones_like(inputs["input_ids"], dtype=torch.bool)
+        else:
+            residue_mask = attention_mask.bool()
+        if special_mask is not None:
+            residue_mask = residue_mask & ~special_mask.bool()
+        residue_mask_1d = residue_mask.squeeze(0)
+
+        n_residues = int(residue_mask_1d.sum().item())
+        if n_residues == 0:
+            raise ValueError(f"No residue tokens found for sequence {seq_id}.")
+        if mutation_sites:
+            if max(mutation_sites) >= n_residues or min(mutation_sites) < 0:
+                raise ValueError(
+                    f"Mutation sites {mutation_sites} are out of bounds for sequence {seq_id} "
+                    f"with length {n_residues}."
+                )
+            mutation_index = torch.as_tensor(mutation_sites, device=device, dtype=torch.long)
+        else:
+            mutation_index = None
+
+        n_layers = int(model.esmc.config.n_layers)
+        if layer == "all":
+            layers_to_save = set(range(n_layers + 1))
+        else:
+            layers_to_save = {int(str(layer).replace("Layer_", ""))}
+
+        feature_chunks = {"mean_pool": {}, "max_pool": {}, "per_residue": {}}
+
+        def save_layer_features(layer_idx: int, hidden_state: torch.Tensor) -> None:
+            if layer_idx not in layers_to_save:
+                return
+            layer_residue_mask = residue_mask_1d.to(hidden_state.device)
+            residue_state = hidden_state[0, layer_residue_mask, :].float()
+            layer_label = esmDMS._layer_label(layer_idx)
+            feature_chunks["mean_pool"][layer_label] = {
+                seq_id: residue_state.mean(dim=0).detach().cpu().numpy()
+            }
+            feature_chunks["max_pool"][layer_label] = {
+                seq_id: residue_state.max(dim=0).values.detach().cpu().numpy()
+            }
+            if mutation_index is None:
+                per_residue = None
+            else:
+                per_residue = residue_state.index_select(
+                    0,
+                    mutation_index.to(residue_state.device),
+                ).detach().cpu().numpy()
+            feature_chunks["per_residue"][layer_label] = {seq_id: per_residue}
+
+        with torch.no_grad():
+            x = model.esmc.embed(inputs["input_ids"])
+            for layer_idx, block in enumerate(model.esmc.transformer.blocks):
+                save_layer_features(layer_idx, x)
+                x, _ = block(x, None, output_attentions=False)
+            save_layer_features(n_layers, model.esmc.transformer.norm(x))
+
+        return feature_chunks
 
     def embed_sequences(self, seq_ids: list[str], out_path: str | None = None,
                         verbose: bool = False) -> dict[str, np.ndarray]:
@@ -1412,10 +1509,12 @@ class esmDMS:
         merge_embedding_batch_outputs(job_dir).
         Set max_active_jobs to limit concurrently active Slurm array tasks.
 
-        For GPU runs (e.g. ESMC-6B): set partition="dept_gpu" (or "any_gpu"),
-        gres="gpu:1", constraint="L40|A100" (or "C8" for any Ampere+ card),
-        and an hf_home on shared storage so array tasks share the downloaded
-        weights. torch_dtype="bfloat16" is the default for ESMC on CUDA.
+        ESMC runs are forced onto CUDA jobs by default. If a caller leaves CPU
+        defaults in place, the generated script is rewritten to use
+        partition="dept_gpu", gres="gpu:1", constraint="C8", and
+        torch_dtype="bfloat16". Use constraint="L40|A100" for larger ESMC
+        checkpoints. Set hf_home on shared storage so array tasks share the
+        downloaded weights.
 
         Note: this cluster encodes GPU model as a Slurm feature/constraint,
         not as a typed GRES — use gres="gpu:N" + constraint="L40", not
@@ -1429,6 +1528,17 @@ class esmDMS:
             raise ValueError("n_chunks must be at least 1.")
         if max_active_jobs is not None and max_active_jobs < 1:
             raise ValueError("max_active_jobs must be at least 1 when specified.")
+
+        is_esmc_job = self._is_esmc_model(str(self.config.embedding_model))
+        if is_esmc_job:
+            if partition in {"dept_cpu", "any_cpu", "big_memory"}:
+                partition = "dept_gpu"
+            if gres is None:
+                gres = "gpu:1"
+            if constraint is None:
+                constraint = "C8"
+            if torch_dtype is None:
+                torch_dtype = "bfloat16"
 
         batch_dir = self._batch_dir(job_dir)
         logs_dir = batch_dir / "logs"
@@ -1529,18 +1639,34 @@ export TMPDIR="$SCRDIR"
             raise ValueError(f"chunk_idx must be between 0 and {n_chunks - 1}.")
 
         esm_model = f"{payload['embedding_model']}"
+        if esmDMS._is_esmc_model(esm_model) and not torch.cuda.is_available():
+            raise RuntimeError(
+                "ESMC batch embedding requires a CUDA GPU. This worker has no CUDA device, "
+                "so running would fall back to CPU and exhaust job memory. Recreate the "
+                "embedding batch job with partition='dept_gpu', gres='gpu:1', and "
+                "constraint='C8' (or 'L40|A100' for larger ESMC checkpoints)."
+            )
         tokenizer, model = esmDMS._load_embedding_model(esm_model)
 
-        out = {}
-        for seq_id in chunks[chunk_idx].tolist():
-            prot_seq = payload["sequence_to_protein_sequence"][seq_id]
-            out[seq_id] = esmDMS._embed_sequence(prot_seq, tokenizer, model)
         if payload.get("sequence_to_mutation_sites") is not None:
-            feature_chunks = esmDMS._build_feature_chunks(
-                out,
-                payload.get("layer", "all"),
-                payload["sequence_to_mutation_sites"],
-            )
+            feature_chunks = {"mean_pool": {}, "max_pool": {}, "per_residue": {}}
+            for seq_id in chunks[chunk_idx].tolist():
+                prot_seq = payload["sequence_to_protein_sequence"][seq_id]
+                seq_feature_chunks = esmDMS._embed_sequence_feature_chunks(
+                    seq_id,
+                    prot_seq,
+                    tokenizer,
+                    model,
+                    payload["sequence_to_mutation_sites"][seq_id],
+                    payload.get("layer", "all"),
+                )
+                for embedding_type, features_by_layer in seq_feature_chunks.items():
+                    for layer_label, seq_to_features in features_by_layer.items():
+                        feature_chunks[embedding_type].setdefault(layer_label, {})
+                        feature_chunks[embedding_type][layer_label].update(seq_to_features)
+                del seq_feature_chunks
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             written_paths = {}
             for embedding_type, features_by_layer in feature_chunks.items():
                 chunk_payload = {
@@ -1567,6 +1693,11 @@ export TMPDIR="$SCRDIR"
                     shutil.copy2(scratch_path, final_path)
                 written_paths[embedding_type] = final_path
             return written_paths
+
+        out = {}
+        for seq_id in chunks[chunk_idx].tolist():
+            prot_seq = payload["sequence_to_protein_sequence"][seq_id]
+            out[seq_id] = esmDMS._embed_sequence(prot_seq, tokenizer, model)
 
         dataset_prefix = payload.get("dataset_prefix", "")
         final_path = Path(payload["batch_dir"]) / f"{dataset_prefix}embeddings_chunk_{chunk_idx}.pkl"

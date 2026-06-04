@@ -8,7 +8,7 @@ GPU is actually being used.
 Run from a GPU node:
     sbatch job_scripts/submit_esmc_smoke_test.sh
 or interactively:
-    srun -p dept_gpu --gres=gpu:1 --pty python3 job_scripts/esmc_smoke_test.py
+    srun -p dept_gpu --gres=gpu:1 --constraint=C8 --pty python3 job_scripts/esmc_smoke_test.py
 """
 
 import os
@@ -40,8 +40,8 @@ def main() -> int:
     print(f"model device={param.device}, dtype={param.dtype}")
 
     emb = esmDMS._embed_sequence(GFP, tokenizer, model)
-    print(f"layer embeddings shape: {emb.shape}  (num_layers, embedding_dim)")
-    print(f"first-layer norm: {float((emb[0] ** 2).sum() ** 0.5):.4f}")
+    print(f"residue embeddings shape: {emb.shape}  (num_residues, num_layers, embedding_dim)")
+    print(f"first-residue, first-layer norm: {float((emb[0, 0] ** 2).sum() ** 0.5):.4f}")
     return 0
 
 
