@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import json
+import multiprocessing as mp
 import os
 import pickle
+import queue
 import re
 import shutil
 import subprocess
@@ -10,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 import time
+import traceback
 
 # Hugging Face access token for gated models (e.g. biohub/ESMC-6B).
 # Prefer the HF_TOKEN env var; fall back to the constant below if you must
@@ -348,6 +352,45 @@ class esmDMS:
         embedding_type: str | None = None,
     ) -> str:
         return f"{self._embedding_type(embedding_type)}_{self._abstraction_type(abstraction_method)}_{self._layer_label(layer)}_{norm_scheme}_inference_results"
+
+    @staticmethod
+    def _safe_file_component(value: object) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_.-")
+        return safe or "run"
+
+    @classmethod
+    def _sae_sweep_run_label(cls, idx: int, params: dict) -> str:
+        run_label = params.get("run_label")
+        if run_label:
+            return cls._safe_file_component(run_label)
+        parts = [f"run{idx:03d}"]
+        for key in ("n_features", "sparsity_mode", "k", "sparsity_coeff", "lr", "epochs", "batch_size", "seed"):
+            if key in params:
+                parts.append(f"{key}-{params[key]}")
+        return cls._safe_file_component("_".join(parts))
+
+    def _sae_sweep_job_dir(
+        self,
+        layer: str | int,
+        method: str,
+        embedding_type: str | None = None,
+        job_dir: str | Path | None = None,
+    ) -> Path:
+        if job_dir is not None:
+            sweep_dir = Path(job_dir)
+        else:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            sweep_dir = (
+                self._save_dir()
+                / "sae_sweep_jobs"
+                / (
+                    f"{self._dataset_prefix()}{self._model_cache_label()}_"
+                    f"{self._embedding_type(embedding_type)}_{self._abstraction_type(method)}_"
+                    f"{self._layer_label(layer)}_{stamp}"
+                )
+            )
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        return sweep_dir
 
     @staticmethod
     def _abstraction_type(method: str) -> str:
@@ -2703,6 +2746,443 @@ export TMPDIR="$SCRDIR"
             "output_path": output_path,
             "job_id": job_id,
         }
+
+    def create_sae_sweep_job(
+        self,
+        layer: str | int,
+        sweep_params: list[dict],
+        method: AbstractionMethod | str = "DeltaSAE",
+        embedding_type: EmbeddingType | None = None,
+        job_dir: str | Path | None = None,
+        job_name: str = "sae_sweep",
+        partition: str = "dept_gpu",
+        gpus: int = 1,
+        gres: str | None = None,
+        constraint: str | None = None,
+        cpus_per_task: int | None = None,
+        mem: str = "16G",
+        time: str = "06:00:00",
+        python_executable: str = "python3",
+        scratch_root: str | Path = "/scr",
+        max_parallel_runs: int | None = None,
+        run_inference: bool = True,
+        force_recompute: bool = False,
+        require_cuda: bool = True,
+        submit: bool = False,
+    ) -> dict[str, Path | str]:
+        """
+        Create one Slurm job that sweeps SAE/DeltaSAE hyperparameters on GPUs.
+
+        The job requests up to ``gpus`` GPUs in a single allocation and runs one
+        SAE training worker per visible GPU. Each worker consumes sweep configs
+        from a shared queue, so the allocation is filled without submitting a
+        separate Slurm job for every hyperparameter setting.
+        """
+        if not self._use_disk():
+            raise ValueError("SAE sweep jobs require local_or_disk to be 'disk' or 'both'.")
+        if not sweep_params:
+            raise ValueError("sweep_params must contain at least one parameter dictionary.")
+        if gpus < 1:
+            raise ValueError("gpus must be at least 1.")
+        if max_parallel_runs is not None and max_parallel_runs < 1:
+            raise ValueError("max_parallel_runs must be at least 1 when specified.")
+        method = self._abstraction_type(method)
+        if self._abstraction_base_method(method) not in {"SAE", "DeltaSAE"}:
+            raise ValueError("create_sae_sweep_job only supports SAE and DeltaSAE methods.")
+        embedding_type = self._embedding_type(embedding_type)
+        if run_inference and self.sequence_dataframe is None:
+            raise ValueError("Run process_raw_data() before creating an SAE sweep job with run_inference=True.")
+
+        embedding_path = self._embedding_path(layer, embedding_type)
+        if not embedding_path.is_file():
+            raise FileNotFoundError(
+                f"No saved {embedding_type} embeddings found at {embedding_path}. "
+                f"Run embed_all_sequences({layer!r}) first."
+            )
+
+        sweep_dir = self._sae_sweep_job_dir(layer, method, embedding_type, job_dir)
+        logs_dir = sweep_dir / "logs"
+        output_root = sweep_dir / "runs"
+        logs_dir.mkdir(exist_ok=True)
+        output_root.mkdir(exist_ok=True)
+
+        configs = []
+        seen_labels = set()
+        for idx, params in enumerate(sweep_params):
+            run_params = dict(params)
+            run_label = self._sae_sweep_run_label(idx, run_params)
+            if run_label in seen_labels:
+                raise ValueError(f"Duplicate SAE sweep run_label after sanitization: {run_label!r}")
+            seen_labels.add(run_label)
+            run_params["run_label"] = run_label
+            configs.append({"run_label": run_label, "params": run_params})
+
+        cpus_per_task = cpus_per_task if cpus_per_task is not None else max(4, gpus * 2)
+        if gres is None:
+            gres = f"gpu:{gpus}"
+
+        payload = {
+            "input_data": self.input_data,
+            "config": {
+                "embedding_model": self.config.embedding_model,
+                "embedding_type": embedding_type,
+                "embedding_method": None,
+                "local_or_disk": "both",
+                "save_dir": str(self._save_dir()),
+                "dataset_name": self.config.dataset_name,
+            },
+            "sequence_dataframe": self.sequence_dataframe,
+            "sequence_to_mutation_sites": self.sequence_to_mutation_sites,
+            "sequence_to_protein_sequence": self.sequence_to_protein_sequence,
+            "sequence_metadata": self.sequence_metadata,
+            "scores_dataframe": self.scores_dataframe,
+            "layer": layer,
+            "method": method,
+            "embedding_type": embedding_type,
+            "embedding_path": str(embedding_path),
+            "output_root": str(output_root),
+            "sweep_dir": str(sweep_dir),
+            "configs": configs,
+            "gpus": gpus,
+            "max_parallel_runs": max_parallel_runs,
+            "run_inference": run_inference,
+            "force_recompute": force_recompute,
+            "require_cuda": require_cuda,
+        }
+        payload_path = sweep_dir / f"{self._dataset_prefix()}sae_sweep_payload.pkl"
+        self._save_pickle(payload, payload_path)
+
+        runner_path = sweep_dir / "run_sae_sweep.py"
+        runner_script = f"""from pathlib import Path
+import os
+import sys
+
+sys.path.insert(0, r"{Path.cwd()}")
+
+import popDMS  # noqa: F401
+from esmDMS import esmDMS
+
+
+if __name__ == "__main__":
+    esmDMS.run_sae_sweep_job(
+        Path(r"{payload_path}"),
+        scratch_dir=os.environ.get("TMPDIR"),
+    )
+"""
+        runner_path.write_text(runner_script)
+        runner_path.chmod(0o755)
+
+        script_path = sweep_dir / "submit_sae_sweep.sh"
+        gres_line = f"#SBATCH --gres={gres}\n" if gres else ""
+        constraint_line = f"#SBATCH --constraint={constraint}\n" if constraint else ""
+        script = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH -p {partition}
+{gres_line}{constraint_line}#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --time={time}
+#SBATCH --mem={mem}
+#SBATCH --output={logs_dir}/slurm-%j.out
+#SBATCH --error={logs_dir}/slurm-%j.err
+
+set -euo pipefail
+cd {Path.cwd()}
+
+SCRDIR={scratch_root}/${{SLURM_JOB_ID}}_sae_sweep
+mkdir -p "$SCRDIR"
+export TMPDIR="$SCRDIR"
+export MPLCONFIGDIR="$SCRDIR/mplconfig"
+mkdir -p "$MPLCONFIGDIR"
+
+{python_executable} {runner_path}
+"""
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        job_id = ""
+        if submit:
+            completed = subprocess.run(
+                ["sbatch", str(script_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            job_id = completed.stdout.strip()
+
+        return {
+            "sweep_dir": sweep_dir,
+            "payload_path": payload_path,
+            "runner_path": runner_path,
+            "script_path": script_path,
+            "output_root": output_root,
+            "job_id": job_id,
+        }
+
+    @staticmethod
+    def _run_sae_sweep_config_safe(
+        payload: dict,
+        config_idx: int,
+        gpu_idx: int | None,
+        scratch_dir: str | Path | None = None,
+    ) -> dict:
+        try:
+            return esmDMS._run_sae_sweep_config(payload, config_idx, gpu_idx, scratch_dir)
+        except Exception as exc:
+            config = payload["configs"][config_idx]
+            return {
+                "status": "failed",
+                "config_idx": config_idx,
+                "run_label": config.get("run_label"),
+                "gpu_idx": gpu_idx,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+
+    @staticmethod
+    def _run_sae_sweep_config(
+        payload: dict,
+        config_idx: int,
+        gpu_idx: int | None,
+        scratch_dir: str | Path | None = None,
+    ) -> dict:
+        if gpu_idx is not None and torch.cuda.is_available():
+            torch.cuda.set_device(gpu_idx)
+
+        started = time.time()
+        config_entry = payload["configs"][config_idx]
+        run_label = config_entry["run_label"]
+        params = dict(config_entry["params"])
+        params["run_label"] = run_label
+        layer = payload["layer"]
+        method = payload["method"]
+        embedding_type = payload["embedding_type"]
+        norm_scheme = params.get("norm_scheme", "none")
+
+        output_root = Path(payload["output_root"])
+        final_run_dir = output_root / run_label
+        if scratch_dir is None:
+            work_run_dir = final_run_dir
+        else:
+            work_run_dir = Path(scratch_dir) / "sae_sweep_runs" / run_label
+        work_run_dir.mkdir(parents=True, exist_ok=True)
+        final_run_dir.mkdir(parents=True, exist_ok=True)
+
+        base_config = dict(payload["config"])
+        work_config = dict(base_config)
+        work_config["save_dir"] = str(work_run_dir)
+        final_config = dict(base_config)
+        final_config["save_dir"] = str(final_run_dir)
+
+        runner = esmDMS(payload["input_data"], ESMDMSConfig(**work_config))
+        final_runner = esmDMS(payload["input_data"], ESMDMSConfig(**final_config))
+        for target in (runner, final_runner):
+            target.sequence_dataframe = payload.get("sequence_dataframe")
+            target.sequence_to_mutation_sites = payload.get("sequence_to_mutation_sites")
+            target.sequence_to_protein_sequence = payload.get("sequence_to_protein_sequence")
+            target.sequence_metadata = payload.get("sequence_metadata")
+            target.scores_dataframe = payload.get("scores_dataframe")
+
+        final_feature_path = final_runner._feature_path(method, layer, embedding_type)
+        final_inference_path = final_runner._inference_path(method, layer, norm_scheme, embedding_type)
+        feature_status = "trained"
+        force_recompute = bool(payload.get("force_recompute", False))
+
+        if final_feature_path.is_file() and not force_recompute:
+            abstracted_features = final_runner._load_pickle(final_feature_path)
+            feature_status = "cached"
+        else:
+            embeddings = esmDMS._load_pickle(Path(payload["embedding_path"]))
+            _, embeddings = esmDMS._drop_missing_features(None, embeddings, f"{method} sweep abstraction")
+            if embedding_type == "per_residue":
+                embeddings, _ = esmDMS._expand_per_residue_feature_vectors(
+                    embeddings,
+                    payload.get("sequence_to_mutation_sites"),
+                )
+            esmDMS._require_vector_features(embeddings, f"{method} sweep abstraction")
+            params.setdefault("_layer", layer)
+            params.setdefault("_embedding_type", embedding_type)
+            abstracted_features = runner._create_feature_space(embeddings, method, params)
+            runner._save_pickle(abstracted_features, runner._feature_path(method, layer, embedding_type))
+
+            if work_run_dir != final_run_dir:
+                shutil.copytree(work_run_dir, final_run_dir, dirs_exist_ok=True)
+
+        inference_status = "not_requested"
+        if payload.get("run_inference", True):
+            if final_inference_path.is_file() and not force_recompute:
+                inference_status = "cached"
+            else:
+                if force_recompute and final_inference_path.is_file():
+                    final_inference_path.unlink()
+                inference_runner = final_runner if feature_status == "cached" else runner
+                inference_runner.run_feature_inference(
+                    layer=layer,
+                    abstraction_method=method,
+                    abstraction_params=params,
+                    embedding_type=embedding_type,
+                )
+                if work_run_dir != final_run_dir and inference_runner is runner:
+                    shutil.copytree(work_run_dir, final_run_dir, dirs_exist_ok=True)
+                inference_status = "ran"
+
+        feature_dim = 0
+        if abstracted_features:
+            first_feature = next(iter(abstracted_features.values()))
+            feature_dim = int(np.asarray(first_feature).shape[0])
+
+        model_path = final_runner._sae_model_path(
+            layer,
+            params.get("n_features", "unknown"),
+            params.get("sparsity_coeff", 1e-3),
+            embedding_type,
+            params.get("sparsity_mode", "normal"),
+            params.get("k"),
+            run_label,
+        )
+        viz_path = final_runner._sae_viz_path(
+            layer,
+            params.get("n_features", "unknown"),
+            params.get("sparsity_coeff", 1e-3),
+            embedding_type,
+            params.get("sparsity_mode", "normal"),
+            params.get("k"),
+            run_label,
+        )
+
+        return {
+            "status": "ok",
+            "config_idx": config_idx,
+            "run_label": run_label,
+            "gpu_idx": gpu_idx,
+            "feature_status": feature_status,
+            "inference_status": inference_status,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "method": method,
+            "embedding_type": embedding_type,
+            "layer": esmDMS._layer_label(layer),
+            "n_features": params.get("n_features"),
+            "sparsity_mode": params.get("sparsity_mode", "normal"),
+            "k": params.get("k"),
+            "sparsity_coeff": params.get("sparsity_coeff", 1e-3),
+            "lr": params.get("lr", 1e-3),
+            "epochs": params.get("epochs", 200),
+            "batch_size": params.get("batch_size", 64),
+            "seed": params.get("seed", 42),
+            "feature_count": len(abstracted_features),
+            "feature_dim": feature_dim,
+            "run_dir": str(final_run_dir),
+            "feature_path": str(final_feature_path),
+            "inference_path": str(final_inference_path) if payload.get("run_inference", True) else "",
+            "model_path": str(model_path),
+            "viz_path": str(viz_path),
+        }
+
+    @staticmethod
+    def _sae_sweep_gpu_worker(
+        payload: dict,
+        task_queue,
+        result_queue,
+        gpu_idx: int | None,
+        scratch_dir: str | Path | None,
+    ) -> None:
+        while True:
+            config_idx = task_queue.get()
+            if config_idx is None:
+                return
+            result_queue.put(
+                esmDMS._run_sae_sweep_config_safe(payload, config_idx, gpu_idx, scratch_dir)
+            )
+
+    @staticmethod
+    def run_sae_sweep_job(
+        payload_path: str | Path,
+        scratch_dir: str | Path | None = None,
+    ) -> list[dict]:
+        """
+        Worker entrypoint used by create_sae_sweep_job().
+        """
+        payload_path = Path(payload_path)
+        payload = esmDMS._load_pickle(payload_path)
+        configs = payload["configs"]
+        n_configs = len(configs)
+        requested_gpus = int(payload.get("gpus", 1))
+        available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if payload.get("require_cuda", False) and available_gpus < 1:
+            raise RuntimeError(
+                "SAE sweep was configured with require_cuda=True, but no CUDA GPU is visible."
+            )
+        max_parallel = payload.get("max_parallel_runs")
+        if max_parallel is None:
+            max_parallel = requested_gpus if available_gpus else 1
+        max_parallel = int(max_parallel)
+        n_workers = min(n_configs, max_parallel)
+        if available_gpus:
+            n_workers = min(n_workers, available_gpus, requested_gpus)
+            gpu_ids = list(range(n_workers))
+        else:
+            n_workers = 1
+            gpu_ids = [None]
+
+        print(
+            f"Starting SAE sweep with {n_configs} config(s), "
+            f"{available_gpus} visible CUDA GPU(s), {n_workers} worker(s)."
+        )
+
+        if n_workers == 1:
+            results = [
+                esmDMS._run_sae_sweep_config_safe(payload, idx, gpu_ids[0], scratch_dir)
+                for idx in range(n_configs)
+            ]
+        else:
+            ctx = mp.get_context("spawn")
+            task_queue = ctx.Queue()
+            result_queue = ctx.Queue()
+            for idx in range(n_configs):
+                task_queue.put(idx)
+            for _ in range(n_workers):
+                task_queue.put(None)
+
+            processes = [
+                ctx.Process(
+                    target=esmDMS._sae_sweep_gpu_worker,
+                    args=(payload, task_queue, result_queue, gpu_ids[worker_idx], scratch_dir),
+                )
+                for worker_idx in range(n_workers)
+            ]
+            for proc in processes:
+                proc.start()
+
+            results = []
+            while len(results) < n_configs:
+                try:
+                    results.append(result_queue.get(timeout=5))
+                except queue.Empty:
+                    if all(not proc.is_alive() for proc in processes):
+                        break
+
+            for proc in processes:
+                proc.join()
+            if len(results) != n_configs:
+                raise RuntimeError(
+                    f"SAE sweep workers exited after returning {len(results)}/{n_configs} result(s)."
+                )
+
+        results = sorted(results, key=lambda row: row.get("config_idx", -1))
+        sweep_dir = Path(payload["sweep_dir"])
+        summary_path = sweep_dir / "sae_sweep_results.csv"
+        json_path = sweep_dir / "sae_sweep_results.json"
+        pd.DataFrame(results).to_csv(summary_path, index=False)
+        with json_path.open("w") as f:
+            json.dump(results, f, indent=2)
+
+        failed = [row for row in results if row.get("status") != "ok"]
+        if failed:
+            for row in failed:
+                print(f"SAE sweep failed for {row.get('run_label')}: {row.get('error')}")
+                print(row.get("traceback", ""))
+            raise RuntimeError(f"{len(failed)} SAE sweep run(s) failed. See {json_path}.")
+
+        print(f"SAE sweep complete. Summary written to {summary_path}")
+        return results
 
     @staticmethod
     def run_inference_job(
