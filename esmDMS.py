@@ -1288,6 +1288,10 @@ class esmDMS:
         return "ESMC" in model_name or "esmc" in model_name.lower()
 
     @staticmethod
+    def _is_esmc_6b_model(model_name: str) -> bool:
+        return esmDMS._is_esmc_model(model_name) and "6b" in model_name.lower()
+
+    @staticmethod
     def _resolve_torch_dtype(name: str | None):
         if not name:
             return None
@@ -1574,12 +1578,12 @@ class esmDMS:
         merge_embedding_batch_outputs(job_dir).
         Set max_active_jobs to limit concurrently active Slurm array tasks.
 
-        ESMC runs are forced onto CUDA jobs by default. If a caller leaves CPU
-        defaults in place, the generated script is rewritten to use
-        partition="dept_gpu", gres="gpu:1", constraint="C8", and
-        torch_dtype="bfloat16". Use constraint="L40|A100" for larger ESMC
-        checkpoints. Set hf_home on shared storage so array tasks share the
-        downloaded weights.
+        ESMC-6B runs are routed to the big_memory CPU partition by default.
+        Other ESMC runs are forced onto CUDA jobs by default. If a caller
+        leaves CPU defaults in place for non-6B ESMC, the generated script is
+        rewritten to use partition="dept_gpu", gres="gpu:1", constraint="C8",
+        and torch_dtype="bfloat16". Set hf_home on shared storage so array
+        tasks share the downloaded weights.
 
         Note: this cluster encodes GPU model as a Slurm feature/constraint,
         not as a typed GRES — use gres="gpu:N" + constraint="L40", not
@@ -1594,8 +1598,18 @@ class esmDMS:
         if max_active_jobs is not None and max_active_jobs < 1:
             raise ValueError("max_active_jobs must be at least 1 when specified.")
 
-        is_esmc_job = self._is_esmc_model(str(self.config.embedding_model))
-        if is_esmc_job:
+        embedding_model = str(self.config.embedding_model)
+        is_esmc_job = self._is_esmc_model(embedding_model)
+        is_esmc_6b_job = self._is_esmc_6b_model(embedding_model)
+        if is_esmc_6b_job:
+            partition = "big_memory"
+            gres = None
+            constraint = None
+            if mem == "16G":
+                mem = "64G"
+            if torch_dtype is None:
+                torch_dtype = "float32"
+        elif is_esmc_job:
             if partition in {"dept_cpu", "any_cpu", "big_memory"}:
                 partition = "dept_gpu"
             if gres is None:
@@ -1704,7 +1718,11 @@ export TMPDIR="$SCRDIR"
             raise ValueError(f"chunk_idx must be between 0 and {n_chunks - 1}.")
 
         esm_model = f"{payload['embedding_model']}"
-        if esmDMS._is_esmc_model(esm_model) and not torch.cuda.is_available():
+        if (
+            esmDMS._is_esmc_model(esm_model)
+            and not esmDMS._is_esmc_6b_model(esm_model)
+            and not torch.cuda.is_available()
+        ):
             raise RuntimeError(
                 "ESMC batch embedding requires a CUDA GPU. This worker has no CUDA device, "
                 "so running would fall back to CPU and exhaust job memory. Recreate the "
