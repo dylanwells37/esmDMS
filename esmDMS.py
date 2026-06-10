@@ -58,7 +58,7 @@ EmbeddingModel = Literal[
 ]
 
 EmbeddingType = Literal["per_residue", "mutation_pooled", "mean_pool", "max_pool"]
-AbstractionMethod = Literal["none", "PCA", "SAE", "DeltaSAE", "SPCA"]
+AbstractionMethod = Literal["none", "PCA", "SAE", "DeltaSAE", "DeltaEmbSAE", "SPCA"]
 
 ## CONFIGURATION AND INPUT CLASSES #################################
 
@@ -151,20 +151,15 @@ SparsityMode = Literal["normal", "topk", "batchtopk"]
 
 class SparseAutoencoder(torch.nn.Module):
     """
-    Simple sparse autoencoder: Linear+ReLU encoder, linear decoder (no bias).
+    SAE with tied decoder bias (pre-encoder centering).
 
     Architecture:
-        x  →  encoder (Linear + ReLU)  →  z  →  decoder (Linear)  →  x_hat
+        x  →  (x - b_d)  →  encoder (Linear, no bias + ReLU)  →  z
+           →  decoder (Linear, no bias)  →  x_hat + b_d  →  x_hat
 
-    The decoder columns are optionally kept at unit norm throughout training to
-    prevent feature collapse (standard SAE practice).
-
-    Sparsity is enforced via ``sparsity_mode``:
-      - 'normal':    activations are unconstrained inside the module; sparsity
-                     comes from an L1 penalty added to the loss outside.
-      - 'topk':      per sample, keep only the top-k activations (others → 0).
-      - 'batchtopk': across the whole batch, keep only the top k * batch_size
-                     activations (others → 0).
+    b_d is a learned vector that approximates the mean of the input
+    distribution. By centering before encoding, features only need to
+    explain *deviations* from the mean, improving sparsity quality.
     """
 
     def __init__(
@@ -184,19 +179,38 @@ class SparseAutoencoder(torch.nn.Module):
             raise ValueError(
                 f"sparsity_mode={sparsity_mode!r} requires a positive integer k."
             )
-        self.encoder = torch.nn.Linear(input_dim, n_features)
+
+        # ── Layers ────────────────────────────────────────────────────────
+        # Both linear layers have bias=False — b_d handles all centering.
+        self.encoder = torch.nn.Linear(input_dim, n_features, bias=False)
         self.decoder = torch.nn.Linear(n_features, input_dim, bias=False)
+
+        # ── Tied decoder bias ─────────────────────────────────────────────
+        # Shared learned center: subtracted before encoding, added after decoding.
+        # Initialized to zero; will converge toward the mean of the training data.
+        self.b_d = torch.nn.Parameter(torch.zeros(input_dim))
+
         self.normalize_decoder = normalize_decoder
         self.sparsity_mode = sparsity_mode
         self.k = k
         self._init_weights()
 
+    """def _init_weights(self) -> None:
+    torch.nn.init.kaiming_uniform_(self.decoder.weight)
+    if self.normalize_decoder:
+        self._renorm_decoder()
+    with torch.no_grad():
+        self.encoder.weight.copy_(self.decoder.weight.T)
+    # b_d stays zero-initialized — it learns the data mean during training"""
+
+    # Initialize together
     def _init_weights(self) -> None:
-        torch.nn.init.kaiming_uniform_(self.encoder.weight)
-        torch.nn.init.zeros_(self.encoder.bias)
         torch.nn.init.kaiming_uniform_(self.decoder.weight)
         if self.normalize_decoder:
             self._renorm_decoder()
+        with torch.no_grad():
+            self.encoder.weight.copy_(self.decoder.weight.T)
+        # b_d stays zero-initialized — it learns the data mean during training
 
     def _renorm_decoder(self) -> None:
         """Project decoder columns back to the unit sphere (in-place, no grad)."""
@@ -205,7 +219,11 @@ class SparseAutoencoder(torch.nn.Module):
             self.decoder.weight.div_(norms)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z = torch.relu(self.encoder(x))
+        # ── Center the input ──────────────────────────────────────────────
+        x_centered = x - self.b_d
+
+        z = torch.relu(self.encoder(x_centered))
+
         if self.sparsity_mode == "topk":
             k = min(self.k, z.shape[-1])
             _, topk_idx = z.topk(k, dim=-1)
@@ -223,7 +241,8 @@ class SparseAutoencoder(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.encode(x)
-        x_hat = self.decoder(z)
+        # ── Add b_d back after decoding ───────────────────────────────────
+        x_hat = self.decoder(z) + self.b_d
         return x_hat, z
 
 
@@ -240,7 +259,8 @@ class esmDMS:
     1. Take in DMS data from MabeDB format (cellular or viral data)
     2. Process the data to reconstruct a protein sequence / mutation site -> frequency time series
     3. Construct esm embeddings for the for each mutation / protein sequence
-    4. (Optional) Perform an abstraction on top of the embeddings (PCA, SAE, SPCA, etc.)
+
+        4. (Optional) Perform an abstraction on top of the embeddings (PCA, SAE, SPCA, etc.)
 
     5. Analyze the results:
 
@@ -403,6 +423,8 @@ class esmDMS:
         method = esmDMS._abstraction_type(method)
         if method.startswith("PCA"):
             return "PCA"
+        if method.startswith("DeltaEmbSAE"):
+            return "DeltaEmbSAE"
         if method.startswith("DeltaSAE"):
             return "DeltaSAE"
         if method.startswith("SAE"):
@@ -2143,6 +2165,8 @@ cd {Path.cwd()}
             return self._sae_abstraction(embeddings, method_params)
         elif base_method == 'DeltaSAE':
             return self._delta_sae_abstraction(embeddings, method_params)
+        elif base_method == 'DeltaEmbSAE':
+            return self._delta_embedding_sae_abstraction(embeddings, method_params)
         elif base_method == 'SPCA':
             # Implement SPCA abstraction here
             return self._spca_abstraction(embeddings, method_params)
@@ -2312,7 +2336,7 @@ cd {Path.cwd()}
         if checkpoint_active_mask is not None:
             active_mask = np.asarray(checkpoint_active_mask, dtype=bool)
         else:
-            active_mask = (act_freq > 0.0) & (act_freq < 1.0)
+            active_mask = (act_freq > 0.0)
         if not active_mask.any():
             print(
                 "Warning: no neurons had activation frequency strictly between 0 and 1. "
@@ -2324,7 +2348,7 @@ cd {Path.cwd()}
         n_active = int(active_mask.sum())
         print(
             f"SAE: {n_active}/{n_features} neurons active "
-            f"(0 < activation frequency < 1, layer={layer})"
+            f"(0 < activation frequency, layer={layer})"
         )
         Z_active = Z_all[:, active_mask]       # (n_samples, n_active)
 
@@ -2404,6 +2428,51 @@ cd {Path.cwd()}
         wt_vector = np.asarray(sae_features[wildtype_key])
         return {
             seq_id: np.asarray(feature) - wt_vector
+            for seq_id, feature in sae_features.items()
+            if seq_id != wildtype_key
+        }
+
+    def _delta_embedding_sae_abstraction(
+        self,
+        embeddings: dict[str, np.ndarray],
+        method_params: dict | None,
+    ) -> dict[str, np.ndarray]:
+        """
+        Train an SAE on wildtype-centered embeddings and return mutant delta
+        embedding activations.
+
+        This differs from DeltaSAE:
+          - DeltaSAE trains on raw embeddings and returns SAE(mutant) - SAE(wildtype).
+          - DeltaEmbSAE trains on embedding - embedding(wildtype) and returns
+            SAE(mutant - wildtype). Optionally subtract SAE(0) to remove any
+            learned zero-input baseline activation.
+        """
+        params = dict(method_params or {})
+        wildtype_key = params.get("wildtype_key")
+        if wildtype_key is None and self.input_data.kind == "cellular":
+            wildtype_key = self.input_data.wildtype_key
+        if wildtype_key is None:
+            raise ValueError("DeltaEmbSAE requires a wildtype_key.")
+        if wildtype_key not in embeddings:
+            raise KeyError(
+                f"Wildtype key {wildtype_key!r} is not present in embeddings. "
+                "Run embeddings with the class-managed sequence_to_protein_sequence map."
+            )
+
+        subtract_zero_activation = bool(params.pop("subtract_zero_activation", False))
+        wt_embedding = np.asarray(embeddings[wildtype_key], dtype=np.float32)
+        delta_embeddings = {
+            seq_id: np.asarray(embedding, dtype=np.float32) - wt_embedding
+            for seq_id, embedding in embeddings.items()
+        }
+
+        sae_features = self._sae_abstraction(delta_embeddings, params)
+        if wildtype_key not in sae_features:
+            raise KeyError(f"Wildtype key {wildtype_key!r} is not present in SAE features.")
+
+        zero_vector = np.asarray(sae_features[wildtype_key]) if subtract_zero_activation else 0.0
+        return {
+            seq_id: np.asarray(feature) - zero_vector
             for seq_id, feature in sae_features.items()
             if seq_id != wildtype_key
         }
@@ -2787,8 +2856,8 @@ export TMPDIR="$SCRDIR"
         if max_parallel_runs is not None and max_parallel_runs < 1:
             raise ValueError("max_parallel_runs must be at least 1 when specified.")
         method = self._abstraction_type(method)
-        if self._abstraction_base_method(method) not in {"SAE", "DeltaSAE"}:
-            raise ValueError("create_sae_sweep_job only supports SAE and DeltaSAE methods.")
+        if self._abstraction_base_method(method) not in {"SAE", "DeltaSAE", "DeltaEmbSAE"}:
+            raise ValueError("create_sae_sweep_job only supports SAE, DeltaSAE, and DeltaEmbSAE methods.")
         embedding_type = self._embedding_type(embedding_type)
         if run_inference and self.sequence_dataframe is None:
             raise ValueError("Run process_raw_data() before creating an SAE sweep job with run_inference=True.")
@@ -2820,6 +2889,10 @@ export TMPDIR="$SCRDIR"
         cpus_per_task = cpus_per_task if cpus_per_task is not None else max(4, gpus * 2)
         if gres is None:
             gres = f"gpu:{gpus}"
+        threads_per_worker = max(
+            1,
+            cpus_per_task // max_parallel_runs,
+        ) if max_parallel_runs else max(1, cpus_per_task)
 
         payload = {
             "input_data": self.input_data,
@@ -2891,6 +2964,9 @@ SCRDIR={scratch_root}/${{SLURM_JOB_ID}}_sae_sweep
 mkdir -p "$SCRDIR"
 export TMPDIR="$SCRDIR"
 export MPLCONFIGDIR="$SCRDIR/mplconfig"
+export OMP_NUM_THREADS={threads_per_worker}
+export MKL_NUM_THREADS={threads_per_worker}
+export NUMEXPR_NUM_THREADS={threads_per_worker}
 mkdir -p "$MPLCONFIGDIR"
 
 {python_executable} {runner_path}
@@ -3119,8 +3195,7 @@ mkdir -p "$MPLCONFIGDIR"
             n_workers = min(n_workers, available_gpus, requested_gpus)
             gpu_ids = list(range(n_workers))
         else:
-            n_workers = 1
-            gpu_ids = [None]
+            gpu_ids = [None] * n_workers
 
         print(
             f"Starting SAE sweep with {n_configs} config(s), "

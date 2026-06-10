@@ -34,7 +34,7 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export ESMDMS_TORCH_DTYPE="${ESMDMS_TORCH_DTYPE:-bfloat16}"
 
 # Set ESMC_MODEL=biohub/ESMC-6B to actually exercise the 6B path.
-export ESMC_MODEL="${ESMC_MODEL:-biohub/ESMC-600M}"
+export ESMC_MODEL="${ESMC_MODEL:-biohub/ESMC-6B}"
 
 # HF_TOKEN must be exported in your shell environment for gated models.
 if [ -z "${HF_TOKEN:-}" ]; then
