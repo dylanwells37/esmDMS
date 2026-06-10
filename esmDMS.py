@@ -1399,7 +1399,7 @@ class esmDMS:
         if not (hasattr(model, "esmc") and hasattr(model.esmc, "embed")):
             embeddings = {seq_id: esmDMS._embed_sequence(sequence, tokenizer, model)}
             return esmDMS._build_feature_chunks(embeddings, layer, {seq_id: mutation_sites})
-
+        print(f"Embedding sequence {seq_id} with {model}")
         inputs = tokenizer(
             sequence,
             return_tensors="pt",
@@ -1676,6 +1676,7 @@ cd {Path.cwd()}
 mkdir -p "$SCRDIR"
 export TMPDIR="$SCRDIR"
 
+export PYTHONUNBUFFERED=1
 {python_executable} -c "import sys, os; sys.path.insert(0, r'{Path.cwd()}'); import popDMS; from esmDMS import esmDMS; esmDMS.run_embedding_batch_chunk(r'{payload_path}', int(os.environ['SLURM_ARRAY_TASK_ID']), scratch_dir=os.environ['TMPDIR'])"
 """
         script_path.write_text(script)
@@ -1683,6 +1684,7 @@ export TMPDIR="$SCRDIR"
 
         job_id = ""
         if submit:
+            print(f"Submitting embedding batch job with array spec {array_spec}...")
             completed = subprocess.run(
                 ["sbatch", str(script_path)],
                 check=True,
@@ -1729,7 +1731,10 @@ export TMPDIR="$SCRDIR"
                 "embedding batch job with partition='dept_gpu', gres='gpu:1', and "
                 "constraint='C8' (or 'L40|A100' for larger ESMC checkpoints)."
             )
+        
+        print(f"Loading model {esm_model} for embedding batch chunk {chunk_idx}...")
         tokenizer, model = esmDMS._load_embedding_model(esm_model)
+        print(f"Model loaded, embedding chunk {chunk_idx} with {len(chunks[chunk_idx])} sequences...")
 
         if payload.get("sequence_to_mutation_sites") is not None:
             feature_chunks = {"mean_pool": {}, "max_pool": {}, "per_residue": {}}

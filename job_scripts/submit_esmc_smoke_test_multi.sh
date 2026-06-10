@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=esmc_smoke_multi
 #SBATCH --partition=dept_gpu
-#SBATCH --gres=gpu:8
-#SBATCH --constraint=L40
-#SBATCH --exclusive
+#SBATCH --gres=gpu
+#SBATCH --constraint=L40|A100
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=200G
+#SBATCH --mem=40G
 #SBATCH --time=01:00:00
 #SBATCH --output=job_scripts/logs/esmc_smoke_multi-%j.out
 #SBATCH --error=job_scripts/logs/esmc_smoke_multi-%j.err
