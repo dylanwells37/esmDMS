@@ -1566,6 +1566,7 @@ class esmDMS:
         scratch_root: str | Path = "/scr",
         hf_home: str | Path | None = None,
         torch_dtype: str | None = None,
+        allow_cpu_esmc: bool = False,
         submit: bool = False,
     ) -> dict[str, Path | str]:
         """
@@ -1579,11 +1580,12 @@ class esmDMS:
         Set max_active_jobs to limit concurrently active Slurm array tasks.
 
         ESMC-6B runs are routed to the big_memory CPU partition by default.
-        Other ESMC runs are forced onto CUDA jobs by default. If a caller
-        leaves CPU defaults in place for non-6B ESMC, the generated script is
-        rewritten to use partition="dept_gpu", gres="gpu:1", constraint="C8",
-        and torch_dtype="bfloat16". Set hf_home on shared storage so array
-        tasks share the downloaded weights.
+        Other ESMC runs are forced onto CUDA jobs by default unless
+        allow_cpu_esmc=True. If a caller leaves CPU defaults in place for
+        non-6B ESMC without allow_cpu_esmc, the generated script is rewritten
+        to use partition="dept_gpu", gres="gpu:1", constraint="C8", and
+        torch_dtype="bfloat16". Set hf_home on shared storage so array tasks
+        share the downloaded weights.
 
         Note: this cluster encodes GPU model as a Slurm feature/constraint,
         not as a typed GRES — use gres="gpu:N" + constraint="L40", not
@@ -1610,14 +1612,20 @@ class esmDMS:
             if torch_dtype is None:
                 torch_dtype = "float32"
         elif is_esmc_job:
-            if partition in {"dept_cpu", "any_cpu", "big_memory"}:
-                partition = "dept_gpu"
-            if gres is None:
-                gres = "gpu:1"
-            if constraint is None:
-                constraint = "C8"
-            if torch_dtype is None:
-                torch_dtype = "bfloat16"
+            if allow_cpu_esmc:
+                gres = None
+                constraint = None
+                if torch_dtype is None:
+                    torch_dtype = "float32"
+            else:
+                if partition in {"dept_cpu", "any_cpu", "big_memory"}:
+                    partition = "dept_gpu"
+                if gres is None:
+                    gres = "gpu:1"
+                if constraint is None:
+                    constraint = "C8"
+                if torch_dtype is None:
+                    torch_dtype = "bfloat16"
 
         batch_dir = self._batch_dir(job_dir)
         logs_dir = batch_dir / "logs"
@@ -1642,6 +1650,7 @@ class esmDMS:
             "n_chunks": n_chunks,
             "max_active_jobs": max_active_jobs,
             "batch_dir": str(batch_dir),
+            "allow_cpu_esmc": allow_cpu_esmc,
         }
 
         payload_path = self._batch_payload_path(batch_dir)
@@ -1724,6 +1733,7 @@ export PYTHONUNBUFFERED=1
             esmDMS._is_esmc_model(esm_model)
             and not esmDMS._is_esmc_6b_model(esm_model)
             and not torch.cuda.is_available()
+            and not payload.get("allow_cpu_esmc", False)
         ):
             raise RuntimeError(
                 "ESMC batch embedding requires a CUDA GPU. This worker has no CUDA device, "
