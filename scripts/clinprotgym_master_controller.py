@@ -420,14 +420,59 @@ def job_ids_from_state(state: dict[str, Any]) -> list[str]:
     return sorted(set(ids))
 
 
+def parse_running_job_ids(output: str) -> list[str]:
+    return sorted(
+        {line.strip().split("_", 1)[0] for line in output.splitlines() if line.strip()}
+    )
+
+
 def running_job_ids(job_ids: list[str], *, dry_run: bool) -> list[str]:
     if dry_run or not job_ids:
         return []
     result = run_command(["squeue", "-h", "-j", ",".join(job_ids), "-o", "%A"], check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"squeue failed while checking job ids {job_ids}: {result.stderr.strip()}")
-    running = sorted(set(line.strip().split("_", 1)[0] for line in result.stdout.splitlines() if line.strip()))
-    return running
+    if result.returncode == 0:
+        return parse_running_job_ids(result.stdout)
+    # A non-zero exit means at least one id is no longer known to Slurm.
+    # Completed jobs are purged from squeue after MinJobAge, and squeue rejects
+    # the entire batch when even a single id is invalid (this is the common case
+    # once a single-array stage finishes). Re-query ids one at a time so a purged
+    # (finished) job reads as "not running" while a genuine squeue failure still
+    # raises instead of silently advancing the pipeline.
+    running: list[str] = []
+    for job_id in job_ids:
+        single = run_command(["squeue", "-h", "-j", job_id, "-o", "%A"], check=False)
+        if single.returncode == 0:
+            running.extend(parse_running_job_ids(single.stdout))
+        elif "Invalid job id" not in (single.stderr or ""):
+            raise RuntimeError(
+                f"squeue failed while checking job id {job_id}: {single.stderr.strip()}"
+            )
+    return sorted(set(running))
+
+
+def forwarded_controller_argv(argv: list[str]) -> list[str]:
+    """Strip wrapper-injected flags so resubmissions don't accumulate them.
+
+    run_clinprotgym_master_controller.sh always prepends
+    ``--controller-script <path> --resubmit-self`` before our argv. Forwarding
+    those back verbatim makes the resubmitted command line grow on every poll,
+    so drop them here; the wrapper re-adds them on the next run.
+    """
+    out: list[str] = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--controller-script":
+            skip_next = True
+            continue
+        if token.startswith("--controller-script="):
+            continue
+        if token in ("--resubmit-self", "--no-resubmit-self"):
+            continue
+        out.append(token)
+    return out
 
 
 def schedule_self(args: argparse.Namespace, argv: list[str], state: dict[str, Any], reason: str) -> None:
@@ -440,7 +485,7 @@ def schedule_self(args: argparse.Namespace, argv: list[str], state: dict[str, An
         "sbatch",
         f"--begin=now+{args.poll_minutes}minutes",
         str(args.controller_script),
-        *argv,
+        *forwarded_controller_argv(argv),
     ]
     result = run_command(command, dry_run=args.dry_run)
     if result.stdout:
