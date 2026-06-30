@@ -40,6 +40,15 @@ NORM_SCHEME = "none"
 ABSTRACTION_METHOD = "DeltaEmbSAE"
 WILDTYPE_KEY = "__wildtype__"
 PATHOGENICITY_LABELS = {"benign", "pathogenic"}
+ESMC_CONTEXT_LENGTH = 2048
+ESMC_WINDOW_STRIDE = ESMC_CONTEXT_LENGTH // 2
+SAHU_BRCA2_BASE_DATASET = "MV_BRCA2_Sahu_2025"
+SAHU_BRCA2_LAST2048_DATASET = f"{SAHU_BRCA2_BASE_DATASET}__last2048"
+SAHU_BRCA2_WINDOW_DATASET = f"{SAHU_BRCA2_BASE_DATASET}__sliding2048_overlap1024"
+SAHU_BRCA2_DERIVED_DATASETS = {
+    "last2048": SAHU_BRCA2_LAST2048_DATASET,
+    "sliding-window": SAHU_BRCA2_WINDOW_DATASET,
+}
 
 MODEL_LAYER_COUNTS = {
     "biohub/ESMC-300M": 30,
@@ -100,6 +109,18 @@ class DatasetPaths:
 
 def safe_name(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_.-") or "dataset"
+
+
+def sahu_brca2_derived_dataset_names() -> set[str]:
+    return set(SAHU_BRCA2_DERIVED_DATASETS.values())
+
+
+def is_sahu_brca2_base_dataset(dataset: object) -> bool:
+    return safe_name(dataset) == SAHU_BRCA2_BASE_DATASET
+
+
+def is_sahu_brca2_window_dataset(dataset: object) -> bool:
+    return safe_name(dataset) == SAHU_BRCA2_WINDOW_DATASET
 
 
 def model_short_name(model_name: str) -> str:
@@ -197,8 +218,11 @@ def parse_dataset_selection(values: list[str] | None) -> set[str] | None:
         for part in str(value).split(","):
             part = part.strip()
             if part:
+                safe_part = safe_name(Path(part).stem)
                 selected.add(part)
-                selected.add(safe_name(Path(part).stem))
+                selected.add(safe_part)
+                if safe_part == SAHU_BRCA2_BASE_DATASET:
+                    selected.update(sahu_brca2_derived_dataset_names())
     return selected or None
 
 
@@ -209,7 +233,10 @@ def iter_input_csvs(input_dir: Path, selected: set[str] | None = None) -> list[P
     out = []
     for path in files:
         dataset = safe_name(path.stem)
-        if path.name in selected or path.stem in selected or dataset in selected:
+        matches_sahu_derived = dataset == SAHU_BRCA2_BASE_DATASET and bool(
+            selected & sahu_brca2_derived_dataset_names()
+        )
+        if path.name in selected or path.stem in selected or dataset in selected or matches_sahu_derived:
             out.append(path)
     return out
 
@@ -278,6 +305,153 @@ def infer_reference_sequence(df: pd.DataFrame) -> tuple[str, dict]:
     if parse_failures or position_failures or reconstruction_mismatches:
         raise ValueError(f"Could not consistently infer reference sequence: {summary}")
     return reference_sequence, summary
+
+
+def mutant_with_position(parsed: tuple[str, int, str], position: int) -> str:
+    wt_aa, _, alt_aa = parsed
+    return f"{wt_aa}{int(position)}{alt_aa}"
+
+
+def truncate_dataframe_to_reference_suffix(
+    df: pd.DataFrame,
+    reference_sequence: str,
+    context_length: int = ESMC_CONTEXT_LENGTH,
+) -> tuple[pd.DataFrame, str, dict]:
+    if len(reference_sequence) <= context_length:
+        out, summary = add_full_length_transform_columns(df, reference_sequence, "last2048")
+        summary.update({"context_length": int(context_length), "all_mutations_retained": True})
+        return out, reference_sequence, summary
+
+    offset = len(reference_sequence) - context_length
+    parsed = df["mutant"].map(parse_mutant)
+    if parsed.isna().any():
+        bad = df.loc[parsed.isna(), "mutant"].head().astype(str).tolist()
+        raise ValueError(f"Cannot truncate sequences with unparseable mutants: {bad}")
+    positions = parsed.map(lambda value: value[1])
+    if int(positions.min()) <= offset:
+        raise ValueError(
+            f"Last-{context_length} truncation starts at original position {offset + 1}, "
+            f"but the earliest mutation is at position {int(positions.min())}."
+        )
+
+    out = df.copy()
+    out["original_mutant"] = out["mutant"].astype(str)
+    out["original_position"] = positions.astype(int)
+    out["original_sequence_length"] = int(len(reference_sequence))
+    out["analysis_sequence_start"] = int(offset + 1)
+    out["analysis_sequence_end"] = int(len(reference_sequence))
+    out["analysis_sequence_transform"] = "last2048"
+    out["mutated_sequence"] = out["mutated_sequence"].astype(str).str.upper().str.slice(offset)
+    out["mutant"] = [
+        mutant_with_position(value, int(value[1]) - offset)
+        for value in parsed
+    ]
+    return out, reference_sequence[offset:], {
+        "sequence_transform": "last2048",
+        "analysis_sequence_start": int(offset + 1),
+        "analysis_sequence_end": int(len(reference_sequence)),
+        "context_length": int(context_length),
+        "all_mutations_retained": True,
+        "min_original_position": int(positions.min()),
+        "max_original_position": int(positions.max()),
+    }
+
+
+def sliding_window_ranges(length: int, window_size: int, stride: int) -> list[tuple[int, int]]:
+    if length < 1:
+        raise ValueError("Cannot build windows for an empty sequence.")
+    if window_size < 1 or stride < 1:
+        raise ValueError("window_size and stride must be positive.")
+    if length <= window_size:
+        return [(0, length)]
+
+    final_start = length - window_size
+    starts = list(range(0, final_start + 1, stride))
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return [(int(start), int(start + window_size)) for start in starts]
+
+
+def add_full_length_transform_columns(
+    df: pd.DataFrame,
+    reference_sequence: str,
+    sequence_transform: str,
+) -> tuple[pd.DataFrame, dict]:
+    parsed = df["mutant"].map(parse_mutant)
+    if parsed.isna().any():
+        bad = df.loc[parsed.isna(), "mutant"].head().astype(str).tolist()
+        raise ValueError(f"Cannot prepare sequences with unparseable mutants: {bad}")
+    positions = parsed.map(lambda value: value[1])
+    out = df.copy()
+    out["original_mutant"] = out["mutant"].astype(str)
+    out["original_position"] = positions.astype(int)
+    out["original_sequence_length"] = int(len(reference_sequence))
+    out["analysis_sequence_start"] = 1
+    out["analysis_sequence_end"] = int(len(reference_sequence))
+    out["analysis_sequence_transform"] = sequence_transform
+    return out, {
+        "sequence_transform": sequence_transform,
+        "analysis_sequence_start": 1,
+        "analysis_sequence_end": int(len(reference_sequence)),
+        "context_length": int(ESMC_CONTEXT_LENGTH) if sequence_transform != "full" else np.nan,
+        "min_original_position": int(positions.min()),
+        "max_original_position": int(positions.max()),
+    }
+
+
+def build_sliding_window_embedding_state(
+    sequence_to_protein_sequence: dict[str, str],
+    window_size: int = ESMC_CONTEXT_LENGTH,
+    stride: int = ESMC_WINDOW_STRIDE,
+) -> tuple[dict, dict]:
+    embedding_sequences: dict[str, str] = {}
+    sequence_to_windows: dict[str, list[str]] = {}
+    window_ranges: dict[str, dict] = {}
+    window_lookup: dict[tuple[int, int, str], str] = {}
+
+    for seq_id, sequence in sequence_to_protein_sequence.items():
+        seq_id = str(seq_id)
+        sequence = str(sequence).upper()
+        window_ids = []
+        for window_idx, (start, end) in enumerate(sliding_window_ranges(len(sequence), window_size, stride)):
+            window_sequence = sequence[start:end]
+            key = (start, end, window_sequence)
+            if key not in window_lookup:
+                window_id = f"window_{len(window_lookup):07d}_{start + 1}_{end}"
+                window_lookup[key] = window_id
+                embedding_sequences[window_id] = window_sequence
+                window_ranges[window_id] = {
+                    "window_index": int(window_idx),
+                    "start": int(start),
+                    "end": int(end),
+                    "start_1based": int(start + 1),
+                    "end_1based": int(end),
+                    "length": int(end - start),
+                }
+            window_ids.append(window_lookup[key])
+        sequence_to_windows[seq_id] = window_ids
+
+    windows_per_sequence = [len(value) for value in sequence_to_windows.values()]
+    window_lengths = [len(value) for value in embedding_sequences.values()]
+    state = {
+        "embedding_window_method": "sliding_max_pool",
+        "embedding_window_size": int(window_size),
+        "embedding_window_stride": int(stride),
+        "embedding_sequence_to_protein_sequence": embedding_sequences,
+        "sequence_to_embedding_windows": sequence_to_windows,
+        "embedding_window_ranges": window_ranges,
+    }
+    summary = {
+        "embedding_window_method": "sliding_max_pool",
+        "embedding_window_size": int(window_size),
+        "embedding_window_stride": int(stride),
+        "embedding_window_sequences": int(len(embedding_sequences)),
+        "embedding_windows_per_sequence_min": int(min(windows_per_sequence)) if windows_per_sequence else 0,
+        "embedding_windows_per_sequence_max": int(max(windows_per_sequence)) if windows_per_sequence else 0,
+        "embedding_window_length_min": int(min(window_lengths)) if window_lengths else 0,
+        "embedding_window_length_max": int(max(window_lengths)) if window_lengths else 0,
+    }
+    return state, summary
 
 
 def make_sequence_ids(df: pd.DataFrame) -> pd.Series:
@@ -451,14 +625,20 @@ def build_metadata(df: pd.DataFrame, reference_sequence: str) -> pd.DataFrame:
             {
                 "SequenceIndex": str(row["SequenceIndex"]),
                 "mutant": str(row["mutant"]),
+                "original_mutant": str(row.get("original_mutant", row["mutant"])),
                 "wt_aa": wt_aa,
                 "position": pos1,
+                "original_position": row.get("original_position", pos1),
                 "mutant_aa": alt_aa,
                 "n_mutation_sites": len(mutation_sites),
                 "mutation_sites": json.dumps(mutation_sites),
                 "is_synonymous": bool(wt_aa == alt_aa),
                 "is_stop": bool(alt_aa == "*" or "*" in str(row["mutated_sequence"])),
                 "sequence_length": len(reference_sequence),
+                "original_sequence_length": row.get("original_sequence_length", len(reference_sequence)),
+                "analysis_sequence_start": row.get("analysis_sequence_start", 1),
+                "analysis_sequence_end": row.get("analysis_sequence_end", len(reference_sequence)),
+                "analysis_sequence_transform": row.get("analysis_sequence_transform", "full"),
                 "functional_score": row.get("functional_score", np.nan),
                 "has_clinvar": row.get("has_clinvar", np.nan),
                 "clinvar_significance_normalized": row.get("clinvar_significance_normalized", np.nan),
@@ -483,12 +663,24 @@ def build_annotations(metadata_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, force: bool = False) -> DatasetPaths:
+def prepare_dataset(
+    raw_csv: Path,
+    output_root: Path,
+    drop_stop: bool = True,
+    force: bool = False,
+    dataset_name: str | None = None,
+    sequence_transform: str = "full",
+) -> DatasetPaths:
     raw_csv = Path(raw_csv).resolve()
     raw_stat = raw_csv.stat()
-    dataset = safe_name(raw_csv.stem)
+    dataset = safe_name(dataset_name or raw_csv.stem)
     paths = dataset_paths(output_root, dataset)
     ensure_dataset_dirs(paths)
+    transform_cache_keys = {
+        "sequence_transform": sequence_transform,
+        "context_length": int(ESMC_CONTEXT_LENGTH) if sequence_transform != "full" else None,
+        "window_stride": int(ESMC_WINDOW_STRIDE) if sequence_transform == "sliding2048_overlap1024" else None,
+    }
     if paths.state_path.is_file() and not force:
         try:
             state = read_pickle(paths.state_path)
@@ -496,15 +688,38 @@ def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, fo
                 Path(state.get("raw_csv", "")).resolve() == raw_csv
                 and int(state.get("raw_csv_size", -1)) == int(raw_stat.st_size)
                 and int(state.get("raw_csv_mtime_ns", -1)) == int(raw_stat.st_mtime_ns)
+                and all(state.get(key) == value for key, value in transform_cache_keys.items())
             ):
                 return paths
         except Exception:
             pass
 
     raw_df = pd.read_csv(raw_csv)
-    reference_sequence, ref_summary = infer_reference_sequence(raw_df)
+    full_reference_sequence, ref_summary = infer_reference_sequence(raw_df)
     df = raw_df.copy()
     df["SequenceIndex"] = make_sequence_ids(df)
+    if sequence_transform == "last2048":
+        df, reference_sequence, transform_summary = truncate_dataframe_to_reference_suffix(
+            df,
+            full_reference_sequence,
+            context_length=ESMC_CONTEXT_LENGTH,
+        )
+    elif sequence_transform == "sliding2048_overlap1024":
+        reference_sequence = full_reference_sequence
+        df, transform_summary = add_full_length_transform_columns(df, reference_sequence, sequence_transform)
+        transform_summary.update(
+            {
+                "context_length": int(ESMC_CONTEXT_LENGTH),
+                "window_stride": int(ESMC_WINDOW_STRIDE),
+            }
+        )
+    elif sequence_transform == "full":
+        reference_sequence = full_reference_sequence
+        df, transform_summary = add_full_length_transform_columns(df, reference_sequence, sequence_transform)
+        transform_summary.update({"context_length": None, "window_stride": None})
+    else:
+        raise ValueError(f"Unsupported sequence_transform: {sequence_transform!r}")
+
     parsed = df["mutant"].map(parse_mutant)
     df["wt_aa"] = parsed.map(lambda value: value[0])
     df["position"] = parsed.map(lambda value: value[1])
@@ -527,6 +742,14 @@ def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, fo
     sequence_to_mutation_sites = {WILDTYPE_KEY: []}
     for _, row in metadata_df.iterrows():
         sequence_to_mutation_sites[str(row["SequenceIndex"])] = json.loads(row["mutation_sites"])
+    window_state = {}
+    window_summary = {}
+    if sequence_transform == "sliding2048_overlap1024":
+        window_state, window_summary = build_sliding_window_embedding_state(
+            sequence_to_protein_sequence,
+            window_size=ESMC_CONTEXT_LENGTH,
+            stride=ESMC_WINDOW_STRIDE,
+        )
 
     paths.reference_path.write_text(f">{dataset}\n{reference_sequence}\n")
     df.to_csv(paths.counts_path, index=False)
@@ -544,6 +767,7 @@ def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, fo
         "kept_rows": int(len(df)),
         "dropped_stop_rows": int(len(raw_df) - len(df)) if drop_stop else 0,
         "reference_length": int(len(reference_sequence)),
+        "full_reference_length": int(len(full_reference_sequence)),
         "trajectory_columns": int(len(specs)),
         "trajectory_source_kind": specs[0].source_kind if specs else "",
         "trajectory_replicates": int(sequence_dataframe["Replicate"].nunique()) if not sequence_dataframe.empty else 0,
@@ -552,6 +776,8 @@ def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, fo
         ),
         "functional_score_rows": int(scores_df["score"].notna().sum()),
         "binary_clinvar_rows": int(annotations_df["annotation"].isin(PATHOGENICITY_LABELS).sum()),
+        **transform_summary,
+        **window_summary,
         **ref_summary,
     }
     pd.DataFrame([summary]).to_csv(paths.processing_summary_path, index=False)
@@ -561,8 +787,10 @@ def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, fo
         "raw_csv": str(raw_csv),
         "raw_csv_size": int(raw_stat.st_size),
         "raw_csv_mtime_ns": int(raw_stat.st_mtime_ns),
+        **transform_cache_keys,
         "paths": {key: str(value) for key, value in paths.__dict__.items() if isinstance(value, Path)},
         "reference_sequence": reference_sequence,
+        "full_reference_sequence": full_reference_sequence,
         "reference_kind": "protein",
         "sequence_dataframe": sequence_dataframe,
         "sequence_to_protein_sequence": sequence_to_protein_sequence,
@@ -572,6 +800,7 @@ def prepare_dataset(raw_csv: Path, output_root: Path, drop_stop: bool = True, fo
         "annotations_dataframe": annotations_df,
         "has_real_trajectory": bool(not sequence_dataframe.empty),
         "summary": summary,
+        **window_state,
     }
     write_pickle(paths.state_path, state)
     return paths
@@ -637,6 +866,60 @@ def available_datasets(output_root: Path) -> list[str]:
     if not root.is_dir():
         return []
     return sorted(path.name for path in root.iterdir() if (path / "sequence_data" / f"{path.name}_processed_state.pkl").is_file())
+
+
+def expand_sahu_brca2_base_selection(selected: set[str]) -> set[str]:
+    selected = set(selected)
+    if SAHU_BRCA2_BASE_DATASET in selected:
+        selected.discard(SAHU_BRCA2_BASE_DATASET)
+        selected.update(sahu_brca2_derived_dataset_names())
+    return selected
+
+
+def filter_sahu_brca2_final_datasets(datasets: Iterable[str], keep: str = "both") -> list[str]:
+    keep = str(keep or "both")
+    derived = sahu_brca2_derived_dataset_names()
+    if keep == "both":
+        keep_derived = derived
+    elif keep == "none":
+        keep_derived = set()
+    elif keep in SAHU_BRCA2_DERIVED_DATASETS:
+        keep_derived = {SAHU_BRCA2_DERIVED_DATASETS[keep]}
+    else:
+        raise ValueError(
+            f"Unsupported Sahu BRCA2 final dataset option {keep!r}; "
+            "expected one of both, last2048, sliding-window, none."
+        )
+    out = []
+    for dataset in datasets:
+        dataset = str(dataset)
+        if dataset in derived:
+            if dataset in keep_derived:
+                out.append(dataset)
+        else:
+            out.append(dataset)
+    return out
+
+
+def dataset_uses_sliding_window_embeddings(state: dict) -> bool:
+    return state.get("embedding_window_method") == "sliding_max_pool"
+
+
+def filter_count_available_datasets(output_root: Path, datasets: Iterable[str]) -> list[str]:
+    output_root = Path(output_root)
+    out = []
+    for dataset in datasets:
+        state = load_dataset_state(output_root, str(dataset))
+        if bool(state.get("has_real_trajectory", False)):
+            out.append(str(dataset))
+    return out
+
+
+def command_datasets(args: argparse.Namespace, output_root: Path, count_datasets_only: bool = False) -> list[str]:
+    datasets = list(args.datasets) if getattr(args, "datasets", None) else available_datasets(output_root)
+    if count_datasets_only or getattr(args, "count_datasets_only", False):
+        datasets = filter_count_available_datasets(output_root, datasets)
+    return datasets
 
 
 def annotation_map_for_dataset(output_root: Path, dataset: str) -> dict[str, str]:
@@ -975,7 +1258,8 @@ def cross_replicate_consistency_dataframe(
     datasets: list[str] | None = None,
 ) -> pd.DataFrame:
     output_root = Path(output_root)
-    datasets = datasets or available_datasets(output_root)
+    if datasets is None:
+        datasets = available_datasets(output_root)
     rows = []
     for dataset in datasets:
         state = load_dataset_state(output_root, dataset)
@@ -1146,7 +1430,8 @@ def write_cross_replicate_consistency_outputs(
     import seaborn as sns
 
     output_root = Path(output_root)
-    datasets = datasets or available_datasets(output_root)
+    if datasets is None:
+        datasets = available_datasets(output_root)
     table_path = table_path or output_root / "tables" / "clinprotgym_cross_replicate_consistency_by_dataset_method.csv"
     figure_path = figure_path or output_root / "figures" / "clinprotgym_cross_replicate_consistency_by_dataset_method.png"
     table_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1258,6 +1543,202 @@ export PYTHONUNBUFFERED=1
     return script_path
 
 
+def write_slurm_single_task_script(
+    script_path: Path,
+    payload_path: Path,
+    subcommand: str,
+    job_name: str,
+    log_dir: Path,
+    partition: str,
+    cpus_per_task: int,
+    mem: str,
+    time: str,
+    python_executable: str,
+) -> Path:
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    script = f"""#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH -p {partition}
+#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --time={time}
+#SBATCH --mem={mem}
+#SBATCH --output={log_dir}/merge-%j.out
+#SBATCH --error={log_dir}/merge-%j.err
+
+set -euo pipefail
+cd {REPO_ROOT}
+export PYTHONUNBUFFERED=1
+{python_executable} {Path(__file__).resolve()} {subcommand} {payload_path}
+"""
+    script_path.write_text(script)
+    script_path.chmod(0o755)
+    return script_path
+
+
+def prepare_runner_for_embedding_job(runner: esmDMS, state: dict) -> tuple[esmDMS, int, str]:
+    if not dataset_uses_sliding_window_embeddings(state):
+        return runner, len(runner.sequence_to_protein_sequence), ""
+    embedding_sequences = {
+        str(seq_id): str(sequence)
+        for seq_id, sequence in state["embedding_sequence_to_protein_sequence"].items()
+    }
+    runner.sequence_to_protein_sequence = embedding_sequences
+    runner.sequence_to_mutation_sites = {seq_id: [] for seq_id in embedding_sequences}
+    return runner, len(embedding_sequences), state["embedding_window_method"]
+
+
+def layer_label_sort_key(layer_label: object) -> tuple[int, str]:
+    label = str(layer_label)
+    try:
+        return int(label.replace("Layer_", "")), label
+    except ValueError:
+        return 10**9, label
+
+
+def aggregate_sliding_window_max_pool_embeddings(
+    output_root: Path,
+    dataset: str,
+    model_name: str,
+    job_dir: Path | None = None,
+    n_chunks: int | None = None,
+) -> dict:
+    output_root = Path(output_root)
+    state = load_dataset_state(output_root, dataset)
+    if not dataset_uses_sliding_window_embeddings(state):
+        raise ValueError(f"{dataset} is not configured for sliding-window embedding aggregation.")
+    runner = runner_for_dataset(output_root, dataset, model_name)
+    if job_dir is None:
+        job_dir = dataset_paths(output_root, dataset).job_dir / "embedding_batches" / model_cache_label(model_name)
+    batch_dir = runner._batch_dir(job_dir)
+    payload_path = runner._batch_payload_path(batch_dir)
+    if payload_path.is_file() and n_chunks is None:
+        n_chunks = int(read_pickle(payload_path)["n_chunks"])
+    if n_chunks is None:
+        raise ValueError("n_chunks is required when the embedding batch payload is missing.")
+
+    sequence_to_windows = {
+        str(seq_id): [str(window_id) for window_id in window_ids]
+        for seq_id, window_ids in state["sequence_to_embedding_windows"].items()
+    }
+    required_windows = {window_id for window_ids in sequence_to_windows.values() for window_id in window_ids}
+    layer_to_window_features: dict[str, dict[str, np.ndarray]] = {}
+    missing_chunk_paths = []
+    for chunk_idx in range(int(n_chunks)):
+        chunk_path = runner._batch_feature_chunk_path(batch_dir, chunk_idx, EMBEDDING_TYPE)
+        if not chunk_path.is_file():
+            missing_chunk_paths.append(chunk_path)
+            continue
+        chunk = read_pickle(chunk_path)
+        if not (
+            isinstance(chunk, dict)
+            and chunk.get("format") == "esmDMS_embedding_feature_chunk_v2"
+            and chunk.get("embedding_type") == EMBEDDING_TYPE
+        ):
+            raise ValueError(f"Unexpected max-pool feature chunk format in {chunk_path}.")
+        for layer_label, window_features in chunk["features_by_layer"].items():
+            layer_features = layer_to_window_features.setdefault(str(layer_label), {})
+            for window_id, feature in window_features.items():
+                layer_features[str(window_id)] = np.asarray(feature)
+    if missing_chunk_paths:
+        raise FileNotFoundError(f"Missing max-pool embedding chunk files: {missing_chunk_paths}")
+
+    rows = []
+    for layer_label in sorted(layer_to_window_features, key=layer_label_sort_key):
+        window_features = layer_to_window_features[layer_label]
+        missing_windows = sorted(required_windows - set(window_features))
+        if missing_windows:
+            raise FileNotFoundError(
+                f"Missing {len(missing_windows)} window embeddings for {dataset} {model_name} {layer_label}; "
+                f"first missing windows: {missing_windows[:5]}"
+            )
+        sequence_features = {}
+        for seq_id, window_ids in sequence_to_windows.items():
+            vectors = [np.asarray(window_features[window_id]) for window_id in window_ids]
+            if len(vectors) == 1:
+                sequence_features[seq_id] = vectors[0].copy()
+            else:
+                sequence_features[seq_id] = np.maximum.reduce(vectors)
+        embedding_path = runner._embedding_path(layer_label, EMBEDDING_TYPE)
+        write_pickle(embedding_path, sequence_features)
+        rows.append(
+            {
+                "dataset": dataset,
+                "model": model_name,
+                "model_short": model_short_name(model_name),
+                "layer": layer_label,
+                "embedding_type": EMBEDDING_TYPE,
+                "n_sequences": int(len(sequence_features)),
+                "n_windows": int(len(required_windows)),
+                "path": str(embedding_path),
+            }
+        )
+
+    paths = dataset_paths(output_root, dataset)
+    status_path = paths.table_dir / f"{dataset}_{model_cache_label(model_name)}_window_embedding_merge_status.csv"
+    pd.DataFrame(rows).to_csv(status_path, index=False)
+    return {
+        "status": "ok",
+        "dataset": dataset,
+        "model": model_name,
+        "embedding_type": EMBEDDING_TYPE,
+        "n_layers": int(len(rows)),
+        "n_sequences": int(len(sequence_to_windows)),
+        "n_windows": int(len(required_windows)),
+        "status_path": str(status_path),
+    }
+
+
+def create_sliding_window_embedding_merge_job(
+    output_root: Path,
+    dataset: str,
+    model_name: str,
+    job_dir: Path,
+    n_chunks: int,
+    partition: str,
+    cpus_per_task: int,
+    mem: str,
+    time: str,
+    python_executable: str,
+) -> dict[str, Path | str]:
+    batch_dir = Path(job_dir)
+    logs_dir = batch_dir / "logs"
+    payload = {
+        "output_root": str(output_root),
+        "dataset": dataset,
+        "model": model_name,
+        "job_dir": str(job_dir),
+        "n_chunks": int(n_chunks),
+    }
+    payload_path = batch_dir / f"{dataset}_window_embedding_merge_payload.pkl"
+    write_pickle(payload_path, payload)
+    script_path = write_slurm_single_task_script(
+        script_path=batch_dir / "submit_window_embedding_merge.sh",
+        payload_path=payload_path,
+        subcommand="run-window-embedding-merge",
+        job_name=safe_name(f"{dataset}_{model_short_name(model_name)}_winmerge")[:48],
+        log_dir=logs_dir,
+        partition=partition,
+        cpus_per_task=cpus_per_task,
+        mem=mem,
+        time=time,
+        python_executable=python_executable,
+    )
+    return {"batch_dir": batch_dir, "payload_path": payload_path, "script_path": script_path, "job_id": ""}
+
+
+def run_window_embedding_merge(args: argparse.Namespace) -> None:
+    payload = read_pickle(Path(args.payload_path))
+    result = aggregate_sliding_window_max_pool_embeddings(
+        output_root=Path(payload["output_root"]),
+        dataset=payload["dataset"],
+        model_name=payload["model"],
+        job_dir=Path(payload["job_dir"]),
+        n_chunks=int(payload["n_chunks"]),
+    )
+    print(json.dumps(result, indent=2, default=str))
+
+
 def create_embedding_jobs(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     datasets = args.datasets or available_datasets(output_root)
@@ -1265,6 +1746,7 @@ def create_embedding_jobs(args: argparse.Namespace) -> None:
     merge_rows = []
     for dataset in datasets:
         paths = dataset_paths(output_root, dataset)
+        state = load_dataset_state(output_root, dataset)
         for model_name in args.models:
             runner = runner_for_dataset(output_root, dataset, model_name)
             defaults = model_job_defaults(model_name)
@@ -1284,9 +1766,13 @@ def create_embedding_jobs(args: argparse.Namespace) -> None:
                 "payload_path": "",
                 "job_id": "",
                 "submitted": False,
+                "embedding_window_method": state.get("embedding_window_method", ""),
+                "n_embedding_sequences": "",
             }
             if action != "skip_complete":
-                job = runner.create_embedding_batch_job(
+                embedding_runner, n_embedding_sequences, window_method = prepare_runner_for_embedding_job(runner, state)
+                row["n_embedding_sequences"] = int(n_embedding_sequences)
+                job = embedding_runner.create_embedding_batch_job(
                     job_dir=job_dir,
                     n_chunks=args.n_chunks or defaults["n_chunks"],
                     max_active_jobs=args.max_active_embedding_tasks,
@@ -1312,19 +1798,33 @@ def create_embedding_jobs(args: argparse.Namespace) -> None:
                         "submitted": bool(args.submit),
                     }
                 )
-                merge_job = runner.create_embedding_batch_merge_job(
-                    job_dir=job_dir,
-                    layer="all",
-                    n_chunks=args.n_chunks or defaults["n_chunks"],
-                    save_layers=True,
-                    job_name=safe_name(f"{dataset}_{model_short_name(model_name)}_merge")[:48],
-                    partition=args.merge_partition,
-                    cpus_per_task=1,
-                    mem=args.merge_mem,
-                    time=args.merge_time,
-                    python_executable=args.python_executable,
-                    submit=False,
-                )
+                if window_method:
+                    merge_job = create_sliding_window_embedding_merge_job(
+                        output_root=output_root,
+                        dataset=dataset,
+                        model_name=model_name,
+                        job_dir=job_dir,
+                        n_chunks=args.n_chunks or defaults["n_chunks"],
+                        partition=args.merge_partition,
+                        cpus_per_task=1,
+                        mem=args.merge_mem,
+                        time=args.merge_time,
+                        python_executable=args.python_executable,
+                    )
+                else:
+                    merge_job = runner.create_embedding_batch_merge_job(
+                        job_dir=job_dir,
+                        layer="all",
+                        n_chunks=args.n_chunks or defaults["n_chunks"],
+                        save_layers=True,
+                        job_name=safe_name(f"{dataset}_{model_short_name(model_name)}_merge")[:48],
+                        partition=args.merge_partition,
+                        cpus_per_task=1,
+                        mem=args.merge_mem,
+                        time=args.merge_time,
+                        python_executable=args.python_executable,
+                        submit=False,
+                    )
                 merge_rows.append(
                     {
                         "dataset": dataset,
@@ -1333,6 +1833,7 @@ def create_embedding_jobs(args: argparse.Namespace) -> None:
                         "script_path": str(merge_job["script_path"]),
                         "payload_path": str(merge_job["payload_path"]),
                         "submitted": False,
+                        "embedding_window_method": window_method,
                     }
                 )
             rows.append(row)
@@ -1347,18 +1848,31 @@ def create_embedding_jobs(args: argparse.Namespace) -> None:
 
 
 def merge_embeddings(args: argparse.Namespace) -> None:
-    for dataset in args.datasets or available_datasets(Path(args.output_root)):
+    output_root = Path(args.output_root)
+    for dataset in args.datasets or available_datasets(output_root):
+        state = load_dataset_state(output_root, dataset)
         for model_name in args.models:
-            runner = runner_for_dataset(Path(args.output_root), dataset, model_name)
-            job_dir = dataset_paths(Path(args.output_root), dataset).job_dir / "embedding_batches" / model_cache_label(model_name)
-            runner.merge_embedding_batch_outputs(job_dir=job_dir, layer="all", n_chunks=args.n_chunks, save_layers=True)
-            print(f"Merged embeddings for {dataset} {model_name}")
+            job_dir = dataset_paths(output_root, dataset).job_dir / "embedding_batches" / model_cache_label(model_name)
+            if dataset_uses_sliding_window_embeddings(state):
+                result = aggregate_sliding_window_max_pool_embeddings(
+                    output_root=output_root,
+                    dataset=dataset,
+                    model_name=model_name,
+                    job_dir=job_dir,
+                    n_chunks=args.n_chunks,
+                )
+                print(f"Merged sliding-window max-pool embeddings for {dataset} {model_name}: {result['status_path']}")
+            else:
+                runner = runner_for_dataset(output_root, dataset, model_name)
+                runner.merge_embedding_batch_outputs(job_dir=job_dir, layer="all", n_chunks=args.n_chunks, save_layers=True)
+                print(f"Merged embeddings for {dataset} {model_name}")
 
 
 def write_embedding_cache_status(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     all_rows = []
     for dataset in args.datasets or available_datasets(output_root):
+        state = load_dataset_state(output_root, dataset)
         rows = []
         for model_name in args.models:
             runner = runner_for_dataset(output_root, dataset, model_name)
@@ -1371,6 +1885,7 @@ def write_embedding_cache_status(args: argparse.Namespace) -> None:
                         "model_short": model_short_name(model_name),
                         "layer": layer,
                         "embedding_type": EMBEDDING_TYPE,
+                        "embedding_window_method": state.get("embedding_window_method", ""),
                         "path": str(path),
                         "exists": path.is_file(),
                     }
@@ -1388,6 +1903,9 @@ def create_llr_jobs(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     tasks = []
     for dataset in args.datasets or available_datasets(output_root):
+        state = load_dataset_state(output_root, dataset)
+        if dataset_uses_sliding_window_embeddings(state):
+            continue
         for model_name in args.models:
             paths = dataset_paths(output_root, dataset)
             tasks.append(
@@ -1400,6 +1918,12 @@ def create_llr_jobs(args: argparse.Namespace) -> None:
                     "torch_dtype": model_job_defaults(model_name)["torch_dtype"],
                 }
             )
+    task_table_path = output_root / "tables" / "clinprotgym_llr_tasks.csv"
+    task_table_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(tasks).to_csv(task_table_path, index=False)
+    if not tasks:
+        print(f"No LLR tasks were created. Wrote empty task table: {task_table_path}")
+        return
     payload = {"output_root": str(output_root), "tasks": tasks}
     job_root = output_root / "jobs" / "llr"
     payload_path = job_root / "clinprotgym_llr_payload.pkl"
@@ -1418,7 +1942,6 @@ def create_llr_jobs(args: argparse.Namespace) -> None:
         max_active_tasks=args.max_active_llr_tasks,
         python_executable=args.python_executable,
     )
-    pd.DataFrame(tasks).to_csv(output_root / "tables" / "clinprotgym_llr_tasks.csv", index=False)
     print(f"Wrote LLR payload: {payload_path}")
     print(f"Wrote LLR array script: {script_path}")
     if args.submit:
@@ -1574,7 +2097,8 @@ def run_payload_task(payload_path: Path, task_idx: int, runner_fn) -> None:
 def create_sae_jobs(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     tasks = []
-    for dataset in args.datasets or available_datasets(output_root):
+    for dataset in command_datasets(args, output_root):
+        state = load_dataset_state(output_root, dataset)
         for model_name in args.models:
             for layer in model_layers(model_name, args.layer_counts):
                 tasks.append(
@@ -1587,6 +2111,7 @@ def create_sae_jobs(args: argparse.Namespace) -> None:
                         "embedding_type": EMBEDDING_TYPE,
                         "params": dict(BEST_SAE_PARAMS),
                         "run_label": BEST_SAE_PARAMS["run_label"],
+                        "run_inference": bool(state.get("has_real_trajectory", False)),
                     }
                 )
     job_root = output_root / "jobs" / "fixed_deltaembsae_layer_array"
@@ -1632,6 +2157,7 @@ def run_sae_task(payload_path: Path, task_idx: int) -> dict:
     layer = task["layer"]
     paths = dataset_paths(output_root, dataset)
     runner = runner_for_dataset(output_root, dataset, model_name)
+    run_inference = bool(task.get("run_inference", bool(load_dataset_state(output_root, dataset).get("has_real_trajectory", False))))
     embedding_path = runner._embedding_path(layer, EMBEDDING_TYPE)
     if not embedding_path.is_file():
         raise FileNotFoundError(f"Missing embedding cache for {dataset} {model_name} layer {layer}: {embedding_path}")
@@ -1666,7 +2192,7 @@ def run_sae_task(payload_path: Path, task_idx: int) -> dict:
         "configs": [{"run_label": task["run_label"], "params": params}],
         "gpus": 1,
         "max_parallel_runs": 1,
-        "run_inference": True,
+        "run_inference": run_inference,
         "force_recompute": bool(payload.get("force_recompute", False)),
         "require_cuda": False,
     }
@@ -1697,7 +2223,7 @@ def run_sae_task(payload_path: Path, task_idx: int) -> dict:
 def collect_sae(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     all_rows = []
-    for dataset in args.datasets or available_datasets(output_root):
+    for dataset in command_datasets(args, output_root):
         paths = dataset_paths(output_root, dataset)
         result_paths = sorted((paths.job_dir / "fixed_sae_model_layer_array").glob("*/Layer_*/sae_sweep_results.csv"))
         rows = [pd.read_csv(path) for path in result_paths]
@@ -1716,7 +2242,7 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
     tasks = []
     sae_metrics_path = output_root / "tables" / "clinprotgym_fixed_deltaembsae_layer_metrics.csv"
     sae_metrics_df = pd.read_csv(sae_metrics_path) if sae_metrics_path.is_file() else pd.DataFrame()
-    for dataset in args.datasets or available_datasets(output_root):
+    for dataset in command_datasets(args, output_root):
         state = load_dataset_state(output_root, dataset)
         has_trajectory = bool(state["has_real_trajectory"])
         paths = dataset_paths(output_root, dataset)
@@ -1925,7 +2451,7 @@ def run_benchmark_task(payload_path: Path, task_idx: int) -> dict:
 
 def collect_benchmarks(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
-    active_datasets = args.datasets or available_datasets(output_root)
+    active_datasets = command_datasets(args, output_root)
     task_table_path = output_root / "tables" / "clinprotgym_benchmark_tasks.csv"
     task_table = pd.read_csv(task_table_path) if task_table_path.is_file() else pd.DataFrame()
     all_frames = []
@@ -1958,7 +2484,7 @@ def create_ensemble_jobs(args: argparse.Namespace) -> None:
     if not metrics_path.is_file():
         raise FileNotFoundError(f"Missing benchmark metrics: {metrics_path}. Run collect-benchmarks first.")
     metrics_df = pd.read_csv(metrics_path)
-    for dataset in args.datasets or available_datasets(output_root):
+    for dataset in command_datasets(args, output_root):
         state = load_dataset_state(output_root, dataset)
         if not state["has_real_trajectory"]:
             continue
@@ -2095,7 +2621,7 @@ def run_ensemble_task(payload_path: Path, task_idx: int) -> dict:
 def collect_ensembles(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     frames = []
-    for dataset in args.datasets or available_datasets(output_root):
+    for dataset in command_datasets(args, output_root):
         paths = dataset_paths(output_root, dataset)
         metric_paths = sorted((paths.table_dir / "sae_ensemble_gamma1").glob("*_metrics.csv"))
         dataset_df = pd.concat([pd.read_csv(path) for path in metric_paths], ignore_index=True, sort=False) if metric_paths else pd.DataFrame()
@@ -2111,7 +2637,11 @@ def collect_ensembles(args: argparse.Namespace) -> None:
 
 def summarize(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
-    active_datasets = set(args.datasets or available_datasets(output_root))
+    active_dataset_list = filter_sahu_brca2_final_datasets(
+        command_datasets(args, output_root),
+        getattr(args, "sahu_brca2_final", "both"),
+    )
+    active_datasets = set(active_dataset_list)
     frames = []
     for path in [
         output_root / "tables" / "clinprotgym_method_metrics.csv",
@@ -2122,7 +2652,7 @@ def summarize(args: argparse.Namespace) -> None:
     if not frames:
         raise FileNotFoundError("No method or ensemble metrics were found to summarize.")
     metrics_df = pd.concat(frames, ignore_index=True, sort=False)
-    if active_datasets and "dataset" in metrics_df.columns:
+    if "dataset" in metrics_df.columns:
         metrics_df = metrics_df[metrics_df["dataset"].astype(str).isin(active_datasets)].copy()
     wanted = [
         "Enrichment ratio baseline",
@@ -2147,7 +2677,7 @@ def summarize(args: argparse.Namespace) -> None:
             selected_rows.append(group.iloc[0])
             continue
         selected_rows.append(finite.sort_values(["spearman_rho", "auc"], ascending=[False, False]).iloc[0])
-    selected_df = pd.DataFrame(selected_rows)
+    selected_df = pd.DataFrame(selected_rows) if selected_rows else pd.DataFrame(columns=metrics_df.columns)
     summary_rows = []
     for family in wanted:
         group = selected_df[selected_df["method_family"].eq(family)]
@@ -2178,7 +2708,10 @@ def summarize(args: argparse.Namespace) -> None:
 
 def cross_replicate_consistency(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
-    datasets = args.datasets or available_datasets(output_root)
+    datasets = filter_sahu_brca2_final_datasets(
+        command_datasets(args, output_root),
+        getattr(args, "sahu_brca2_final", "both"),
+    )
     consistency_df, plot_df, table_path, figure_path = write_cross_replicate_consistency_outputs(
         output_root,
         datasets=datasets,
@@ -2198,6 +2731,16 @@ def cross_replicate_consistency(args: argparse.Namespace) -> None:
         )
 
 
+def preparation_specs_for_csv(raw_csv: Path) -> list[dict[str, str]]:
+    dataset = safe_name(Path(raw_csv).stem)
+    if dataset == SAHU_BRCA2_BASE_DATASET:
+        return [
+            {"dataset_name": SAHU_BRCA2_LAST2048_DATASET, "sequence_transform": "last2048"},
+            {"dataset_name": SAHU_BRCA2_WINDOW_DATASET, "sequence_transform": "sliding2048_overlap1024"},
+        ]
+    return [{"dataset_name": dataset, "sequence_transform": "full"}]
+
+
 def prepare(args: argparse.Namespace) -> None:
     input_dir = Path(args.input_dir)
     output_root = Path(args.output_root)
@@ -2207,10 +2750,18 @@ def prepare(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"No CSV files matched under {input_dir}.")
     rows = []
     for raw_csv in csvs:
-        paths = prepare_dataset(raw_csv, output_root, drop_stop=not args.keep_stop, force=args.force)
-        summary = pd.read_csv(paths.processing_summary_path).iloc[0].to_dict()
-        rows.append(summary)
-        print(f"Prepared {paths.dataset}: {paths.state_path}")
+        for spec in preparation_specs_for_csv(raw_csv):
+            paths = prepare_dataset(
+                raw_csv,
+                output_root,
+                drop_stop=not args.keep_stop,
+                force=args.force,
+                dataset_name=spec["dataset_name"],
+                sequence_transform=spec["sequence_transform"],
+            )
+            summary = pd.read_csv(paths.processing_summary_path).iloc[0].to_dict()
+            rows.append(summary)
+            print(f"Prepared {paths.dataset}: {paths.state_path}")
     manifest_path = output_root / "tables" / "clinprotgym_processing_manifest.csv"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(manifest_path, index=False)
@@ -2239,12 +2790,33 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-layer-count", action="append", help="Register an extra model layer count as MODEL=N.")
 
 
+def add_sahu_brca2_final_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--sahu-brca2-final",
+        choices=["both", "last2048", "sliding-window", "none"],
+        default="both",
+        help=(
+            "Which derived Sahu BRCA2 ESM-C context analysis to include in final summary/plot commands. "
+            "Both derived datasets can still be calculated before this filter is applied."
+        ),
+    )
+
+
+def add_count_dataset_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--count-datasets-only",
+        action="store_true",
+        help="Restrict this analysis command to datasets with real trajectory/count data in the processed state.",
+    )
+
+
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if hasattr(args, "model_layer_count"):
         args.layer_counts = parse_model_layer_counts(args.model_layer_count)
     if hasattr(args, "datasets") and args.datasets:
         selected = parse_dataset_selection(args.datasets)
         if selected is not None and not hasattr(args, "input_dir"):
+            selected = expand_sahu_brca2_base_selection(selected)
             available = available_datasets(Path(args.output_root))
             args.datasets = [dataset for dataset in available if dataset in selected]
     return args
@@ -2285,6 +2857,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_args(p)
     p.add_argument("--n-chunks", type=int)
     p.set_defaults(func=merge_embeddings)
+
+    p = sub.add_parser("run-window-embedding-merge")
+    p.add_argument("payload_path")
+    p.set_defaults(func=run_window_embedding_merge)
 
     p = sub.add_parser("cache-status", help="Write embedding cache status tables.")
     add_common_args(p)
@@ -2333,6 +2909,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-benchmark-jobs", help="Write method benchmark jobs.")
     add_common_args(p)
     add_model_args(p)
+    add_count_dataset_arg(p)
     p.add_argument("--python-executable", default="python3")
     p.add_argument("--benchmark-partition", default="any_cpu")
     p.add_argument("--benchmark-cpus", type=int, default=4)
@@ -2350,10 +2927,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("collect-benchmarks", help="Collect benchmark metrics.")
     add_common_args(p)
+    add_count_dataset_arg(p)
     p.set_defaults(func=collect_benchmarks)
 
     p = sub.add_parser("create-ensemble-jobs", help="Write gamma=1 SAE rank-worst ensemble jobs.")
     add_common_args(p)
+    add_count_dataset_arg(p)
     p.add_argument("--ensemble-top-n", type=int, default=12)
     p.add_argument("--ensemble-gamma", type=float, default=1.0)
     p.add_argument("--python-executable", default="python3")
@@ -2372,10 +2951,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("collect-ensembles", help="Collect ensemble metrics.")
     add_common_args(p)
+    add_count_dataset_arg(p)
     p.set_defaults(func=collect_ensembles)
 
     p = sub.add_parser("summarize", help="Write average Spearman/AUC summary across datasets.")
     add_common_args(p)
+    add_count_dataset_arg(p)
+    add_sahu_brca2_final_arg(p)
     p.set_defaults(func=summarize)
 
     p = sub.add_parser(
@@ -2383,6 +2965,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the ClinProtGym cross-replicate consistency table and dot plot.",
     )
     add_common_args(p)
+    add_count_dataset_arg(p)
+    add_sahu_brca2_final_arg(p)
     p.add_argument(
         "--omit-empty-datasets",
         action="store_true",
