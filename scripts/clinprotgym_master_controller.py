@@ -118,7 +118,7 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
 
 def parse_policies(values: list[str] | None) -> list[EmbeddingPolicy]:
     if not values:
-        values = ["120:128G:2", "180:192G:1", "240:256G:1"]
+        values = ["120:64G:6", "180:64G:6"]
     policies: list[EmbeddingPolicy] = []
     for value in values:
         parts = value.split(":")
@@ -342,6 +342,21 @@ def embedding_chunk_status(output_root: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def worst_missing_chunk_fraction(rows: list[dict[str, Any]]) -> tuple[float, dict[str, Any] | None]:
+    worst_fraction = 0.0
+    worst_row = None
+    for row in rows:
+        n_chunks = int(row.get("n_chunks") or 0)
+        if n_chunks < 1:
+            continue
+        missing = len(row.get("missing_chunks") or [])
+        fraction = missing / n_chunks
+        if fraction > worst_fraction:
+            worst_fraction = fraction
+            worst_row = row
+    return worst_fraction, worst_row
+
+
 def submit_embedding_arrays(
     args: argparse.Namespace,
     policy: EmbeddingPolicy,
@@ -364,6 +379,8 @@ def submit_embedding_arrays(
         "--max-active",
         str(policy.max_active),
     ]
+    if args.embedding_target_active_total > 0:
+        command.extend(["--target-active-total", str(args.embedding_target_active_total)])
     if dry_run:
         command.append("--dry-run")
     result = run_command(command, dry_run=False)
@@ -693,7 +710,12 @@ def handle_embedding(
     missing_rows = [row for row in chunk_rows if row["missing_chunks"]]
     if missing_rows:
         if state.get("embedding_submitted"):
-            if policy_index + 1 < len(policies):
+            worst_fraction, worst_row = worst_missing_chunk_fraction(missing_rows)
+            should_escalate = (
+                worst_fraction > float(args.embedding_escalate_failure_fraction)
+                and policy_index + 1 < len(policies)
+            )
+            if should_escalate:
                 archive_incomplete_embedding_chunks(
                     args,
                     incomplete_pairs,
@@ -707,26 +729,42 @@ def handle_embedding(
                 state["embedding_submitted"] = False
                 state["merge_submitted"] = False
                 state["job_ids"] = {}
+                state["final_policy_resubmits"] = 0
                 append_event(
                     state,
                     "escalating embedding policy",
                     from_n_chunks=policy.n_chunks,
                     to_n_chunks=policies[policy_index + 1].n_chunks,
+                    worst_missing_fraction=worst_fraction,
+                    threshold=args.embedding_escalate_failure_fraction,
+                    dataset=(worst_row or {}).get("dataset", ""),
+                    model=(worst_row or {}).get("model_short", ""),
                 )
                 write_json(args.state_path, state)
                 return "continue"
-            if int(state.get("final_policy_resubmits", 0)) >= args.max_final_embedding_resubmits:
-                if args.allow_partial_downstream:
-                    state["stage"] = "sae"
-                    append_event(state, "final embedding policy incomplete; proceeding with complete datasets")
+            append_event(
+                state,
+                "retrying missing embedding chunks with same policy",
+                n_chunks=policy.n_chunks,
+                mem=policy.mem,
+                max_active=policy.max_active,
+                worst_missing_fraction=worst_fraction,
+                threshold=args.embedding_escalate_failure_fraction,
+                missing_rows=len(missing_rows),
+            )
+            if policy_index + 1 >= len(policies):
+                if int(state.get("final_policy_resubmits", 0)) >= args.max_final_embedding_resubmits:
+                    if args.allow_partial_downstream:
+                        state["stage"] = "sae"
+                        append_event(state, "final embedding policy incomplete; proceeding with complete datasets")
+                        write_json(args.state_path, state)
+                        return "continue"
+                    state["stage"] = "blocked"
+                    append_event(state, "final embedding policy failed", missing_rows=len(missing_rows))
                     write_json(args.state_path, state)
-                    return "continue"
-                state["stage"] = "blocked"
-                append_event(state, "final embedding policy failed", missing_rows=len(missing_rows))
-                write_json(args.state_path, state)
-                print("Final embedding policy still has missing chunks; controller is blocked.")
-                return "stop"
-            state["final_policy_resubmits"] = int(state.get("final_policy_resubmits", 0)) + 1
+                    print("Final embedding policy still has missing chunks; controller is blocked.")
+                    return "stop"
+                state["final_policy_resubmits"] = int(state.get("final_policy_resubmits", 0)) + 1
 
         job_ids = submit_embedding_arrays(args, policy, dry_run=args.dry_run)
         state.setdefault("job_ids", {})["embedding"] = job_ids
@@ -887,6 +925,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-partition", default="dept_cpu")
     parser.add_argument("--embedding-cpus", type=int, default=4)
     parser.add_argument("--embedding-time", default="24:00:00")
+    parser.add_argument(
+        "--embedding-escalate-failure-fraction",
+        type=float,
+        default=0.10,
+        help="Escalate to the next embedding policy only when any dataset/model is missing more than this fraction of chunks.",
+    )
+    parser.add_argument(
+        "--embedding-target-active-total",
+        type=int,
+        default=20,
+        help=(
+            "When the per-dataset/model max-active setting would allow fewer than this many "
+            "embedding array tasks in aggregate, raise per-row array limits to approach this total."
+        ),
+    )
     parser.add_argument("--merge-partition", default="any_cpu")
     parser.add_argument("--merge-mem", default="16G")
     parser.add_argument("--merge-time", default="02:00:00")

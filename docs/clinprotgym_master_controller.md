@@ -35,14 +35,22 @@ The controller starts with larger chunks than the original 40-chunk jobs:
 
 | Attempt | `n_chunks` | Memory | Max active tasks per dataset/model |
 |---:|---:|---:|---:|
-| 1 | 120 | `128G` | 2 |
-| 2 | 180 | `192G` | 1 |
-| 3 | 240 | `256G` | 1 |
+| 1 | 120 | `64G` | 6 |
+| 2 | 180 | `64G` | 6 |
 
-When an embedding attempt finishes with missing chunks, the controller archives
-active chunk files for the incomplete dataset/model pairs before increasing
-`n_chunks`. It moves files into timestamped directories inside each batch
-directory; it does not delete outputs.
+When an embedding attempt finishes with missing chunks, the controller checks
+the worst missing-chunk fraction for any dataset/model pair. If more than 10%
+of chunks are missing for any pair, it archives active chunk files for the
+incomplete pairs and increases `n_chunks` to the next policy. If 10% or fewer
+chunks are missing, it resubmits only the missing chunks using the same policy.
+Archived files are moved into timestamped directories inside each batch
+directory; the controller does not delete outputs.
+
+The per-dataset/model array limit starts at the policy value (`%6` by default).
+If the remaining embedding rows would allow fewer than 20 active tasks in
+aggregate, the submitter raises the per-row array limits for the remaining
+rows so the total can approach 20 active embedding tasks. If fewer than 20
+chunks remain total, it simply allows all remaining chunks to run.
 
 Example archive directory:
 
@@ -95,9 +103,22 @@ Use a custom embedding retry policy:
 
 ```bash
 sbatch job_scripts/run_clinprotgym_master_controller.sh \
-  --embedding-policy 120:128G:2 \
-  --embedding-policy 200:192G:1 \
-  --embedding-policy 300:256G:1
+  --embedding-policy 120:64G:6 \
+  --embedding-policy 180:64G:6
+```
+
+Change the escalation threshold:
+
+```bash
+sbatch job_scripts/run_clinprotgym_master_controller.sh \
+  --embedding-escalate-failure-fraction 0.05
+```
+
+Change the aggregate active-task target for embedding retries:
+
+```bash
+sbatch job_scripts/run_clinprotgym_master_controller.sh \
+  --embedding-target-active-total 16
 ```
 
 Proceed to SAE/analysis using only complete datasets if embeddings remain

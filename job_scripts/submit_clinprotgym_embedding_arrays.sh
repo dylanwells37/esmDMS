@@ -23,6 +23,7 @@ MEM="128G"
 CPUS="4"
 TIME="24:00:00"
 MAX_ACTIVE="2"
+TARGET_ACTIVE_TOTAL=""
 DRY_RUN=0
 SUBMIT_ALL=0
 DATASET_FILTER=""
@@ -42,6 +43,10 @@ Options:
   --cpus N               Slurm cpus-per-task override. Default: 4
   --time HH:MM:SS        Slurm time override. Default: 24:00:00
   --max-active N         Max active array tasks per dataset/model. Default: 2
+  --target-active-total N
+                         If --max-active would allow fewer than N active
+                         tasks across all submitted rows, raise per-row array
+                         limits to approach N total active tasks
   --dataset NAME         Only submit rows for this dataset. May be repeated.
   --model NAME           Only submit rows for this model or model_short. May be repeated.
   --all                  Submit all chunks, not only missing chunks
@@ -55,6 +60,11 @@ Examples:
 
   # Try a second pass for stubborn chunks.
   bash job_scripts/submit_clinprotgym_embedding_arrays.sh --mem 192G --max-active 1
+
+  # Keep a default cap of 6 per dataset/model, but raise caps when only a few
+  # rows remain so the aggregate active task count can reach 20.
+  bash job_scripts/submit_clinprotgym_embedding_arrays.sh \
+    --mem 64G --max-active 6 --target-active-total 20
 
   # Submit every chunk for one dataset/model pair.
   bash job_scripts/submit_clinprotgym_embedding_arrays.sh \
@@ -93,6 +103,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max-active)
             MAX_ACTIVE="$2"
+            shift 2
+            ;;
+        --target-active-total)
+            TARGET_ACTIVE_TOTAL="$2"
             shift 2
             ;;
         --dataset)
@@ -145,7 +159,7 @@ trap 'rm -f "$row_file"' EXIT
 dataset_filter_csv="$(IFS=,; echo "${DATASET_FILTERS[*]-}")"
 model_filter_csv="$(IFS=,; echo "${MODEL_FILTERS[*]-}")"
 
-python3 - "$TABLE" "$SUBMIT_ALL" "$MAX_ACTIVE" "$dataset_filter_csv" "$model_filter_csv" > "$row_file" <<'PY'
+python3 - "$TABLE" "$SUBMIT_ALL" "$MAX_ACTIVE" "$dataset_filter_csv" "$model_filter_csv" "$TARGET_ACTIVE_TOTAL" > "$row_file" <<'PY'
 import csv
 import pickle
 import re
@@ -157,17 +171,46 @@ submit_all = bool(int(sys.argv[2]))
 max_active = str(sys.argv[3]).strip()
 dataset_filters = {v for v in sys.argv[4].split(",") if v}
 model_filters = {v for v in sys.argv[5].split(",") if v}
+target_active_total = int(sys.argv[6]) if str(sys.argv[6]).strip() else 0
 
 chunk_re = re.compile(r"_(mean_pool|max_pool|per_residue)_embeddings_chunk_(\d+)\.pkl$")
 
-def compress_chunks(chunks: list[int]) -> str:
+def compress_chunks(chunks: list[int], active_limit: int) -> str:
     # Keep this as a comma list instead of ranges. It is easy to audit in
     # Slurm logs and the chunk count is small for these jobs.
     base = ",".join(str(idx) for idx in chunks)
-    if max_active and int(max_active) > 0 and len(chunks) > 1:
-        return f"{base}%{max_active}"
+    if active_limit > 0 and len(chunks) > active_limit:
+        return f"{base}%{active_limit}"
     return base
 
+def allocate_active_limits(rows: list[dict]) -> list[int]:
+    base_limit = int(max_active) if max_active else 0
+    if base_limit < 1:
+        return [0 for _ in rows]
+    limits = [min(base_limit, len(row["chunks"])) for row in rows]
+    current_total = sum(limits)
+    if target_active_total <= current_total:
+        return limits
+    remaining = target_active_total - current_total
+    while remaining > 0:
+        advanced = False
+        for idx, row in sorted(
+            enumerate(rows),
+            key=lambda item: len(item[1]["chunks"]) - limits[item[0]],
+            reverse=True,
+        ):
+            if limits[idx] >= len(row["chunks"]):
+                continue
+            limits[idx] += 1
+            remaining -= 1
+            advanced = True
+            if remaining <= 0:
+                break
+        if not advanced:
+            break
+    return limits
+
+rows = []
 with table.open(newline="") as handle:
     reader = csv.DictReader(handle)
     required = {"dataset", "model", "model_short", "script_path", "payload_path"}
@@ -206,19 +249,34 @@ with table.open(newline="") as handle:
         if not chunks:
             continue
 
-        values = [
-            dataset,
-            model,
-            model_short,
-            str(script_path),
-            str(payload_path),
-            str(n_chunks),
-            str(len(complete_chunks)),
-            ",".join(str(idx) for idx in chunks),
-            compress_chunks(chunks),
-            str(row.get("embedding_window_method", "")),
-        ]
-        print("\t".join(values))
+        rows.append(
+            {
+                "dataset": dataset,
+                "model": model,
+                "model_short": model_short,
+                "script_path": str(script_path),
+                "payload_path": str(payload_path),
+                "n_chunks": str(n_chunks),
+                "complete_chunks": str(len(complete_chunks)),
+                "chunks": chunks,
+                "embedding_window_method": str(row.get("embedding_window_method", "")),
+            }
+        )
+
+for row, active_limit in zip(rows, allocate_active_limits(rows)):
+    values = [
+        row["dataset"],
+        row["model"],
+        row["model_short"],
+        row["script_path"],
+        row["payload_path"],
+        row["n_chunks"],
+        row["complete_chunks"],
+        ",".join(str(idx) for idx in row["chunks"]),
+        compress_chunks(row["chunks"], active_limit),
+        row["embedding_window_method"],
+    ]
+    print("\t".join(values))
 PY
 
 n_rows="$(wc -l < "$row_file" | tr -d ' ')"
@@ -229,6 +287,9 @@ echo "Memory: $MEM"
 echo "CPUs per task: $CPUS"
 echo "Time: $TIME"
 echo "Max active array tasks per row: $MAX_ACTIVE"
+if [[ -n "$TARGET_ACTIVE_TOTAL" ]]; then
+    echo "Target aggregate active embedding tasks: $TARGET_ACTIVE_TOTAL"
+fi
 echo "Submission manifest: $SUBMISSION_MANIFEST"
 
 printf 'dataset,model,model_short,embedding_window_method,script_path,payload_path,n_chunks,complete_chunks,submitted_chunks,array_spec,partition,mem,cpus,time,submitted,job_id,sbatch_output\n' > "$SUBMISSION_MANIFEST"
