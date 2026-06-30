@@ -10,6 +10,16 @@ Main entry point:
 python3 scripts/clinprotgym_esmc_sae_pipeline.py --help
 ```
 
+Automatic Slurm controller:
+
+```bash
+sbatch job_scripts/run_clinprotgym_master_controller.sh
+```
+
+The controller checks embeddings, escalates failed chunk jobs with larger
+`n_chunks`, submits merges, then runs SAE and count-ready analysis stages. See
+`docs/clinprotgym_master_controller.md` for details.
+
 Analysis notebook:
 
 ```text
