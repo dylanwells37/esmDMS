@@ -2272,10 +2272,36 @@ cd {Path.cwd()}
         n_features: int = params.get("n_features", input_dim * 2)
 
         # ── Train / test split ────────────────────────────────────────────
-        n_train = max(1, int(n_samples * train_frac))
+        # SAE fitting should see each protein sequence once. Some upstream
+        # tables can contain several rows for synonymous/codon-degenerate
+        # variants with identical protein sequences; using them all leaks the
+        # same vector across train/test and over-weights that sequence.
+        deduplicate_training_sequences = bool(params.get("deduplicate_training_sequences", True))
+        sequence_map = getattr(self, "sequence_to_protein_sequence", None) or {}
+        fit_seq_ids = list(seq_ids)
+        duplicate_training_seq_ids: list[str] = []
+        if deduplicate_training_sequences and sequence_map:
+            seen_sequences: set[str] = set()
+            fit_seq_ids = []
+            for seq_id in seq_ids:
+                protein_sequence = sequence_map.get(seq_id)
+                if protein_sequence is None:
+                    fit_seq_ids.append(seq_id)
+                    continue
+                protein_sequence = str(protein_sequence)
+                if protein_sequence in seen_sequences:
+                    duplicate_training_seq_ids.append(seq_id)
+                    continue
+                seen_sequences.add(protein_sequence)
+                fit_seq_ids.append(seq_id)
+
+        seq_id_to_index = {seq_id: idx for idx, seq_id in enumerate(seq_ids)}
+        fit_indices = np.asarray([seq_id_to_index[seq_id] for seq_id in fit_seq_ids], dtype=int)
+        n_fit_samples = int(len(fit_indices))
+        n_train = max(1, int(n_fit_samples * train_frac))
         rng = np.random.default_rng(seed)
-        perm = rng.permutation(n_samples)
-        train_idx, test_idx = perm[:n_train], perm[n_train:]
+        perm = rng.permutation(n_fit_samples)
+        train_idx, test_idx = fit_indices[perm[:n_train]], fit_indices[perm[n_train:]]
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         X_train = torch.from_numpy(X[train_idx]).to(device)
@@ -2405,6 +2431,10 @@ cd {Path.cwd()}
                     "k": k,
                     "active_mask": active_mask,
                     "params": params,
+                    "deduplicate_training_sequences": deduplicate_training_sequences,
+                    "n_training_input_sequences": n_samples,
+                    "n_training_unique_protein_sequences": n_fit_samples,
+                    "n_training_duplicate_protein_sequences": len(duplicate_training_seq_ids),
                 },
                 model_path,
             )
@@ -2412,6 +2442,8 @@ cd {Path.cwd()}
 
             viz_data = {
                 "seq_ids": seq_ids,
+                "fit_seq_ids": fit_seq_ids,
+                "duplicate_training_seq_ids": duplicate_training_seq_ids,
                 "train_idx": train_idx.tolist(),
                 "test_idx": test_idx.tolist(),
                 "Z_all": Z_all,
@@ -2420,6 +2452,10 @@ cd {Path.cwd()}
                 "train_losses": train_losses,
                 "test_losses": test_losses,
                 "active_mask": active_mask,
+                "deduplicate_training_sequences": deduplicate_training_sequences,
+                "n_training_input_sequences": n_samples,
+                "n_training_unique_protein_sequences": n_fit_samples,
+                "n_training_duplicate_protein_sequences": len(duplicate_training_seq_ids),
             }
             self._save_pickle(
                 viz_data,
@@ -3033,18 +3069,100 @@ mkdir -p "$MPLCONFIGDIR"
         gpu_idx: int | None,
         scratch_dir: str | Path | None = None,
     ) -> dict:
+        config = payload["configs"][config_idx]
+        run_label = config.get("run_label")
         try:
             return esmDMS._run_sae_sweep_config(payload, config_idx, gpu_idx, scratch_dir)
         except Exception as exc:
-            config = payload["configs"][config_idx]
             return {
                 "status": "failed",
                 "config_idx": config_idx,
-                "run_label": config.get("run_label"),
+                "run_label": run_label,
                 "gpu_idx": gpu_idx,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
+        finally:
+            esmDMS._cleanup_sae_sweep_scratch(scratch_dir, run_label)
+
+    @staticmethod
+    def _cleanup_sae_sweep_scratch(
+        scratch_dir: str | Path | None,
+        run_label: str | None,
+    ) -> None:
+        if scratch_dir is None or not run_label:
+            return
+        run_dir = Path(scratch_dir) / "sae_sweep_runs" / run_label
+        shutil.rmtree(run_dir, ignore_errors=True)
+        for path in (run_dir.parent, run_dir.parent.parent):
+            try:
+                path.rmdir()
+            except OSError:
+                break
+
+    @staticmethod
+    def _copy_sae_sweep_file(src: Path, dst: Path) -> bool:
+        if not src.is_file():
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.absolute() != dst.absolute():
+            shutil.copy2(src, dst)
+        return True
+
+    @staticmethod
+    def _stage_sae_sweep_outputs(
+        work_runner: "esmDMS",
+        final_runner: "esmDMS",
+        method: str,
+        layer: str | int,
+        embedding_type: str,
+        norm_scheme: str,
+        params: dict,
+        run_label: str,
+        include_inference: bool = False,
+    ) -> None:
+        n_features = params.get("n_features", "unknown")
+        sparsity_coeff = params.get("sparsity_coeff", 1e-3)
+        sparsity_mode = params.get("sparsity_mode", "normal")
+        k = params.get("k")
+
+        artifacts = [
+            (
+                work_runner._feature_path(method, layer, embedding_type),
+                final_runner._feature_path(method, layer, embedding_type),
+            ),
+            (
+                work_runner._sae_model_path(
+                    layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label
+                ),
+                final_runner._sae_model_path(
+                    layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label
+                ),
+            ),
+            (
+                work_runner._sae_viz_path(
+                    layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label
+                ),
+                final_runner._sae_viz_path(
+                    layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label
+                ),
+            ),
+            (
+                work_runner._sae_model_dir()
+                / f"{work_runner._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label)}_viz.png",
+                final_runner._sae_model_dir()
+                / f"{final_runner._sae_tag(layer, n_features, sparsity_coeff, embedding_type, sparsity_mode, k, run_label)}_viz.png",
+            ),
+        ]
+        if include_inference:
+            artifacts.append(
+                (
+                    work_runner._inference_path(method, layer, norm_scheme, embedding_type),
+                    final_runner._inference_path(method, layer, norm_scheme, embedding_type),
+                )
+            )
+        for src, dst in artifacts:
+            esmDMS._copy_sae_sweep_file(src, dst)
 
     @staticmethod
     def _run_sae_sweep_config(
@@ -3072,6 +3190,7 @@ mkdir -p "$MPLCONFIGDIR"
             work_run_dir = final_run_dir
         else:
             work_run_dir = Path(scratch_dir) / "sae_sweep_runs" / run_label
+            shutil.rmtree(work_run_dir, ignore_errors=True)
         work_run_dir.mkdir(parents=True, exist_ok=True)
         final_run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3092,52 +3211,6 @@ mkdir -p "$MPLCONFIGDIR"
 
         final_feature_path = final_runner._feature_path(method, layer, embedding_type)
         final_inference_path = final_runner._inference_path(method, layer, norm_scheme, embedding_type)
-        feature_status = "trained"
-        force_recompute = bool(payload.get("force_recompute", False))
-
-        if final_feature_path.is_file() and not force_recompute:
-            abstracted_features = final_runner._load_pickle(final_feature_path)
-            feature_status = "cached"
-        else:
-            embeddings = esmDMS._load_pickle(Path(payload["embedding_path"]))
-            _, embeddings = esmDMS._drop_missing_features(None, embeddings, f"{method} sweep abstraction")
-            if embedding_type == "per_residue":
-                embeddings, _ = esmDMS._expand_per_residue_feature_vectors(
-                    embeddings,
-                    payload.get("sequence_to_mutation_sites"),
-                )
-            esmDMS._require_vector_features(embeddings, f"{method} sweep abstraction")
-            params.setdefault("_layer", layer)
-            params.setdefault("_embedding_type", embedding_type)
-            abstracted_features = runner._create_feature_space(embeddings, method, params)
-            runner._save_pickle(abstracted_features, runner._feature_path(method, layer, embedding_type))
-
-            if work_run_dir != final_run_dir:
-                shutil.copytree(work_run_dir, final_run_dir, dirs_exist_ok=True)
-
-        inference_status = "not_requested"
-        if payload.get("run_inference", True):
-            if final_inference_path.is_file() and not force_recompute:
-                inference_status = "cached"
-            else:
-                if force_recompute and final_inference_path.is_file():
-                    final_inference_path.unlink()
-                inference_runner = final_runner if feature_status == "cached" else runner
-                inference_runner.run_feature_inference(
-                    layer=layer,
-                    abstraction_method=method,
-                    abstraction_params=params,
-                    embedding_type=embedding_type,
-                )
-                if work_run_dir != final_run_dir and inference_runner is runner:
-                    shutil.copytree(work_run_dir, final_run_dir, dirs_exist_ok=True)
-                inference_status = "ran"
-
-        feature_dim = 0
-        if abstracted_features:
-            first_feature = next(iter(abstracted_features.values()))
-            feature_dim = int(np.asarray(first_feature).shape[0])
-
         model_path = final_runner._sae_model_path(
             layer,
             params.get("n_features", "unknown"),
@@ -3156,6 +3229,70 @@ mkdir -p "$MPLCONFIGDIR"
             params.get("k"),
             run_label,
         )
+        feature_status = "trained"
+        force_recompute = bool(payload.get("force_recompute", False))
+
+        if final_feature_path.is_file() and model_path.is_file() and viz_path.is_file() and not force_recompute:
+            abstracted_features = final_runner._load_pickle(final_feature_path)
+            feature_status = "cached"
+        else:
+            embeddings = esmDMS._load_pickle(Path(payload["embedding_path"]))
+            _, embeddings = esmDMS._drop_missing_features(None, embeddings, f"{method} sweep abstraction")
+            if embedding_type == "per_residue":
+                embeddings, _ = esmDMS._expand_per_residue_feature_vectors(
+                    embeddings,
+                    payload.get("sequence_to_mutation_sites"),
+                )
+            esmDMS._require_vector_features(embeddings, f"{method} sweep abstraction")
+            params.setdefault("_layer", layer)
+            params.setdefault("_embedding_type", embedding_type)
+            abstracted_features = runner._create_feature_space(embeddings, method, params)
+            runner._save_pickle(abstracted_features, runner._feature_path(method, layer, embedding_type))
+
+            if work_run_dir != final_run_dir:
+                esmDMS._stage_sae_sweep_outputs(
+                    runner,
+                    final_runner,
+                    method,
+                    layer,
+                    embedding_type,
+                    norm_scheme,
+                    params,
+                    run_label,
+                )
+
+        inference_status = "not_requested"
+        if payload.get("run_inference", True):
+            if final_inference_path.is_file() and not force_recompute:
+                inference_status = "cached"
+            else:
+                if force_recompute and final_inference_path.is_file():
+                    final_inference_path.unlink()
+                inference_runner = final_runner if feature_status == "cached" else runner
+                inference_runner.run_feature_inference(
+                    layer=layer,
+                    abstraction_method=method,
+                    abstraction_params=params,
+                    embedding_type=embedding_type,
+                )
+                if work_run_dir != final_run_dir and inference_runner is runner:
+                    esmDMS._stage_sae_sweep_outputs(
+                        runner,
+                        final_runner,
+                        method,
+                        layer,
+                        embedding_type,
+                        norm_scheme,
+                        params,
+                        run_label,
+                        include_inference=True,
+                    )
+                inference_status = "ran"
+
+        feature_dim = 0
+        if abstracted_features:
+            first_feature = next(iter(abstracted_features.values()))
+            feature_dim = int(np.asarray(first_feature).shape[0])
 
         return {
             "status": "ok",
@@ -3176,6 +3313,8 @@ mkdir -p "$MPLCONFIGDIR"
             "epochs": params.get("epochs", 200),
             "batch_size": params.get("batch_size", 64),
             "seed": params.get("seed", 42),
+            "deduplicate_training_sequences": params.get("deduplicate_training_sequences", True),
+            "sae_training_version": params.get("sae_training_version"),
             "feature_count": len(abstracted_features),
             "feature_dim": feature_dim,
             "run_dir": str(final_run_dir),

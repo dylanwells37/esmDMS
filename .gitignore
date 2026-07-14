@@ -25,6 +25,8 @@ plots/
 plots/*
 .venv*
 *logs*
+docs/*
+new_data/
 
 # Mac hidden files
 .DS_Store

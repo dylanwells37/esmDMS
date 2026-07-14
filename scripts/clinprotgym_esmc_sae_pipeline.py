@@ -34,12 +34,14 @@ from popDMS import get_best_regularization, mini_infer_esm  # noqa: E402
 
 DEFAULT_INPUT_DIR = REPO_ROOT / "data" / "clin_dms_data" / "data" / "final"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "clinprotgym_esmc_sae"
+DEFAULT_PYTHON_EXECUTABLE = str(Path(sys.executable).resolve())
 DEFAULT_MODELS = ("biohub/ESMC-300M", "biohub/ESMC-600M")
 EMBEDDING_TYPE = "max_pool"
 NORM_SCHEME = "none"
 ABSTRACTION_METHOD = "DeltaEmbSAE"
 WILDTYPE_KEY = "__wildtype__"
 PATHOGENICITY_LABELS = {"benign", "pathogenic"}
+CLINVAR_REVIEW_STAR_CUTOFFS = (0, 1, 2, 3, 4)
 ESMC_CONTEXT_LENGTH = 2048
 ESMC_WINDOW_STRIDE = ESMC_CONTEXT_LENGTH // 2
 SAHU_BRCA2_BASE_DATASET = "MV_BRCA2_Sahu_2025"
@@ -76,7 +78,9 @@ BEST_SAE_PARAMS = {
     "lr": 1e-3,
     "seed": 42,
     "norm_scheme": NORM_SCHEME,
-    "run_label": "DeltaEmbSAE_max_pool_batchtopk_k64_nf12800_seed42",
+    "deduplicate_training_sequences": True,
+    "sae_training_version": 2,
+    "run_label": "DeltaEmbSAE_max_pool_batchtopk_k64_nf12800_seed42_seqdedup_v2",
 }
 
 MUTANT_RE = re.compile(r"^([A-Z*])(\d+)([A-Z*])$")
@@ -109,6 +113,10 @@ class DatasetPaths:
 
 def safe_name(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_.-") or "dataset"
+
+
+def progress(message: str) -> None:
+    print(f"[clinprotgym] {message}", file=sys.stderr, flush=True)
 
 
 def sahu_brca2_derived_dataset_names() -> set[str]:
@@ -197,6 +205,33 @@ def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
         json.dump(payload, handle, indent=2, default=str)
+
+
+def read_json(path: Path) -> dict:
+    with path.open() as handle:
+        return json.load(handle)
+
+
+def completed_sae_task_result(result_path: Path, expected_run_label: str | None = None) -> dict | None:
+    if not result_path.is_file():
+        return None
+    try:
+        result = read_json(result_path)
+    except Exception:
+        return None
+    if result.get("status") != "ok":
+        return None
+    if expected_run_label is not None and result.get("run_label") != expected_run_label:
+        return None
+
+    required_keys = ["feature_path", "model_path", "viz_path"]
+    if result.get("inference_path"):
+        required_keys.append("inference_path")
+    for key in required_keys:
+        value = result.get(key)
+        if not value or not Path(value).is_file():
+            return None
+    return result
 
 
 def write_pickle(path: Path, payload) -> None:
@@ -467,6 +502,83 @@ def make_sequence_ids(df: pd.DataFrame) -> pd.Series:
     return pd.Series(ids, index=df.index)
 
 
+def collapse_duplicate_variants(df: pd.DataFrame) -> pd.DataFrame:
+    """Pool duplicate rows that map to the same full protein sequence.
+
+    The embedding and SAE layers are protein-sequence keyed. If several rows
+    share one ``mutated_sequence``, count/frequency columns must be pooled before
+    downstream training and fitness analysis; otherwise duplicate protein
+    sequences can leak across SAE train/test splits and over-weight the same
+    embedding vector.
+    """
+    if "mutated_sequence" not in df.columns or not df["mutated_sequence"].duplicated().any():
+        return df
+
+    has_score = "functional_score" in df.columns
+    measurement_cols = [
+        col for col in df.columns if str(col).startswith(("count__", "frequency__"))
+    ]
+    union_cols = {"clinvar_variation_ids", "clinvar_allele_ids"}
+    passthrough_cols = [
+        c
+        for c in df.columns
+        if c not in {"functional_score", *measurement_cols, *union_cols}
+    ]
+    rows = []
+    for _, group in df.groupby("mutated_sequence", sort=False):
+        best_idx = max(group.index, key=lambda idx: clinvar_representative_rank(group.loc[idx]))
+        first = group.loc[best_idx]
+        row = {}
+        for col in passthrough_cols:
+            row[col] = first[col]
+        if "has_clinvar" in df.columns:
+            row["has_clinvar"] = bool(group["has_clinvar"].map(truthy).any())
+        for col in measurement_cols:
+            values = pd.to_numeric(group[col], errors="coerce")
+            row[col] = float(values.sum()) if values.notna().any() else np.nan
+        if has_score:
+            scores = pd.to_numeric(group["functional_score"], errors="coerce").dropna()
+            row["functional_score"] = float(scores.mean()) if len(scores) else np.nan
+            row["functional_score_n"] = int(len(scores))
+            row["functional_score_all"] = ";".join(f"{value:.6g}" for value in scores.tolist())
+        for col in union_cols:
+            if col in df.columns:
+                values: set[str] = set()
+                for value in group[col].dropna().astype(str):
+                    values.update(part.strip() for part in value.split("|") if part.strip())
+                row[col] = "|".join(sorted(values))
+        if "mutant" in df.columns:
+            mutants = [str(value) for value in group["mutant"].dropna().unique()]
+            row["mutant"] = mutants[0] if mutants else first.get("mutant", "")
+            if len(mutants) > 1:
+                row["pooled_mutants"] = "|".join(mutants)
+        row["pooled_protein_sequence_n"] = int(len(group))
+        rows.append(row)
+
+    ordered_cols = list(df.columns)
+    if "pooled_mutants" in {key for row in rows for key in row} and "pooled_mutants" not in ordered_cols:
+        ordered_cols.append("pooled_mutants")
+    if "pooled_protein_sequence_n" not in ordered_cols:
+        ordered_cols.append("pooled_protein_sequence_n")
+    if has_score:
+        ordered_cols = ordered_cols + ["functional_score_n", "functional_score_all"]
+    return pd.DataFrame(rows, columns=ordered_cols).reset_index(drop=True)
+
+
+def truthy(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+
+def clinvar_representative_rank(row: pd.Series) -> tuple[int, int, int, int]:
+    label = str(row.get("clinvar_significance_normalized", "")).strip().lower()
+    kept = label in {"pathogenic", "benign", "uncertain", "uncertain significance"}
+    severity = {"pathogenic": 3, "benign": 2, "uncertain": 1, "uncertain significance": 1}.get(label, 0)
+    stars = clinvar_review_status_to_stars(row.get("clinvar_review_status", ""))
+    return (1 if kept else 0, int(stars), int(severity), 1 if truthy(row.get("has_clinvar", False)) else 0)
+
+
 def normalize_clinvar_annotation(value: object) -> str | None:
     if value is None or pd.isna(value):
         return None
@@ -476,6 +588,25 @@ def normalize_clinvar_annotation(value: object) -> str | None:
     if labels == {"pathogenic"}:
         return "pathogenic"
     return None
+
+
+def clinvar_review_status_to_stars(value: object) -> int:
+    if value is None or pd.isna(value):
+        return 0
+    text = str(value).strip().lower()
+    if not text:
+        return 0
+    if "practice guideline" in text:
+        return 4
+    if "reviewed by expert panel" in text:
+        return 3
+    if "multiple submitters" in text and "no conflicts" in text:
+        return 2
+    if "no assertion" in text:
+        return 0
+    if "criteria provided" in text:
+        return 1
+    return 0
 
 
 @dataclass(frozen=True)
@@ -642,6 +773,8 @@ def build_metadata(df: pd.DataFrame, reference_sequence: str) -> pd.DataFrame:
                 "functional_score": row.get("functional_score", np.nan),
                 "has_clinvar": row.get("has_clinvar", np.nan),
                 "clinvar_significance_normalized": row.get("clinvar_significance_normalized", np.nan),
+                "clinvar_review_status": row.get("clinvar_review_status", np.nan),
+                "clinvar_review_stars": clinvar_review_status_to_stars(row.get("clinvar_review_status", np.nan)),
                 "annotation": normalize_clinvar_annotation(row.get("clinvar_significance_normalized")),
             }
         )
@@ -656,10 +789,12 @@ def build_annotations(metadata_df: pd.DataFrame) -> pd.DataFrame:
             "annotation",
             "has_clinvar",
             "clinvar_significance_normalized",
+            "clinvar_review_status",
+            "clinvar_review_stars",
             "functional_score",
         ]
     ].copy()
-    out["stars"] = 0
+    out["stars"] = pd.to_numeric(out["clinvar_review_stars"], errors="coerce").fillna(0).astype(int)
     return out
 
 
@@ -676,14 +811,24 @@ def prepare_dataset(
     dataset = safe_name(dataset_name or raw_csv.stem)
     paths = dataset_paths(output_root, dataset)
     ensure_dataset_dirs(paths)
+    previous_state = None
+    if paths.state_path.is_file():
+        try:
+            previous_state = read_pickle(paths.state_path)
+        except Exception:
+            previous_state = None
     transform_cache_keys = {
         "sequence_transform": sequence_transform,
         "context_length": int(ESMC_CONTEXT_LENGTH) if sequence_transform != "full" else None,
         "window_stride": int(ESMC_WINDOW_STRIDE) if sequence_transform == "sliding2048_overlap1024" else None,
+        # Bump when the ingestion transform changes so stale cached states are
+        # rebuilt. v3 pools duplicate full protein sequences and remaps embedding
+        # caches by mutated_sequence.
+        "ingestion_version": 3,
     }
     if paths.state_path.is_file() and not force:
         try:
-            state = read_pickle(paths.state_path)
+            state = previous_state if previous_state is not None else read_pickle(paths.state_path)
             if (
                 Path(state.get("raw_csv", "")).resolve() == raw_csv
                 and int(state.get("raw_csv_size", -1)) == int(raw_stat.st_size)
@@ -695,6 +840,7 @@ def prepare_dataset(
             pass
 
     raw_df = pd.read_csv(raw_csv)
+    raw_df = collapse_duplicate_variants(raw_df)
     full_reference_sequence, ref_summary = infer_reference_sequence(raw_df)
     df = raw_df.copy()
     df["SequenceIndex"] = make_sequence_ids(df)
@@ -803,6 +949,7 @@ def prepare_dataset(
         **window_state,
     }
     write_pickle(paths.state_path, state)
+    remap_raw_embedding_caches(paths, previous_state, state)
     return paths
 
 
@@ -848,6 +995,120 @@ def runner_for_dataset(
     runner.sequence_metadata = state["sequence_metadata"]
     runner.scores_dataframe = state["scores_dataframe"]
     return runner
+
+
+def expected_embedding_sequence_keys(state: dict) -> set[str]:
+    return {str(key) for key in state.get("sequence_to_protein_sequence", {})}
+
+
+def remap_embedding_cache_by_protein_sequence(cache_path: Path, old_state: dict, new_state: dict) -> dict:
+    row = {
+        "path": str(cache_path),
+        "exists": cache_path.is_file(),
+        "status": "missing",
+        "old_cached_sequences": 0,
+        "new_expected_sequences": len(expected_embedding_sequence_keys(new_state)),
+        "remapped_sequences": 0,
+        "missing_sequences": 0,
+        "extra_sequences_before": 0,
+    }
+    if not cache_path.is_file():
+        return row
+    try:
+        features = read_pickle(cache_path)
+    except Exception as exc:
+        row.update({"status": "unreadable", "error": repr(exc)})
+        return row
+    if not isinstance(features, dict):
+        row.update({"status": "not_dict", "old_cached_sequences": 0})
+        return row
+
+    old_sequence_to_ids: dict[str, list[str]] = {}
+    for seq_id, protein_sequence in old_state.get("sequence_to_protein_sequence", {}).items():
+        old_sequence_to_ids.setdefault(str(protein_sequence), []).append(str(seq_id))
+    new_sequence_map = {
+        str(seq_id): str(protein_sequence)
+        for seq_id, protein_sequence in new_state.get("sequence_to_protein_sequence", {}).items()
+    }
+    cached_keys = {str(key) for key in features}
+    expected_keys = set(new_sequence_map)
+    row["old_cached_sequences"] = int(len(cached_keys))
+    row["extra_sequences_before"] = int(len(cached_keys - expected_keys))
+
+    if expected_keys and expected_keys.issubset(cached_keys) and not (cached_keys - expected_keys):
+        row.update({"status": "already_current", "remapped_sequences": len(expected_keys), "missing_sequences": 0})
+        return row
+
+    remapped = {}
+    missing = []
+    for new_seq_id, protein_sequence in new_sequence_map.items():
+        candidate_ids = old_sequence_to_ids.get(protein_sequence, [])
+        old_seq_id = next((candidate for candidate in candidate_ids if candidate in features), None)
+        if old_seq_id is None and new_seq_id in features:
+            old_seq_id = new_seq_id
+        if old_seq_id is None:
+            missing.append(new_seq_id)
+            continue
+        remapped[new_seq_id] = features[old_seq_id]
+
+    if not remapped:
+        row.update({"status": "no_sequence_matches", "missing_sequences": len(missing)})
+        return row
+
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    write_pickle(tmp_path, remapped)
+    tmp_path.replace(cache_path)
+    row.update(
+        {
+            "status": "remapped" if missing else "remapped_complete",
+            "remapped_sequences": int(len(remapped)),
+            "missing_sequences": int(len(missing)),
+        }
+    )
+    return row
+
+
+def remap_raw_embedding_caches(paths: DatasetPaths, old_state: dict | None, new_state: dict) -> list[dict]:
+    if not old_state:
+        return []
+    pattern = f"{paths.dataset}_*_{EMBEDDING_TYPE}_none_Layer_*_seq_to_features.pkl"
+    rows = []
+    for cache_path in sorted(paths.sequence_dir.glob(pattern)):
+        rows.append(remap_embedding_cache_by_protein_sequence(cache_path, old_state, new_state))
+    if rows:
+        out = paths.table_dir / f"{paths.dataset}_embedding_sequence_remap.csv"
+        pd.DataFrame(rows).to_csv(out, index=False)
+    return rows
+
+
+def embedding_cache_key_coverage(path: Path, state: dict) -> dict:
+    expected = expected_embedding_sequence_keys(state)
+    if not path.is_file():
+        return {
+            "n_expected_sequences": int(len(expected)),
+            "n_cached_sequences": 0,
+            "missing_sequence_keys": int(len(expected)),
+            "extra_sequence_keys": 0,
+            "covers_expected": False,
+        }
+    try:
+        features = read_pickle(path)
+    except Exception:
+        return {
+            "n_expected_sequences": int(len(expected)),
+            "n_cached_sequences": 0,
+            "missing_sequence_keys": int(len(expected)),
+            "extra_sequence_keys": 0,
+            "covers_expected": False,
+        }
+    cached = {str(key) for key in features} if isinstance(features, dict) else set()
+    return {
+        "n_expected_sequences": int(len(expected)),
+        "n_cached_sequences": int(len(cached)),
+        "missing_sequence_keys": int(len(expected - cached)),
+        "extra_sequence_keys": int(len(cached - expected)),
+        "covers_expected": bool(expected.issubset(cached)),
+    }
 
 
 def available_datasets(output_root: Path) -> list[str]:
@@ -907,11 +1168,15 @@ def dataset_uses_sliding_window_embeddings(state: dict) -> bool:
 
 def filter_count_available_datasets(output_root: Path, datasets: Iterable[str]) -> list[str]:
     output_root = Path(output_root)
+    datasets = [str(dataset) for dataset in datasets]
+    progress(f"Filtering {len(datasets)} datasets to count-ready datasets")
     out = []
-    for dataset in datasets:
-        state = load_dataset_state(output_root, str(dataset))
+    for idx, dataset in enumerate(datasets, start=1):
+        progress(f"  [{idx}/{len(datasets)}] loading processed state for {dataset}")
+        state = load_dataset_state(output_root, dataset)
         if bool(state.get("has_real_trajectory", False)):
-            out.append(str(dataset))
+            out.append(dataset)
+    progress(f"Count-ready datasets: {len(out)}/{len(datasets)}")
     return out
 
 
@@ -1888,6 +2153,7 @@ def write_embedding_cache_status(args: argparse.Namespace) -> None:
                         "embedding_window_method": state.get("embedding_window_method", ""),
                         "path": str(path),
                         "exists": path.is_file(),
+                        **embedding_cache_key_coverage(path, state),
                     }
                 )
         paths = dataset_paths(output_root, dataset)
@@ -2156,14 +2422,33 @@ def run_sae_task(payload_path: Path, task_idx: int) -> dict:
     model_name = task["model"]
     layer = task["layer"]
     paths = dataset_paths(output_root, dataset)
+    sweep_dir = paths.job_dir / "fixed_sae_model_layer_array" / model_cache_label(model_name) / f"Layer_{layer}"
+    output_run_root = sweep_dir / "runs"
+    existing_result = completed_sae_task_result(
+        sweep_dir / "task_result.json",
+        expected_run_label=task.get("run_label"),
+    )
+    if existing_result is not None:
+        existing_result = dict(existing_result)
+        existing_result.update(
+            {
+                "task_idx": task_idx,
+                "dataset": dataset,
+                "model": model_name,
+                "model_short": task["model_short"],
+                "layer_index": layer,
+                "model_label": f"{task['model_short']} Layer_{layer} {task['run_label']}",
+                "skipped_existing_ok": True,
+            }
+        )
+        return existing_result
+
     runner = runner_for_dataset(output_root, dataset, model_name)
     run_inference = bool(task.get("run_inference", bool(load_dataset_state(output_root, dataset).get("has_real_trajectory", False))))
     embedding_path = runner._embedding_path(layer, EMBEDDING_TYPE)
     if not embedding_path.is_file():
         raise FileNotFoundError(f"Missing embedding cache for {dataset} {model_name} layer {layer}: {embedding_path}")
 
-    sweep_dir = paths.job_dir / "fixed_sae_model_layer_array" / model_cache_label(model_name) / f"Layer_{layer}"
-    output_run_root = sweep_dir / "runs"
     sweep_dir.mkdir(parents=True, exist_ok=True)
     output_run_root.mkdir(parents=True, exist_ok=True)
     params = dict(task["params"])
@@ -2196,11 +2481,18 @@ def run_sae_task(payload_path: Path, task_idx: int) -> dict:
         "force_recompute": bool(payload.get("force_recompute", False)),
         "require_cuda": False,
     }
+    scratch_dir = None
+    if os.environ.get("TMPDIR"):
+        scratch_dir = (
+            Path(os.environ["TMPDIR"])
+            / "clinprotgym_sae_tasks"
+            / safe_name(f"task_{task_idx:04d}_{dataset}_{model_cache_label(model_name)}_Layer_{layer}")
+        )
     result = esmDMS._run_sae_sweep_config_safe(
         single_payload,
         config_idx=0,
         gpu_idx=None,
-        scratch_dir=os.environ.get("TMPDIR"),
+        scratch_dir=scratch_dir,
     )
     result.update(
         {
@@ -2241,16 +2533,25 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
     tasks = []
     sae_metrics_path = output_root / "tables" / "clinprotgym_fixed_deltaembsae_layer_metrics.csv"
+    progress(f"create-benchmark-jobs: reading SAE metrics from {sae_metrics_path}")
     sae_metrics_df = pd.read_csv(sae_metrics_path) if sae_metrics_path.is_file() else pd.DataFrame()
-    for dataset in command_datasets(args, output_root):
+    progress(f"create-benchmark-jobs: loaded {len(sae_metrics_df)} SAE metric rows")
+    datasets = command_datasets(args, output_root)
+    progress(f"create-benchmark-jobs: building tasks for {len(datasets)} datasets")
+    for dataset_idx, dataset in enumerate(datasets, start=1):
+        dataset_task_start = len(tasks)
+        progress(f"[{dataset_idx}/{len(datasets)}] {dataset}: loading processed state")
         state = load_dataset_state(output_root, dataset)
         has_trajectory = bool(state["has_real_trajectory"])
+        progress(f"[{dataset_idx}/{len(datasets)}] {dataset}: has_real_trajectory={has_trajectory}")
         paths = dataset_paths(output_root, dataset)
         tasks.append({"dataset": dataset, "task_type": "functional_score", "model_label": "DMS functional score"})
         if has_trajectory:
             tasks.append({"dataset": dataset, "task_type": "enrichment_ratio", "model_label": "Enrichment ratio"})
             tasks.append({"dataset": dataset, "task_type": "popdms_substitution", "model_label": "Regular popDMS substitution"})
-        for model_name in args.models:
+        for model_idx, model_name in enumerate(args.models, start=1):
+            model_task_start = len(tasks)
+            progress(f"[{dataset_idx}/{len(datasets)}] {dataset}: checking model {model_idx}/{len(args.models)} {model_name}")
             llr_path = paths.table_dir / f"{dataset}_{model_cache_label(model_name)}_llr_fitness.csv"
             if llr_path.is_file():
                 tasks.append(
@@ -2265,7 +2566,11 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
                 )
             if has_trajectory:
                 runner = runner_for_dataset(output_root, dataset, model_name)
-                for layer in model_layers(model_name, args.layer_counts):
+                layers = model_layers(model_name, args.layer_counts)
+                progress(
+                    f"[{dataset_idx}/{len(datasets)}] {dataset}: scanning {len(layers)} embedding layers for {model_name}"
+                )
+                for layer in layers:
                     embedding_path = runner._embedding_path(layer, EMBEDDING_TYPE)
                     if embedding_path.is_file():
                         tasks.append(
@@ -2279,8 +2584,12 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
                                 "model_label": f"{model_short_name(model_name)} Layer_{layer} raw max_pool",
                             }
                         )
+            progress(
+                f"[{dataset_idx}/{len(datasets)}] {dataset}: added {len(tasks) - model_task_start} tasks for {model_name}"
+            )
         if has_trajectory and not sae_metrics_df.empty:
             sub = sae_metrics_df[(sae_metrics_df["dataset"].eq(dataset)) & (sae_metrics_df["status"].eq("ok"))].copy()
+            progress(f"[{dataset_idx}/{len(datasets)}] {dataset}: adding {len(sub)} successful SAE benchmark tasks")
             for _, row in sub.iterrows():
                 tasks.append(
                     {
@@ -2296,6 +2605,8 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
                         "model_label": row.get("model_label", "Fixed DeltaEmbSAE"),
                     }
                 )
+        progress(f"[{dataset_idx}/{len(datasets)}] {dataset}: total added {len(tasks) - dataset_task_start} tasks")
+    progress(f"create-benchmark-jobs: assigning output paths for {len(tasks)} tasks")
     for idx, task in enumerate(tasks):
         task["task_idx"] = idx
         safe_label = safe_name(f"{task['dataset']}_{task['model_label']}")[:120]
@@ -2306,7 +2617,9 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
     job_root = output_root / "jobs" / "benchmark_row_analysis"
     payload = {"output_root": str(output_root), "tasks": tasks, "force_recompute": bool(args.force_recompute)}
     payload_path = job_root / "clinprotgym_benchmark_row_analysis_payload.pkl"
+    progress(f"create-benchmark-jobs: writing payload to {payload_path}")
     write_pickle(payload_path, payload)
+    progress("create-benchmark-jobs: writing Slurm array script")
     script_path = write_slurm_array_script(
         script_path=job_root / "submit_clinprotgym_benchmark_row_analysis_array.sh",
         payload_path=payload_path,
@@ -2324,6 +2637,7 @@ def create_benchmark_jobs(args: argparse.Namespace) -> None:
     task_df = pd.DataFrame(tasks)
     out = output_root / "tables" / "clinprotgym_benchmark_tasks.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
+    progress(f"create-benchmark-jobs: writing task table to {out}")
     task_df.to_csv(out, index=False)
     print(f"Wrote benchmark payload: {payload_path}")
     print(f"Wrote benchmark array script: {script_path}")
@@ -2635,14 +2949,539 @@ def collect_ensembles(args: argparse.Namespace) -> None:
     print(f"Wrote ensemble metrics: {out}")
 
 
+def method_plot_label(method_family: object) -> str:
+    labels = {
+        "Enrichment ratio baseline": "Enrichment ratio",
+        "popDMS baseline": "popDMS",
+        "LLR baseline": "LLR",
+        "Raw embeddings": "Raw ESM",
+        "Raw SAE": "Single SAE",
+        "Ensemble SAE model": "SAE ensemble",
+    }
+    return labels.get(str(method_family), str(method_family))
+
+
+def review_star_cutoff_label(min_stars: int) -> str:
+    if int(min_stars) <= 0:
+        return "all binary"
+    suffix = "star" if int(min_stars) == 1 else "stars"
+    return f">={int(min_stars)} {suffix}"
+
+
+def auc_discrimination_value(auc: object) -> float:
+    auc_value = pd.to_numeric(pd.Series([auc]), errors="coerce").iloc[0]
+    if not np.isfinite(auc_value):
+        return np.nan
+    return float(max(auc_value, 1.0 - auc_value))
+
+
+def auc_direction_flipped(auc: object) -> bool:
+    auc_value = pd.to_numeric(pd.Series([auc]), errors="coerce").iloc[0]
+    return bool(np.isfinite(auc_value) and auc_value < 0.5)
+
+
+def best_auc_rows_by_dataset_method(metrics_df: pd.DataFrame, method_order: list[str]) -> pd.DataFrame:
+    rows = []
+    if metrics_df.empty or "fitness_path" not in metrics_df.columns:
+        return pd.DataFrame()
+    candidate_df = metrics_df[metrics_df["method_family"].isin(method_order)].copy()
+    candidate_df = candidate_df[candidate_df["fitness_path"].notna() & candidate_df["fitness_path"].astype(str).str.len().gt(0)]
+    if candidate_df.empty:
+        return pd.DataFrame()
+    candidate_df["auc"] = pd.to_numeric(candidate_df.get("auc", np.nan), errors="coerce")
+    candidate_df["auc_discrimination"] = candidate_df["auc"].map(auc_discrimination_value)
+    candidate_df["auc_flipped"] = candidate_df["auc"].map(auc_direction_flipped)
+    candidate_df["spearman_rho"] = pd.to_numeric(candidate_df.get("spearman_rho", np.nan), errors="coerce")
+    candidate_df["layer_numeric"] = pd.to_numeric(candidate_df.get("layer", np.nan), errors="coerce")
+    layer_method = candidate_df["method_family"].isin(["Raw embeddings", "Raw SAE"])
+    candidate_df = candidate_df[~(layer_method & candidate_df["layer_numeric"].eq(0))].copy()
+    for (_, _), group in candidate_df.groupby(["dataset", "method_family"], sort=False):
+        finite = group[np.isfinite(group["auc_discrimination"])].copy()
+        if finite.empty:
+            continue
+        rows.append(finite.sort_values(["auc_discrimination", "spearman_rho"], ascending=[False, False]).iloc[0])
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=candidate_df.columns)
+
+
+def auc_by_review_star_cutoff_rows(
+    output_root: Path,
+    dataset: str,
+    selected_rows: pd.DataFrame,
+) -> pd.DataFrame:
+    if selected_rows.empty:
+        return pd.DataFrame()
+    annotations = load_dataset_state(output_root, dataset)["annotations_dataframe"].copy()
+    annotations["SequenceIndex"] = annotations["SequenceIndex"].astype(str)
+    annotations["stars"] = pd.to_numeric(annotations.get("stars", 0), errors="coerce").fillna(0).astype(int)
+    annotation_lookup = dict(zip(annotations["SequenceIndex"], annotations["annotation"]))
+    star_lookup = dict(zip(annotations["SequenceIndex"], annotations["stars"]))
+
+    rows = []
+    for _, row in selected_rows.iterrows():
+        fitness_path = row.get("fitness_path", "")
+        if pd.isna(fitness_path) or not str(fitness_path):
+            continue
+        path = Path(str(fitness_path))
+        if not path.is_file():
+            continue
+        try:
+            fitness_df = pd.read_csv(path)
+        except Exception:
+            continue
+        if not {"SequenceIndex", "fitness"}.issubset(fitness_df.columns):
+            continue
+        fitness_df["SequenceIndex"] = fitness_df["SequenceIndex"].astype(str)
+        fitness_df["fitness"] = pd.to_numeric(fitness_df["fitness"], errors="coerce")
+        annotation_scheme = str(row.get("annotation_scheme", "")).strip().lower()
+        has_embedded_annotations = {"annotation", "stars"}.issubset(fitness_df.columns)
+        if annotation_scheme == "hgvs" and has_embedded_annotations:
+            fitness_df["stars"] = pd.to_numeric(fitness_df["stars"], errors="coerce").fillna(0).astype(int)
+        else:
+            fitness_df["annotation"] = fitness_df["SequenceIndex"].map(annotation_lookup)
+            fitness_df["stars"] = fitness_df["SequenceIndex"].map(star_lookup).fillna(0).astype(int)
+
+        for min_stars in CLINVAR_REVIEW_STAR_CUTOFFS:
+            cutoff_df = fitness_df if min_stars <= 0 else fitness_df[fitness_df["stars"].ge(min_stars)].copy()
+            auc_metrics = classification_metrics_for_fitness(cutoff_df)
+            auc_metrics["auc_discrimination"] = auc_discrimination_value(auc_metrics["auc"])
+            auc_metrics["auc_flipped"] = auc_direction_flipped(auc_metrics["auc"])
+            rows.append(
+                {
+                    "dataset": dataset,
+                    "method_family": row.get("method_family", ""),
+                    "method_plot_label": method_plot_label(row.get("method_family", "")),
+                    "model_label": row.get("model_label", ""),
+                    "benchmark": row.get("benchmark", ""),
+                    "method": row.get("method", ""),
+                    "model_short": row.get("model_short", ""),
+                    "layer": row.get("layer", np.nan),
+                    "review_cutoff": review_star_cutoff_label(min_stars),
+                    "min_review_stars": int(min_stars),
+                    "fitness_path": str(path),
+                    "annotation_scheme": row.get("annotation_scheme", "protein"),
+                    **auc_metrics,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def write_auc_by_review_star_cutoff_plots(
+    output_root: Path,
+    auc_selected_rows: pd.DataFrame,
+    active_dataset_list: list[str],
+    method_order: list[str],
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    written: list[Path] = []
+    if auc_selected_rows.empty:
+        return written
+
+    global_rows = []
+    method_label_order = [method_plot_label(value) for value in method_order]
+    cutoff_order = [review_star_cutoff_label(value) for value in CLINVAR_REVIEW_STAR_CUTOFFS]
+
+    for dataset in active_dataset_list:
+        dataset_rows = auc_selected_rows[auc_selected_rows["dataset"].astype(str).eq(dataset)].copy()
+        if dataset_rows.empty:
+            continue
+        paths = dataset_paths(Path(output_root), dataset)
+        table_df = auc_by_review_star_cutoff_rows(Path(output_root), dataset, dataset_rows)
+        if table_df.empty:
+            continue
+        global_rows.append(table_df)
+
+        table_path = paths.table_dir / f"{dataset}_best_method_auc_by_clinvar_review_stars.csv"
+        table_df.to_csv(table_path, index=False)
+
+        plot_df = table_df[np.isfinite(pd.to_numeric(table_df["auc_discrimination"], errors="coerce"))].copy()
+        if plot_df.empty:
+            continue
+        plot_df["auc_discrimination"] = pd.to_numeric(plot_df["auc_discrimination"], errors="coerce")
+        plot_df["review_cutoff"] = pd.Categorical(plot_df["review_cutoff"], categories=cutoff_order, ordered=True)
+        present_labels = set(plot_df["method_plot_label"].dropna().astype(str))
+        hue_order = [label for label in method_label_order if label in present_labels]
+
+        progress(f"summarize: plotting {dataset}_best_method_auc_by_clinvar_review_stars.png")
+        fig_width = max(8.8, 1.35 * len(cutoff_order) + 3.5)
+        fig, ax = plt.subplots(figsize=(fig_width, 5.4))
+        sns.barplot(
+            data=plot_df.sort_values(["review_cutoff", "method_plot_label"]),
+            x="review_cutoff",
+            y="auc_discrimination",
+            hue="method_plot_label",
+            order=cutoff_order,
+            hue_order=hue_order or None,
+            ax=ax,
+        )
+        ax.axhline(0.5, color="0.65", linewidth=1.0, linestyle="--", zorder=0)
+        ax.set_ylim(0.0, 1.02)
+        ax.set_xlabel("ClinVar review-star cutoff")
+        ax.set_ylabel("Direction-normalized pathogenic-vs-benign AUC")
+        ax.set_title(f"{dataset}: best non-layer-0 method AUC by ClinVar review-star cutoff")
+        ax.tick_params(axis="x", rotation=25)
+        for tick in ax.get_xticklabels():
+            tick.set_horizontalalignment("right")
+        ax.legend(title="Method", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+        sns.despine(ax=ax)
+        fig.tight_layout()
+        figure_path = paths.figure_dir / f"{dataset}_best_method_auc_by_clinvar_review_stars.png"
+        fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        written.append(figure_path)
+
+    if global_rows:
+        global_path = Path(output_root) / "tables" / "clinprotgym_best_method_auc_by_clinvar_review_stars.csv"
+        pd.concat(global_rows, ignore_index=True, sort=False).to_csv(global_path, index=False)
+
+    return written
+
+
+def write_summary_plots(
+    output_root: Path,
+    metrics_df: pd.DataFrame,
+    selected_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    method_order: list[str],
+    active_dataset_list: list[str],
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    progress("summarize: writing summary plots")
+    figure_dir = Path(output_root) / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    sns.set_theme(style="whitegrid")
+
+    selected_plot = selected_df.copy()
+    if not selected_plot.empty:
+        selected_plot["method_plot_label"] = selected_plot["method_family"].map(method_plot_label)
+    auc_selected_plot = best_auc_rows_by_dataset_method(metrics_df, method_order)
+    if not auc_selected_plot.empty:
+        auc_selected_plot["method_plot_label"] = auc_selected_plot["method_family"].map(method_plot_label)
+
+    method_labels_present = set()
+    if not selected_plot.empty:
+        method_labels_present.update(selected_plot["method_plot_label"].dropna().astype(str))
+    if not auc_selected_plot.empty:
+        method_labels_present.update(auc_selected_plot["method_plot_label"].dropna().astype(str))
+    method_label_order = [method_plot_label(value) for value in method_order if method_plot_label(value) in method_labels_present]
+
+    plot_dataset_values = set()
+    if not selected_plot.empty:
+        plot_dataset_values.update(selected_plot["dataset"].dropna().astype(str))
+    if not auc_selected_plot.empty:
+        plot_dataset_values.update(auc_selected_plot["dataset"].dropna().astype(str))
+    dataset_order = [dataset for dataset in active_dataset_list if dataset in plot_dataset_values]
+    if not dataset_order:
+        dataset_order = sorted(plot_dataset_values)
+
+    if not selected_plot.empty:
+        plot_df = selected_plot[np.isfinite(pd.to_numeric(selected_plot["spearman_rho"], errors="coerce"))].copy()
+        if not plot_df.empty:
+            progress("summarize: plotting clinprotgym_best_method_spearman_by_dataset.png")
+            plot_df["spearman_rho"] = pd.to_numeric(plot_df["spearman_rho"], errors="coerce")
+            fig_width = max(10.0, 1.2 * len(dataset_order) + 3.2)
+            fig, ax = plt.subplots(figsize=(fig_width, 6.0))
+            sns.barplot(
+                data=plot_df,
+                x="dataset",
+                y="spearman_rho",
+                hue="method_plot_label",
+                order=dataset_order,
+                hue_order=method_label_order or None,
+                ax=ax,
+            )
+            ax.axhline(0, color="0.75", linewidth=1.0, zorder=0)
+            ax.set_xlabel("Dataset")
+            ax.set_ylabel("Spearman rho")
+            ax.set_title("Best method per family by dataset: Spearman rho")
+            ax.tick_params(axis="x", rotation=55)
+            for tick in ax.get_xticklabels():
+                tick.set_horizontalalignment("right")
+            ax.legend(title="Method", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+            sns.despine(ax=ax)
+            fig.tight_layout()
+            path = figure_dir / "clinprotgym_best_method_spearman_by_dataset.png"
+            fig.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
+
+    if not auc_selected_plot.empty:
+        plot_df = auc_selected_plot[
+            np.isfinite(pd.to_numeric(auc_selected_plot["auc_discrimination"], errors="coerce"))
+        ].copy()
+        if not plot_df.empty:
+            progress("summarize: plotting clinprotgym_best_method_auc_by_dataset.png")
+            plot_df["auc_discrimination"] = pd.to_numeric(plot_df["auc_discrimination"], errors="coerce")
+            fig_width = max(10.0, 1.2 * len(dataset_order) + 3.2)
+            fig, ax = plt.subplots(figsize=(fig_width, 6.0))
+            sns.barplot(
+                data=plot_df,
+                x="dataset",
+                y="auc_discrimination",
+                hue="method_plot_label",
+                order=dataset_order,
+                hue_order=method_label_order or None,
+                ax=ax,
+            )
+            ax.axhline(0.5, color="0.65", linewidth=1.0, linestyle="--", zorder=0)
+            ax.set_ylim(0.0, 1.02)
+            ax.set_xlabel("Dataset")
+            ax.set_ylabel("Direction-normalized ClinVar AUC")
+            ax.set_title("Best non-layer-0 method per family by dataset: ClinVar AUC")
+            ax.tick_params(axis="x", rotation=55)
+            for tick in ax.get_xticklabels():
+                tick.set_horizontalalignment("right")
+            ax.legend(title="Method", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+            sns.despine(ax=ax)
+            fig.tight_layout()
+            path = figure_dir / "clinprotgym_best_method_auc_by_dataset.png"
+            fig.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
+
+        scatter_df = auc_selected_plot[
+            np.isfinite(pd.to_numeric(auc_selected_plot["spearman_rho"], errors="coerce"))
+            & np.isfinite(pd.to_numeric(auc_selected_plot["auc_discrimination"], errors="coerce"))
+        ].copy()
+        if not scatter_df.empty:
+            progress("summarize: plotting clinprotgym_best_method_spearman_vs_auc.png")
+            scatter_df["spearman_rho"] = pd.to_numeric(scatter_df["spearman_rho"], errors="coerce")
+            scatter_df["auc_discrimination"] = pd.to_numeric(scatter_df["auc_discrimination"], errors="coerce")
+            fig, ax = plt.subplots(figsize=(8.2, 6.4))
+            sns.scatterplot(
+                data=scatter_df,
+                x="spearman_rho",
+                y="auc_discrimination",
+                hue="method_plot_label",
+                style="dataset",
+                hue_order=method_label_order or None,
+                s=95,
+                edgecolor="white",
+                linewidth=0.7,
+                ax=ax,
+            )
+            ax.axvline(0, color="0.80", linewidth=1.0, zorder=0)
+            ax.set_xlabel("Spearman rho")
+            ax.set_ylabel("Direction-normalized ClinVar AUC")
+            ax.set_title("Best non-layer-0 method per family: Spearman rho vs ClinVar AUC")
+            ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+            sns.despine(ax=ax)
+            fig.tight_layout()
+            path = figure_dir / "clinprotgym_best_method_spearman_vs_auc.png"
+            fig.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
+
+    if not selected_plot.empty:
+        heatmap_df = selected_plot.copy()
+        heatmap_df["spearman_rho"] = pd.to_numeric(heatmap_df["spearman_rho"], errors="coerce")
+        heatmap_df = heatmap_df[np.isfinite(heatmap_df["spearman_rho"])]
+        if not heatmap_df.empty:
+            progress("summarize: plotting clinprotgym_best_method_spearman_heatmap.png")
+            pivot = heatmap_df.pivot_table(
+                index="dataset",
+                columns="method_plot_label",
+                values="spearman_rho",
+                aggfunc="first",
+            )
+            pivot = pivot.reindex(index=dataset_order)
+            pivot = pivot[[col for col in method_label_order if col in pivot.columns]]
+            fig_width = max(7.5, 0.75 * len(pivot.columns) + 3.5)
+            fig_height = max(4.8, 0.45 * len(pivot.index) + 2.0)
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            sns.heatmap(
+                pivot,
+                annot=True,
+                fmt=".2f",
+                cmap="vlag",
+                center=0,
+                linewidths=0.4,
+                linecolor="white",
+                cbar_kws={"label": "Spearman rho"},
+                ax=ax,
+            )
+            ax.set_xlabel("Method")
+            ax.set_ylabel("Dataset")
+            ax.set_title("Best method per family: Spearman rho heatmap")
+            fig.tight_layout()
+            path = figure_dir / "clinprotgym_best_method_spearman_heatmap.png"
+            fig.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
+
+    summary_plot = summary_df.copy()
+    if not summary_plot.empty:
+        summary_plot["method_plot_label"] = summary_plot["method_family"].map(method_plot_label)
+        summary_plot = summary_plot[
+            np.isfinite(pd.to_numeric(summary_plot["mean_spearman_rho"], errors="coerce"))
+        ].copy()
+        if not summary_plot.empty:
+            progress("summarize: plotting clinprotgym_average_spearman_by_method.png")
+            summary_plot["mean_spearman_rho"] = pd.to_numeric(summary_plot["mean_spearman_rho"], errors="coerce")
+            summary_plot["sem_spearman_rho"] = pd.to_numeric(summary_plot["sem_spearman_rho"], errors="coerce").fillna(0.0)
+            summary_order = [method_plot_label(value) for value in method_order if method_plot_label(value) in set(summary_plot["method_plot_label"])]
+            plot_df = summary_plot.set_index("method_plot_label").reindex(summary_order).dropna(subset=["mean_spearman_rho"]).reset_index()
+            fig, ax = plt.subplots(figsize=(9.0, 5.2))
+            ax.bar(
+                plot_df["method_plot_label"],
+                plot_df["mean_spearman_rho"],
+                yerr=plot_df["sem_spearman_rho"],
+                color=sns.color_palette("tab10", n_colors=len(plot_df)),
+                capsize=3,
+            )
+            ax.axhline(0, color="0.75", linewidth=1.0, zorder=0)
+            ax.set_xlabel("Method")
+            ax.set_ylabel("Mean Spearman rho across datasets")
+            ax.set_title("Average best-method Spearman rho")
+            ax.tick_params(axis="x", rotation=35)
+            for tick in ax.get_xticklabels():
+                tick.set_horizontalalignment("right")
+            sns.despine(ax=ax)
+            fig.tight_layout()
+            path = figure_dir / "clinprotgym_average_spearman_by_method.png"
+            fig.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
+
+    layer_df = metrics_df[metrics_df["method_family"].isin(["Raw embeddings", "Raw SAE"])].copy()
+    if not layer_df.empty and {"dataset", "method_family", "layer", "model_short", "spearman_rho"}.issubset(layer_df.columns):
+        layer_df["layer"] = pd.to_numeric(layer_df["layer"], errors="coerce")
+        layer_df["spearman_rho"] = pd.to_numeric(layer_df["spearman_rho"], errors="coerce")
+        layer_df = layer_df[np.isfinite(layer_df["layer"]) & np.isfinite(layer_df["spearman_rho"])].copy()
+        if not layer_df.empty:
+            progress("summarize: plotting clinprotgym_layer_spearman_by_dataset_model.png")
+            layer_df["method_plot_label"] = layer_df["method_family"].map(method_plot_label)
+            layer_df["dataset"] = pd.Categorical(layer_df["dataset"].astype(str), categories=active_dataset_list, ordered=True)
+            grid = sns.relplot(
+                data=layer_df.sort_values(["dataset", "method_plot_label", "model_short", "layer"]),
+                x="layer",
+                y="spearman_rho",
+                hue="model_short",
+                style="method_plot_label",
+                col="dataset",
+                col_wrap=2,
+                kind="line",
+                marker="o",
+                height=3.7,
+                aspect=1.55,
+                facet_kws={"sharey": False, "sharex": True},
+            )
+            grid.set_axis_labels("ESM-C layer", "Spearman rho")
+            grid.set_titles("{col_name}")
+            grid.figure.suptitle("Layer-wise benchmark performance", y=1.02)
+            grid.figure.tight_layout()
+            path = figure_dir / "clinprotgym_layer_spearman_by_dataset_model.png"
+            grid.figure.savefig(path, dpi=300, bbox_inches="tight")
+            plt.close(grid.figure)
+            written.append(path)
+
+    if not auc_selected_plot.empty:
+        written.extend(
+            write_auc_by_review_star_cutoff_plots(
+                Path(output_root),
+                auc_selected_plot,
+                active_dataset_list,
+                method_order,
+            )
+        )
+
+    best_fitness_rows = []
+    if not auc_selected_plot.empty and "fitness_path" in auc_selected_plot.columns:
+        for dataset, group in auc_selected_plot.groupby("dataset", sort=False):
+            finite = group[np.isfinite(pd.to_numeric(group["auc_discrimination"], errors="coerce"))].copy()
+            if finite.empty:
+                finite = group[np.isfinite(pd.to_numeric(group["spearman_rho"], errors="coerce"))].copy()
+            if finite.empty:
+                continue
+            finite["spearman_rho"] = pd.to_numeric(finite["spearman_rho"], errors="coerce")
+            finite["auc"] = pd.to_numeric(finite["auc"], errors="coerce")
+            finite["auc_discrimination"] = pd.to_numeric(finite["auc_discrimination"], errors="coerce")
+            best_fitness_rows.append(
+                finite.sort_values(["auc_discrimination", "spearman_rho"], ascending=[False, False]).iloc[0]
+            )
+    distribution_panels = []
+    for row in best_fitness_rows:
+        fitness_path = row.get("fitness_path", "")
+        if pd.isna(fitness_path) or not str(fitness_path):
+            continue
+        path = Path(str(fitness_path))
+        if not path.is_file():
+            continue
+        try:
+            fitness_df = pd.read_csv(path)
+        except Exception:
+            continue
+        if not {"fitness", "annotation"}.issubset(fitness_df.columns):
+            continue
+        fitness_df = fitness_df[fitness_df["annotation"].isin(PATHOGENICITY_LABELS)].copy()
+        fitness_df["fitness"] = pd.to_numeric(fitness_df["fitness"], errors="coerce")
+        fitness_df = fitness_df[np.isfinite(fitness_df["fitness"])]
+        if fitness_df.empty:
+            continue
+        distribution_panels.append((row, fitness_df))
+    if distribution_panels:
+        progress("summarize: plotting clinprotgym_best_method_fitness_distributions_by_clinvar.png")
+        ncols = 2
+        nrows = int(math.ceil(len(distribution_panels) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 3.9 * nrows), squeeze=False)
+        axes_flat = axes.ravel()
+        palette = {"benign": "#2c7fb8", "pathogenic": "#d7301f"}
+        for ax, (row, fitness_df) in zip(axes_flat, distribution_panels):
+            values = fitness_df["fitness"].to_numpy(dtype=float)
+            if np.nanmin(values) == np.nanmax(values):
+                center = float(np.nanmin(values))
+                bins = np.array([center - 0.5, center + 0.5])
+            else:
+                bins = np.histogram_bin_edges(values, bins=min(24, max(8, int(np.sqrt(len(values))))))
+            for annotation in ["benign", "pathogenic"]:
+                subset = fitness_df.loc[fitness_df["annotation"].eq(annotation), "fitness"].to_numpy(dtype=float)
+                if len(subset) == 0:
+                    continue
+                ax.hist(
+                    subset,
+                    bins=bins,
+                    color=palette[annotation],
+                    alpha=0.55,
+                    label=f"{annotation} (n={len(subset)})",
+                    edgecolor="white",
+                    linewidth=0.35,
+                )
+            ax.set_title(
+                f"{row.get('dataset')}\n"
+                f"{method_plot_label(row.get('method_family'))}: "
+                f"AUC*={float(row.get('auc_discrimination', np.nan)):.3f}",
+                fontsize=10,
+            )
+            ax.set_xlabel("Fitness")
+            ax.set_ylabel("Variant count")
+            ax.legend(fontsize=8)
+            ax.grid(color="0.90", linewidth=0.65)
+        for ax in axes_flat[len(distribution_panels):]:
+            ax.axis("off")
+        fig.suptitle("Best method fitness distributions by ClinVar annotation", y=1.02)
+        fig.tight_layout()
+        path = figure_dir / "clinprotgym_best_method_fitness_distributions_by_clinvar.png"
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+
+    return written
+
+
 def summarize(args: argparse.Namespace) -> None:
     output_root = Path(args.output_root)
+    progress("summarize: resolving active datasets")
     active_dataset_list = filter_sahu_brca2_final_datasets(
         command_datasets(args, output_root),
         getattr(args, "sahu_brca2_final", "both"),
     )
     active_datasets = set(active_dataset_list)
     frames = []
+    progress("summarize: reading method and ensemble metric tables")
     for path in [
         output_root / "tables" / "clinprotgym_method_metrics.csv",
         output_root / "tables" / "clinprotgym_sae_ensemble_metrics.csv",
@@ -2654,6 +3493,7 @@ def summarize(args: argparse.Namespace) -> None:
     metrics_df = pd.concat(frames, ignore_index=True, sort=False)
     if "dataset" in metrics_df.columns:
         metrics_df = metrics_df[metrics_df["dataset"].astype(str).isin(active_datasets)].copy()
+    progress(f"summarize: loaded {len(metrics_df)} metric rows for {len(active_datasets)} active datasets")
     wanted = [
         "Enrichment ratio baseline",
         "popDMS baseline",
@@ -2669,6 +3509,7 @@ def summarize(args: argparse.Namespace) -> None:
         metrics_df["spearman_target"] = ""
 
     selected_rows = []
+    progress("summarize: selecting best row per dataset and method family")
     for (dataset, family), group in metrics_df.groupby(["dataset", "method_family"], sort=False):
         finite = group[np.isfinite(group["spearman_rho"])].copy()
         if finite.empty:
@@ -2701,9 +3542,13 @@ def summarize(args: argparse.Namespace) -> None:
     selected_path = out_dir / "clinprotgym_best_method_rows_by_dataset.csv"
     summary_path = out_dir / "clinprotgym_average_spearman_auc_summary.csv"
     selected_df.to_csv(selected_path, index=False)
-    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(summary_path, index=False)
+    figure_paths = write_summary_plots(output_root, metrics_df, selected_df, summary_df, wanted, active_dataset_list)
     print(f"Wrote selected rows: {selected_path}")
     print(f"Wrote average Spearman/AUC summary: {summary_path}")
+    for path in figure_paths:
+        print(f"Wrote summary figure: {path}")
 
 
 def cross_replicate_consistency(args: argparse.Namespace) -> None:
@@ -2836,7 +3681,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-embedding-jobs", help="Write ESM-C embedding and merge jobs.")
     add_common_args(p)
     add_model_args(p)
-    p.add_argument("--python-executable", default="python3")
+    p.add_argument("--python-executable", default=DEFAULT_PYTHON_EXECUTABLE)
     p.add_argument("--scratch-root", default="/scr")
     p.add_argument("--hf-home")
     p.add_argument("--n-chunks", type=int)
@@ -2870,7 +3715,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-llr-jobs", help="Write masked-marginal ESM-C LLR jobs.")
     add_common_args(p)
     add_model_args(p)
-    p.add_argument("--python-executable", default="python3")
+    p.add_argument("--python-executable", default=DEFAULT_PYTHON_EXECUTABLE)
     p.add_argument("--llr-partition", default="any_cpu")
     p.add_argument("--llr-cpus", type=int, default=4)
     p.add_argument("--llr-mem", default="64G")
@@ -2887,7 +3732,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-sae-jobs", help="Write fixed DeltaEmbSAE layer-array jobs.")
     add_common_args(p)
     add_model_args(p)
-    p.add_argument("--python-executable", default="python3")
+    p.add_argument("--python-executable", default=DEFAULT_PYTHON_EXECUTABLE)
     p.add_argument("--sae-partition", default="any_cpu")
     p.add_argument("--sae-cpus", type=int, default=4)
     p.add_argument("--sae-mem", default="48G")
@@ -2910,7 +3755,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(p)
     add_model_args(p)
     add_count_dataset_arg(p)
-    p.add_argument("--python-executable", default="python3")
+    p.add_argument("--python-executable", default=DEFAULT_PYTHON_EXECUTABLE)
     p.add_argument("--benchmark-partition", default="any_cpu")
     p.add_argument("--benchmark-cpus", type=int, default=4)
     p.add_argument("--benchmark-mem", default="48G")
@@ -2935,7 +3780,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_count_dataset_arg(p)
     p.add_argument("--ensemble-top-n", type=int, default=12)
     p.add_argument("--ensemble-gamma", type=float, default=1.0)
-    p.add_argument("--python-executable", default="python3")
+    p.add_argument("--python-executable", default=DEFAULT_PYTHON_EXECUTABLE)
     p.add_argument("--ensemble-partition", default="any_cpu")
     p.add_argument("--ensemble-cpus", type=int, default=4)
     p.add_argument("--ensemble-mem", default="96G")

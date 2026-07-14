@@ -2,9 +2,9 @@
 #SBATCH --job-name=esmc_smoke
 #SBATCH --partition=dept_gpu
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=C8
+#SBATCH --constraint=L40|A100
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
+#SBATCH --mem=48G
 #SBATCH --time=00:10:00
 #SBATCH --output=job_scripts/logs/esmc_smoke-%j.out
 #SBATCH --error=job_scripts/logs/esmc_smoke-%j.err
@@ -23,8 +23,8 @@
 set -euo pipefail
 mkdir -p job_scripts/logs
 
-source $HOME/miniforge3/etc/profile.d/conda.sh
-conda activate myproj
+PYTHONPATH=$HOME/.conda/envs/py312/bin/python
+
 
 # Pin HF cache to a shared location so we don't redownload per job. Edit
 # this path to point at your own scratch/home share.
@@ -44,4 +44,4 @@ fi
 echo "host=$(hostname) job=${SLURM_JOB_ID:-local}"
 nvidia-smi || true
 
-python3 job_scripts/esmc_smoke_test.py
+$PYTHONPATH job_scripts/esmc_smoke_test.py

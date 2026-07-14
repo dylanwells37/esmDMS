@@ -1285,7 +1285,8 @@ def infer_correlated(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=Fa
     df_temp.to_csv(path, index=False, compression='gzip')
 
 
-def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=False, freq_dir='.', output_dir='.', plot_gamma=True):
+def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=False, 
+                      freq_dir='.', output_dir='.', plot_gamma=True, prior_mean=None):
     '''
     Infer selection coefficients from data that consists of single amino acid
     frequencies only.
@@ -1321,6 +1322,9 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     dx, icov, aa2i = compute_dx_covariance_independent(aa_freqs)
     L = len(dx[0])
     
+    if prior_mean is None:
+        prior_mean = np.zeros(L)
+
     # Compute optimal regularization value
     gamma_opt = 1
 
@@ -1358,7 +1362,9 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     s = np.zeros_like(dx)
     for r_idx in range(n_replicates):
         for seq_i in range(L):
-            s[r_idx][seq_i] = np.inner(np.linalg.inv(icov[r_idx][seq_i] + gamma_opt*np.eye(len(icov[r_idx][seq_i]))), dx[r_idx][seq_i])
+            C = icov[r_idx][seq_i]
+            rhs = dx[r_idx][seq_i] + gamma_opt * prior_mean[seq_i]
+            s[r_idx][seq_i] = np.inner(np.linalg.inv(C + gamma_opt*np.eye(len(C))), rhs)
     
     s_joint = np.zeros_like(dx[0])
     for seq_i in range(L):
