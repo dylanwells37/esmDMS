@@ -19,6 +19,7 @@ esm_sim_saves
 .vscode
 job_outs
 CLAUDE.md
+AGENTS.md
 data
 testing
 plots/

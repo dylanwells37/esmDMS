@@ -1310,6 +1310,9 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
             saved
         - plot_gamma (default: True): Plot correlation between replicates as a 
             function of the regularization strength gamma
+        - prior_mean (default: None): Prior mean selection coefficients, grouped
+            by sequence site in the same shape as one replicate's dx values. If
+            None, uses the original zero-mean prior.
     '''
     ################################################################################
 
@@ -1346,7 +1349,12 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
             s = np.zeros_like(dx)
             for r_idx in range(n_replicates):
                 for seq_i in range(L):
-                    s[r_idx][seq_i] = np.inner(np.linalg.inv(icov[r_idx][seq_i] + g*np.eye(len(icov[r_idx][seq_i]))), dx[r_idx][seq_i])
+                    C = icov[r_idx][seq_i]
+                    rhs = dx[r_idx][seq_i] + g * prior_mean[seq_i]
+                    s[r_idx][seq_i] = np.inner(
+                        np.linalg.inv(C + g*np.eye(len(C))),
+                        rhs,
+                    )
                 
             corrs.append(np.mean([st.pearsonr(s[i].flatten(), s[j].flatten()).statistic for i in range(n_replicates) for j in range(i+1, n_replicates)]))
 
@@ -1368,7 +1376,21 @@ def infer_independent(name, n_replicates, corr_cutoff_pct, gamma=None, norm_WT=F
     
     s_joint = np.zeros_like(dx[0])
     for seq_i in range(L):
-        s_joint[seq_i] = np.inner(np.linalg.inv(np.sum([icov[r_idx][seq_i] for r_idx in range(n_replicates)], axis=0) + gamma_opt*np.eye(len(icov[0][seq_i]))), np.sum([dx[r_idx][seq_i] for r_idx in range(n_replicates)], axis=0))
+        C_joint = np.sum(
+            [icov[r_idx][seq_i] for r_idx in range(n_replicates)],
+            axis=0,
+        )
+        rhs_joint = (
+            np.sum(
+                [dx[r_idx][seq_i] for r_idx in range(n_replicates)],
+                axis=0,
+            )
+            + gamma_opt * prior_mean[seq_i]
+        )
+        s_joint[seq_i] = np.inner(
+            np.linalg.inv(C_joint + gamma_opt*np.eye(len(C_joint))),
+            rhs_joint,
+        )
 
     # Get WT sequence and site list
     df_ref = aa_freqs['single'][0][aa_freqs['single'][0]['WT_indicator']==True]
