@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esmdms"
+version = "0.1.0"
+description = "Protein embedding, sparse autoencoder, and popDMS prior analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "esm>=3.2.1,<4",
+  "huggingface-hub",
+  "matplotlib",
+  "numpy",
+  "pandas",
+  "safetensors",
+  "scipy",
+  "torch",
+]
+
+[project.optional-dependencies]
+notebook = ["ipykernel"]
+test = ["black", "pytest"]
+
+[project.scripts]
+esmdms = "esmdms.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["esmdms*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

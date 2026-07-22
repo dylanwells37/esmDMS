@@ -1,0 +1,19 @@
+{
+  "output_dir": "results/multi_dataset_llr_prior",
+  "gammas": {"start": -5, "stop": 4, "num": 52},
+  "alphas": [0.0, 0.25, 0.5, 1.0, 2.0],
+  "review_star_cutoffs": [0, 1, 2, 3],
+  "datasets": [
+    {
+      "path": "datasets/MV_BRCA1_Findlay_2018",
+      "features": {
+        "ESM-C 300M layer 30": "artifacts/MV_BRCA1_Findlay_2018/300M/layer_30.npz",
+        "ESM-C 300M layer 30 SAE": "artifacts/MV_BRCA1_Findlay_2018/300M_layer30_sae.npz"
+      },
+      "priors": {
+        "ESM-C 300M LLR": "artifacts/MV_BRCA1_Findlay_2018/300M_llr.npz",
+        "ESM-C 600M LLR": "artifacts/MV_BRCA1_Findlay_2018/600M_llr.npz"
+      }
+    }
+  ]
+}

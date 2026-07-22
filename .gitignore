@@ -1,38 +1,15 @@
-# Python files
-__pycache__
-.ipynb_checkpoints
-*/.ipynb_checkpoints
-
-# Local files
-test
-drafts
-old
-logomaker
-figures_slides.ipynb
-figures_slides.py
-figures/slides-*.pdf
-figures/old
-output/merged_preference/backup
-old_files
-output
-esm_sim_saves
-.vscode
-job_outs
-CLAUDE.md
-AGENTS.md
-data
-testing
-plots/
-plots/*
-.venv*
-*logs*
-docs/*
-new_data/
-
-# Mac hidden files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.matplotlib_cache/
+.venv/
+.venv*/
 .DS_Store
-*/.DS_Store
-*/*/.DS_Store
-*/*/*/.DS_Store
-*/*/*/*/.DS_Store
-*/*/*/*/*/.DS_Store
+
+# Generated model and analysis outputs
+artifacts/
+datasets/
+demo/
+results/
+*.pt

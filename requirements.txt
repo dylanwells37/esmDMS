@@ -1,9 +1,0 @@
-matplotlib
-numpy
-pandas
-psutil
-scipy
-seaborn
-torch
-transformers
-ipykernel
