@@ -270,6 +270,13 @@ CLI default because it retains strong localized activations, while mean pooling
 represents global average context. They are separate artifacts and should be
 benchmarked rather than combined implicitly.
 
+The highest layer index returns the model's post-LayerNorm output state; every
+lower index returns a raw transformer block output. Those are on different
+scales, so layer 30 is not directly comparable with layers 12 and 24. Each
+artifact records `final_layer_norm_applied` in its provenance to make this
+explicit. The raw un-normalized final block output is not reachable through a
+layer index.
+
 ## 7. Reference sequence to LLR prior
 
 ```bash
@@ -284,7 +291,9 @@ For every assayed substitution position:
    wild-type reference context.
 2. Replace that residue token with the model's mask token.
 3. Run the masked-language-model head.
-4. Compute log-softmax over amino-acid tokens.
+4. Compute log-softmax over the full token vocabulary. The LLR is a difference
+   of two log probabilities, so the normalizer cancels and restricting the
+   softmax to amino-acid tokens would give the same value.
 5. Store
 
    `LLR = log P(mutant | masked context) - log P(wild type | masked context)`.
@@ -325,16 +334,54 @@ Sparsity modes:
   globally, allowing samples to use different numbers of features; no L1
   penalty is added.
 
+BatchTopK couples samples through a per-batch ranking, which would make a
+sequence's stored activations depend on which other sequences were encoded
+alongside it. After training, `calibrate_threshold` replaces the ranking with a
+fixed scalar: the mean smallest surviving activation across training batches.
+Evaluation then applies that threshold per sample, so encoding one sequence
+alone gives the same result as encoding it inside the full matrix. The threshold
+is a model buffer, saved in the checkpoint and recorded in provenance.
+
+`train_fraction` holds sequences out of training. They are scored rather than
+discarded: provenance records `train_sequences`, `validation_sequences`,
+`train_reconstruction_mse`, and `validation_reconstruction_mse` alongside the
+all-row `reconstruction_mse`.
+
 After training, neurons that never fire or fire for essentially every sequence
 are removed from the saved SAE artifact. The `.pt` checkpoint stores the full
 model and active mask; the `.npz` artifact stores the active sequence features
-used by inference.
+used by inference. The active mask is stored as a tensor so the checkpoint loads
+under `torch.load(weights_only=True)`.
 
 ## 9. popDMS inference
 
 `inference.infer` accepts any feature matrix `Z` whose rows are sequences. For a
 substitution basis, `Z` is one-hot by amino-acid change. For embedding or SAE
 inference, `Z` contains the corresponding latent vectors.
+
+### Sparse substitution basis
+
+`substitution_basis` returns a `SubstitutionBasis`, which stores one column
+index per variant row instead of a dense matrix. Every supported dataset has
+exactly one assayed variant per substitution, so the dense form would be an
+`n x n` permutation matrix: 1.26 GB for MSH2 alone, and a further copy per
+replicate/generation inside the moment cache. Storing only the indices reduces
+that to well under a megabyte and turns each covariance product into a gather
+and a `bincount`. `SubstitutionBasis.dense()` and `.to_artifact()` materialize
+the equivalent matrix for tests and small inspections.
+
+The class exposes the same read-only attributes as `FeatureArtifact`
+(`sequence_ids`, `feature_names`, `kind`, `dataset`, `provenance`), so inference
+accepts either. Embedding and SAE artifacts continue to use the dense path.
+
+### Reusing moments across a sweep
+
+The replicate moments depend only on the trajectory and the feature basis, never
+on `gamma` or the prior. `build_problem` computes them once and returns an
+`InferenceProblem`; `InferenceProblem.solve(gamma=..., prior_values=...)` runs
+one fit. The gamma baselines and the alpha-by-gamma sweep both build the problem
+once per dataset rather than rebuilding it per grid point. `infer` remains the
+single-fit convenience wrapper.
 
 At each replicate and time point, the observed count/frequency mass is
 normalized to probabilities. The method computes:
@@ -396,7 +443,10 @@ Each gamma/alpha configuration produces a coefficient vector per replicate.
 Consistency is the mean Pearson correlation across every pair of replicate
 coefficient vectors. For regular popDMS, embedding, and SAE baselines, the
 reported gamma is selected by maximum cross-replicate consistency, independently
-of ClinVar labels.
+of ClinVar labels. `baselines.csv` records the selected `gamma` and its
+`cross_replicate_consistency` on every row, so a published number can be
+reproduced from that file alone. Methods without a gamma (enrichment ratio, DMS
+functional score, raw LLR) leave both columns explicitly `NaN`.
 
 ### ClinVar AUC
 
@@ -406,14 +456,26 @@ configured minimum review-star thresholds.
 
 Scores are oriented so higher always means more pathogenic before rank-based
 ROC AUC is calculated. The code does not replace AUC with `max(AUC, 1-AUC)`.
-Raw LLR is evaluated with lower values treated as more pathogenic. Inferred
-selection uses the dataset's assay direction.
+
+`inference.assay_oriented_scores` is the single place a prior's `orientation`
+provenance and the dataset's selection direction are combined. Prior-guided
+inference and the raw-prior baseline both call it, so they cannot disagree. A
+`raw_llr` artifact is negated for `pathogenic_high_selection` datasets; a prior
+already recorded in selection units is used unchanged. The raw-prior baseline is
+then evaluated with the dataset's own assay direction, exactly like every other
+row, which also makes its Spearman rho sign-comparable across datasets.
 
 ### Functional-score Spearman
 
 Where a finite source `functional_score` exists, inferred fitness is inner-joined
 to those rows and Spearman correlation is reported. Partial MSH2 score coverage
 is allowed; BRCA2 correctly has no functional-score baseline.
+
+Spearman rho compares inferred fitness to the assay's own functional score and
+never consults ClinVar review status, so it is emitted once as `spearman_rho`.
+It is deliberately not suffixed per review-star cutoff: the cutoff filters only
+the ClinVar columns (`auc`, `n_benign`, `n_pathogenic`), and a `_stars_N` suffix
+on an unfiltered statistic would assert a filtering that never happened.
 
 ### Baselines
 
@@ -436,7 +498,25 @@ and prior model, with lower alpha and gamma as deterministic tie breakers. This
 is a supervised model-selection summary and should be evaluated on held-out
 data if used for a generalization claim.
 
+Selection uses `head(1)` on the sorted sweep so one intact row survives.
+`GroupBy.first()` must not be used: it returns the first non-null value of each
+column independently, so a `NaN` in the winning row (most plausibly
+`cross_replicate_consistency`) would be silently backfilled from a different
+alpha/gamma, producing a summary row that never existed.
+
+Because `alpha = 0` is the regularized zero-mean control, the AUC-maximizing row
+may use no prior at all. The summary therefore also reports `auc_alpha0` (the
+best `alpha = 0` AUC for the same dataset and prior), `auc_gain_over_alpha0`,
+and the boolean `prior_used`, so a headline number cannot be read as evidence
+for the prior when the prior contributed nothing.
+
 ### Output tables
+
+The notebook and `esmdms analyze` read canonical datasets and feature artifacts
+from disk and never create them. Both output directories are git-ignored, so a
+fresh clone has neither; `esmdms process` and the feature commands must run
+first. The notebook's preflight cell lists every missing configured path instead
+of failing part-way through with a bare `FileNotFoundError`.
 
 `workflow.run_analysis` writes:
 
@@ -449,12 +529,22 @@ data if used for a generalization claim.
 
 ## 11. Verification
 
-The test suite covers dataset and artifact persistence, substitution alignment
-with duplicate nucleotide encodings, raw-LLR assay orientation, per-replicate
-and joint inference, prior sweeps, enrichment and AUC metrics, SAE output,
-configuration-driven analysis, and model-facing embedding/LLR generation with
-a deterministic test model. The real imported-data conversion is also audited
-against all five supplied files as summarized above.
+The test suite is split so that the parts not needing a protein language model
+run in any environment:
+
+- `tests/test_core.py` covers schema and artifact persistence, the sparse
+  substitution basis and its equivalence to the dense matrix, `InferenceProblem`
+  reuse across gamma and alpha, prior alignment and assay orientation,
+  per-replicate and joint inference, prior sweeps, enrichment and AUC metrics,
+  summary-row integrity, and configuration-driven analysis. It imports no torch.
+- `tests/test_features.py` covers the analysis window, SAE output and its
+  held-out split, BatchTopK sample independence, and model-facing embedding/LLR
+  generation with a deterministic test model. The whole module is skipped when
+  torch is unavailable rather than failing collection for the entire suite.
+
+`tests/conftest.py` holds the shared synthetic dataset and prior. The real
+imported-data conversion is also audited against all five supplied files as
+summarized above.
 
 The checked BRCA1 demonstration is:
 

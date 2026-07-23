@@ -10,9 +10,34 @@ embedding, SAE, LLR-prior, inference, and evaluation flow.
 
 ## Install
 
+Create a local virtual environment and install the package, notebook tools,
+tests, and ESM-C support with one command:
+
+```bash
+make setup
+```
+
+This creates `.venv`. Activate it before running commands directly:
+
+```bash
+source .venv/bin/activate
+```
+
+Python 3.10 or newer is required. To select a particular interpreter or put the
+environment somewhere else, override `PYTHON` or `VENV`:
+
+```bash
+make setup PYTHON=python3.11 VENV=/shared/path/venvs/esmdms
+```
+
+The equivalent install step in an already-created environment is:
+
 ```bash
 python3 -m pip install -e '.[notebook,test]'
 ```
+
+The ESM-C model weights are downloaded from Hugging Face on first use; they are
+not bundled into the virtual environment.
 
 ## Data Format
 
@@ -134,6 +159,31 @@ tables. Raw embeddings and SAE artifacts can be listed under `features`; LLR
 artifacts belong under `priors`. The notebook reads the same configuration and
 calls the same workflow.
 
+The example config lists one dataset and the artifacts the commands above
+produce. Add the other processed datasets under `datasets` once you have
+generated their artifacts; the workflow loops over every entry.
+
+Both `datasets/` and `artifacts/` are git-ignored, so a fresh clone has neither
+and the analysis cannot run until `esmdms process` and the feature commands have
+been run. The notebook opens with a preflight cell that names every missing path
+rather than failing part-way through the run.
+
+Reading the output tables:
+
+- `baselines.csv` records the selected `gamma` and its
+  `cross_replicate_consistency` on every row. Gamma is chosen by unsupervised
+  replicate consistency, never by ClinVar labels; methods with no gamma leave
+  both columns `NaN`.
+- `spearman_rho` appears once. It compares inferred fitness to the assay's own
+  functional score and does not depend on the ClinVar review-star cutoff, so it
+  carries no `_stars_N` suffix. Only `auc`, `n_benign`, and `n_pathogenic` are
+  reported per cutoff.
+- `summary.csv` is chosen by **maximum AUC** over the alpha-by-gamma grid, which
+  is supervised selection on the same labels used to score it. Since `alpha = 0`
+  is the zero-prior control, the winning row may use no prior at all; check
+  `prior_used` and `auc_gain_over_alpha0` before reading it as evidence that the
+  LLR prior helped.
+
 ## BRCA1 100-Variant Demonstration
 
 The runnable demonstration selects the first 100 BRCA1 missense rows, retains a
@@ -185,5 +235,10 @@ estimates for 300M, 600M, custom 3B, and official 6B configurations.
 ```bash
 python3 -m pytest
 ```
+
+`tests/test_core.py` covers the schema, inference, metrics, and workflow and
+imports no torch, so it runs in a bare NumPy/pandas/SciPy environment.
+`tests/test_features.py` covers the model-facing code and skips itself when
+torch is unavailable.
 
 Source code is GPL-3.0 licensed. Repository data and figures are CC0 licensed.

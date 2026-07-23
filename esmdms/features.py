@@ -183,23 +183,34 @@ def analysis_window(
     return start, end
 
 
+def _tokenize(sequence: str, tokenizer) -> dict:
+    """Tokenize one sequence and guarantee an explicit attention mask.
+
+    The mask is materialized here rather than defaulted at each use site, so
+    every downstream reader sees the same tensor.
+    """
+    inputs = dict(
+        tokenizer(
+            sequence,
+            return_tensors="pt",
+            add_special_tokens=True,
+            return_special_tokens_mask=True,
+        )
+    )
+    if "attention_mask" not in inputs:
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+    return inputs
+
+
 def _residue_hidden_states(
     sequence: str,
     tokenizer,
     model,
     layers: Sequence[int] | None,
-) -> dict[int, np.ndarray]:
-    inputs = tokenizer(
-        sequence,
-        return_tensors="pt",
-        add_special_tokens=True,
-        return_special_tokens_mask=True,
-    )
+) -> tuple[dict[int, np.ndarray], int]:
+    inputs = _tokenize(sequence, tokenizer)
     special_mask = inputs.pop("special_tokens_mask").bool()
-    attention = inputs.get(
-        "attention_mask", torch.ones_like(inputs["input_ids"])
-    ).bool()
-    residue_mask = (attention & ~special_mask).squeeze(0)
+    residue_mask = (inputs["attention_mask"].bool() & ~special_mask).squeeze(0)
     model_inputs = {
         key: value.to(_model_device(model)) for key, value in inputs.items()
     }
@@ -244,7 +255,7 @@ def _residue_hidden_states(
         raise ValueError(
             "Tokenizer residue count does not match the protein sequence length."
         )
-    return states
+    return states, n_layers
 
 
 def embed(
@@ -310,9 +321,10 @@ def _embed_with_model(
     reducer = np.mean if pooling == "mean" else np.max
     pooled_by_layer: dict[int, dict[str, np.ndarray]] = {}
     selected_layers: tuple[int, ...] | None = None
+    final_layer: int | None = None
     unique_sequences = tuple(dict.fromkeys(sequence_by_id.values()))
     for completed, sequence in enumerate(unique_sequences, start=1):
-        states = _residue_hidden_states(sequence, tokenizer, model, layers)
+        states, final_layer = _residue_hidden_states(sequence, tokenizer, model, layers)
         if selected_layers is None:
             selected_layers = tuple(states)
             pooled_by_layer = {layer: {} for layer in selected_layers}
@@ -336,6 +348,10 @@ def _embed_with_model(
         provenance = {
             "model": model_name,
             "layer": layer,
+            # The final index returns the model's post-LayerNorm output state;
+            # every earlier index is a raw transformer block output. Layers are
+            # therefore on different scales and must not be compared naively.
+            "final_layer_norm_applied": layer == final_layer,
             "pooling": pooling,
             "window_selection": (
                 "custom"
@@ -412,18 +428,9 @@ def _llr_with_model(
     window_start, window_end = analysis_window(dataset, window_size, truncate)
     reference_window = dataset.reference_sequence[window_start:window_end]
 
-    inputs = tokenizer(
-        reference_window,
-        return_tensors="pt",
-        add_special_tokens=True,
-        return_special_tokens_mask=True,
-    )
+    inputs = _tokenize(reference_window, tokenizer)
     special_mask = inputs.pop("special_tokens_mask").bool().squeeze(0)
-    attention = (
-        inputs.get("attention_mask", torch.ones_like(inputs["input_ids"]))
-        .bool()
-        .squeeze(0)
-    )
+    attention = inputs["attention_mask"].bool().squeeze(0)
     residue_positions = torch.where(attention & ~special_mask)[0]
     if len(residue_positions) != len(reference_window):
         raise ValueError(
@@ -578,6 +585,10 @@ class SparseAutoencoder(torch.nn.Module):
         self.center = torch.nn.Parameter(torch.zeros(input_dim))
         self.mode = mode
         self.k = k
+        # BatchTopK couples samples through a per-batch ranking. After training,
+        # a fixed threshold replaces that ranking so a sequence's activations no
+        # longer depend on which other sequences are encoded alongside it.
+        self.register_buffer("activation_threshold", torch.tensor(float("nan")))
         torch.nn.init.kaiming_uniform_(self.decoder.weight)
         self.normalize_decoder()
         with torch.no_grad():
@@ -589,6 +600,14 @@ class SparseAutoencoder(torch.nn.Module):
                 self.decoder.weight.norm(dim=0, keepdim=True).clamp_min(1e-8)
             )
 
+    def _batch_topk(self, activations: torch.Tensor) -> torch.Tensor:
+        flat = activations.flatten()
+        count = min(int(self.k) * activations.shape[0], flat.numel())
+        indices = flat.topk(count).indices
+        return (flat * torch.zeros_like(flat).scatter_(0, indices, 1.0)).view_as(
+            activations
+        )
+
     def encode(self, values: torch.Tensor) -> torch.Tensor:
         activations = torch.relu(self.encoder(values - self.center))
         if self.mode == "topk":
@@ -597,13 +616,39 @@ class SparseAutoencoder(torch.nn.Module):
             mask = torch.zeros_like(activations).scatter_(1, indices, 1.0)
             activations = activations * mask
         elif self.mode == "batchtopk":
-            flat = activations.flatten()
-            count = min(int(self.k) * activations.shape[0], flat.numel())
-            indices = flat.topk(count).indices
-            activations = (
-                flat * torch.zeros_like(flat).scatter_(0, indices, 1.0)
-            ).view_as(activations)
+            threshold = float(self.activation_threshold)
+            if self.training or not np.isfinite(threshold):
+                activations = self._batch_topk(activations)
+            else:
+                activations = activations * (activations > threshold)
         return activations
+
+    @torch.no_grad()
+    def calibrate_threshold(
+        self, values: torch.Tensor, batch_size: int
+    ) -> float | None:
+        """Fix the BatchTopK decision threshold from the training distribution.
+
+        The threshold is the mean smallest surviving activation across training
+        batches, the standard BatchTopK hand-off from a batch ranking to a
+        sample-independent rule.
+        """
+        if self.mode != "batchtopk" or len(values) == 0:
+            return None
+        was_training = self.training
+        self.train()
+        minima = []
+        for start in range(0, len(values), batch_size):
+            activations = self.encode(values[start : start + batch_size])
+            surviving = activations[activations > 0]
+            if surviving.numel():
+                minima.append(float(surviving.min()))
+        self.train(was_training)
+        if not minima:
+            return None
+        threshold = float(np.mean(minima))
+        self.activation_threshold.fill_(threshold)
+        return threshold
 
     def forward(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         activations = self.encode(values)
@@ -665,6 +710,9 @@ def train_sae(
     )
     order = generator.permutation(len(fit_values))
     train = torch.from_numpy(fit_values[order[:split]]).to(target)
+    # train_fraction holds sequences back, so they are scored rather than
+    # silently discarded; the held-out error is what makes the split meaningful.
+    validation = torch.from_numpy(fit_values[order[split:]]).to(target)
 
     torch.manual_seed(config.seed)
     model = SparseAutoencoder(values.shape[1], n_features, config.mode, config.k).to(
@@ -684,10 +732,24 @@ def train_sae(
             optimizer.step()
             model.normalize_decoder()
 
+    threshold = model.calibrate_threshold(train, config.batch_size)
+
     all_values = torch.from_numpy(values).to(target)
     model.eval()
     with torch.inference_mode():
         reconstruction, activations = model(all_values)
+        train_error = float(
+            torch.nn.functional.mse_loss(model(train)[0], train).detach().cpu()
+        )
+        validation_error = (
+            float(
+                torch.nn.functional.mse_loss(model(validation)[0], validation)
+                .detach()
+                .cpu()
+            )
+            if len(validation)
+            else float("nan")
+        )
     activations_np = activations.float().cpu().numpy()
     activation_frequency = (activations_np > 0).mean(axis=0)
     active = (activation_frequency >= config.active_frequency) & (
@@ -705,6 +767,11 @@ def train_sae(
         "input_features": values.shape[1],
         "active_features": int(active.sum()),
         "reconstruction_mse": reconstruction_error,
+        "train_sequences": int(len(train)),
+        "validation_sequences": int(len(validation)),
+        "train_reconstruction_mse": train_error,
+        "validation_reconstruction_mse": validation_error,
+        "activation_threshold": threshold,
     }
     if model_path is not None:
         model_path = Path(model_path)
@@ -712,7 +779,9 @@ def train_sae(
         torch.save(
             {
                 "state_dict": model.state_dict(),
-                "active_mask": active,
+                # A tensor rather than a NumPy array so the checkpoint stays
+                # loadable under torch.load(weights_only=True).
+                "active_mask": torch.from_numpy(active),
                 "input_dim": values.shape[1],
                 "n_features": n_features,
                 "provenance": provenance,
