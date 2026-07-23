@@ -30,6 +30,10 @@ environment somewhere else, override `PYTHON` or `VENV`:
 make setup PYTHON=python3.11 VENV=/shared/path/venvs/esmdms
 ```
 
+GPU setup defaults to PyTorch 2.11 with CUDA 12.8 wheels so it remains
+compatible with CUDA 12.x cluster drivers. Override `TORCH_VERSION` and
+`TORCH_INDEX_URL` when targeting another CUDA generation.
+
 The equivalent install step in an already-created environment is:
 
 ```bash

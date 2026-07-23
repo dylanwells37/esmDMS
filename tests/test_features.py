@@ -12,6 +12,7 @@ torch = pytest.importorskip("torch")
 
 from esmdms.features import (  # noqa: E402
     SAEConfig,
+    _checkpoint_files,
     analysis_window,
     embed,
     embed_and_llr,
@@ -22,6 +23,25 @@ from esmdms.schema import Dataset, FeatureArtifact  # noqa: E402
 from examples.brca1_100_demo import build_subset_dataset  # noqa: E402
 
 from .conftest import synthetic_dataset  # noqa: E402
+
+
+def test_checkpoint_files_supports_single_and_sharded_weights(tmp_path):
+    single = tmp_path / "single"
+    single.mkdir()
+    (single / "model.safetensors").touch()
+    assert _checkpoint_files(single) == (single / "model.safetensors",)
+
+    sharded = tmp_path / "sharded"
+    sharded.mkdir()
+    shard_1 = sharded / "model-00001-of-00002.safetensors"
+    shard_2 = sharded / "model-00002-of-00002.safetensors"
+    shard_1.touch()
+    shard_2.touch()
+    (sharded / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"first": "model-00001-of-00002.safetensors", '
+        '"second": "model-00002-of-00002.safetensors"}}'
+    )
+    assert _checkpoint_files(sharded) == (shard_1, shard_2)
 
 
 def test_brca1_demo_subset_keeps_reference_and_selected_trajectories(tmp_path):

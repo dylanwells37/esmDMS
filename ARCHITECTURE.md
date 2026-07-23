@@ -427,6 +427,14 @@ mu = alpha * assay_oriented_LLR
 raw LLR scale after assay orientation. `gamma` controls confidence in that
 prior. `prior_sweep` evaluates every configured alpha/gamma pair.
 
+By default `run_analysis` (`alpha_mode = "matched"`) does not sweep raw alpha
+multipliers. It scales the prior to the popDMS coefficient spread:
+`inference.matched_alpha_grid` sets `s* = std(regular-popDMS coefficients at the
+elbow gamma) / std(LLR)` and sweeps `alpha ∈ s*·{1/8…8 by 2}`, plus the unscaled
+raw-LLR point (`alpha = 1`, flagged `unscaled_raw_llr`) and the `alpha = 0`
+control. Each sweep row records `scale_multiple`, `matched_scale`, `sigma_coeff`,
+and `sigma_prior`. `alpha_mode = "fixed"` restores the literal `alphas` list.
+
 ## 10. Analysis and baselines
 
 Run the configured analysis with:
@@ -442,8 +450,12 @@ The same call is used by `multi_dataset_llr_prior.ipynb`.
 Each gamma/alpha configuration produces a coefficient vector per replicate.
 Consistency is the mean Pearson correlation across every pair of replicate
 coefficient vectors. For regular popDMS, embedding, and SAE baselines, the
-reported gamma is selected by maximum cross-replicate consistency, independently
-of ClinVar labels. `baselines.csv` records the selected `gamma` and its
+reported gamma is selected at the **popDMS correlation elbow**, independently of
+ClinVar labels: over the ascending grid `logspace(log10(1/max_reads), 4, 20)` the
+consistency curve is fed to `regularization.get_best_regularization` (copied from
+the canonical popDMS), which walks down from the peak to the elbow rather than
+taking the over-regularized argmax. `baselines.csv` records the selected `gamma`
+and its
 `cross_replicate_consistency` on every row, so a published number can be
 reproduced from that file alone. Methods without a gamma (enrichment ratio, DMS
 functional score, raw LLR) leave both columns explicitly `NaN`.

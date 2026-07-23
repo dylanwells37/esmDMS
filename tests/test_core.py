@@ -280,6 +280,7 @@ def test_configured_workflow(tmp_path):
         "_config_dir": str(tmp_path),
         "output_dir": "results",
         "gammas": [0.01, 1.0],
+        "alpha_mode": "fixed",
         "alphas": [0.0, 1.0],
         "review_star_cutoffs": [0, 2],
         "datasets": [{"path": "dataset", "priors": {"Test LLR": "prior.npz"}}],
@@ -291,8 +292,10 @@ def test_configured_workflow(tmp_path):
 
     baselines = results["baselines"]
     # Every gamma-selected baseline records the gamma and consistency it used.
+    # The gamma is chosen by the popDMS elbow over its own grid, not the config
+    # sweep gammas, so only require a valid positive strength here.
     regular = baselines.set_index("method").loc["Regular popDMS"]
-    assert regular["gamma"] in (0.01, 1.0)
+    assert regular["gamma"] > 0
     assert np.isfinite(regular["cross_replicate_consistency"])
     # Methods with no gamma leave it explicitly missing rather than absent.
     assert np.isnan(baselines.set_index("method").loc["Enrichment ratio", "gamma"])

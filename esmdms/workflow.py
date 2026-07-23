@@ -10,13 +10,20 @@ import numpy as np
 import pandas as pd
 
 from .inference import (
+    InferenceProblem,
     SubstitutionBasis,
     assay_oriented_scores,
     build_problem,
+    matched_alpha_grid,
     prior_sweep,
     substitution_basis,
 )
 from .metrics import enrichment_fitness, evaluate_fitness, functional_score_fitness
+from .regularization import (
+    DEFAULT_CORR_CUTOFF_PCT,
+    get_best_regularization,
+    popdms_gamma_grid,
+)
 from .schema import Dataset, FeatureArtifact
 
 # Metrics that depend on the ClinVar review-star cutoff and are therefore
@@ -97,35 +104,51 @@ def _baseline_row(
 def _best_gamma_baseline(
     dataset: Dataset,
     features: FeatureArtifact | SubstitutionBasis,
-    gammas: np.ndarray,
     cutoffs: list[int],
     label: str,
+    *,
+    corr_cutoff_pct: float = DEFAULT_CORR_CUTOFF_PCT,
+    problem: InferenceProblem | None = None,
 ) -> tuple[pd.DataFrame, FeatureArtifact, float, float]:
-    """Sweep gamma once and select by unsupervised cross-replicate consistency."""
-    problem = build_problem(dataset, features)
+    """Sweep gamma on the popDMS grid and select by the correlation elbow.
+
+    The gamma is chosen exactly as canonical popDMS does: over the ascending grid
+    ``logspace(log10(1/max_reads), 4, 20)`` the cross-replicate correlation curve
+    is fed to :func:`get_best_regularization`, which walks down from the peak to
+    the elbow rather than taking the (over-regularized) argmax. ``problem`` may be
+    passed to reuse precomputed moments.
+    """
+    if problem is None:
+        problem = build_problem(dataset, features)
+    gammas = popdms_gamma_grid(dataset)
     rows = []
-    results = []
+    consistency = []
     for gamma in gammas:
         result = problem.solve(gamma=float(gamma))
-        fitness = result.fitness()
+        consistency.append(result.cross_replicate_consistency)
         rows.append(
             {
                 "dataset": dataset.name,
                 "method": label,
                 "gamma": float(gamma),
                 "cross_replicate_consistency": result.cross_replicate_consistency,
-                **_metric_columns(dataset, fitness, cutoffs),
+                **_metric_columns(dataset, result.fitness(), cutoffs),
             }
         )
-        results.append(fitness)
     table = pd.DataFrame(rows)
-    consistency = table["cross_replicate_consistency"].to_numpy(dtype=float)
-    best_index = int(np.nanargmax(consistency)) if np.isfinite(consistency).any() else 0
+    if len(problem.replicate_labels) < 2 or not np.isfinite(consistency).any():
+        # popDMS fixes gamma = 1 when the replicate correlation is undefined.
+        best_gamma = 1.0
+    else:
+        best_gamma = float(
+            get_best_regularization(consistency, gammas, corr_cutoff_pct)
+        )
+    best_result = problem.solve(gamma=best_gamma)
     return (
         table,
-        results[best_index],
-        float(table["gamma"].iloc[best_index]),
-        float(consistency[best_index]),
+        best_result.fitness(),
+        best_gamma,
+        float(best_result.cross_replicate_consistency),
     )
 
 
@@ -134,14 +157,28 @@ def run_analysis(config: dict[str, Any]) -> dict[str, pd.DataFrame]:
     output_dir = _resolve(config, config.get("output_dir", "results"))
     output_dir.mkdir(parents=True, exist_ok=True)
     gammas = _grid(config, "gammas", list(np.logspace(-5, 4, 52)))
-    alphas = _grid(config, "alphas", [0.0, 0.25, 0.5, 1.0, 2.0])
     cutoffs = [int(value) for value in config.get("review_star_cutoffs", [0, 1, 2, 3])]
+
+    # Gamma for the zero-prior baselines is chosen by the popDMS correlation
+    # elbow (config default) rather than argmax; corr_cutoff_pct tunes the elbow.
+    corr_cutoff_pct = float(config.get("corr_cutoff_pct", DEFAULT_CORR_CUTOFF_PCT))
+    # The prior-strength (alpha) axis is scale-matched to the popDMS coefficients
+    # by default; "fixed" reproduces the legacy raw-multiplier behaviour.
+    alpha_mode = config.get("alpha_mode", "matched")
+    fixed_alphas = _grid(config, "alphas", [0.0, 0.25, 0.5, 1.0, 2.0])
+    scale_multiples = _grid(
+        config, "alpha_scale_multiples", [0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+    )
+    include_unscaled_llr = bool(config.get("include_unscaled_llr", True))
 
     sweep_tables = []
     baseline_tables = []
     for dataset_spec in config["datasets"]:
         dataset = Dataset.load(_resolve(config, dataset_spec["path"]))
         basis = substitution_basis(dataset)
+        # Precompute the substitution-basis moments once; regular popDMS, the
+        # matched-scale reference, and every prior sweep on this dataset reuse it.
+        basis_problem = build_problem(dataset, basis)
 
         baseline_rows = []
         enrichment = enrichment_fitness(dataset)
@@ -168,7 +205,14 @@ def run_analysis(config: dict[str, Any]) -> dict[str, pd.DataFrame]:
             )
 
         regular_table, regular_fitness, regular_gamma, regular_consistency = (
-            _best_gamma_baseline(dataset, basis, gammas, cutoffs, "Regular popDMS")
+            _best_gamma_baseline(
+                dataset,
+                basis,
+                cutoffs,
+                "Regular popDMS",
+                corr_cutoff_pct=corr_cutoff_pct,
+                problem=basis_problem,
+            )
         )
         regular_table.to_csv(
             output_dir / f"{dataset.name}__regular_popdms_gamma.csv", index=False
@@ -186,7 +230,7 @@ def run_analysis(config: dict[str, Any]) -> dict[str, pd.DataFrame]:
         for label, artifact_path in dataset_spec.get("features", {}).items():
             features = FeatureArtifact.load(_resolve(config, artifact_path))
             table, best_fitness, best_gamma, best_consistency = _best_gamma_baseline(
-                dataset, features, gammas, cutoffs, label
+                dataset, features, cutoffs, label, corr_cutoff_pct=corr_cutoff_pct
             )
             table.to_csv(
                 output_dir / f"{dataset.name}__{_safe_name(label)}__gamma.csv",
@@ -224,15 +268,50 @@ def run_analysis(config: dict[str, Any]) -> dict[str, pd.DataFrame]:
                 )
             )
 
+            if alpha_mode == "matched":
+                sweep_alphas, alpha_records, scale_meta = matched_alpha_grid(
+                    dataset,
+                    raw_prior,
+                    reference_gamma=regular_gamma,
+                    basis=basis,
+                    problem=basis_problem,
+                    scale_multiples=scale_multiples,
+                    include_unscaled_llr=include_unscaled_llr,
+                )
+            else:
+                sweep_alphas = list(fixed_alphas)
+                alpha_records = [
+                    {
+                        "alpha": float(alpha),
+                        "scale_multiple": float("nan"),
+                        "unscaled_raw_llr": False,
+                    }
+                    for alpha in sweep_alphas
+                ]
+                scale_meta = {
+                    "matched_scale": float("nan"),
+                    "sigma_coeff": float("nan"),
+                    "sigma_prior": float("nan"),
+                    "reference_gamma": float(regular_gamma),
+                }
+
             sweep = prior_sweep(
                 dataset,
                 raw_prior,
-                alphas=alphas,
+                alphas=sweep_alphas,
                 gammas=gammas,
                 evaluate=lambda fitness, current=dataset: _metric_columns(
                     current, fitness, cutoffs
                 ),
+                basis=basis,
+                problem=basis_problem,
             )
+            # Attach per-alpha semantics (multiple of the matched scale, and which
+            # row is the unscaled raw-LLR point) and the scalar scale metadata.
+            attributes = pd.DataFrame(alpha_records).drop_duplicates("alpha")
+            sweep = sweep.merge(attributes, on="alpha", how="left")
+            for key, value in scale_meta.items():
+                sweep[key] = value
             sweep.insert(0, "prior", label)
             sweep.insert(0, "dataset", dataset.name)
             sweep.to_csv(

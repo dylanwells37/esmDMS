@@ -16,11 +16,11 @@ dependencies = [
   "pandas",
   "safetensors",
   "scipy",
-  "torch",
+  "torch>=2.7,<2.12",
 ]
 
 [project.optional-dependencies]
-notebook = ["ipykernel"]
+notebook = ["ipykernel", "nbconvert", "nbformat"]
 test = ["black", "pytest"]
 
 [project.scripts]

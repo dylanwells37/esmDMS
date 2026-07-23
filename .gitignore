@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+slurm-*.out
+slurm-*.err
 .ipynb_checkpoints/
 .matplotlib_cache/
 .venv/

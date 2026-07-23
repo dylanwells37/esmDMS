@@ -71,7 +71,12 @@ def load_language_model(
     snapshot = Path(
         snapshot_download(
             repo_id=model_name,
-            allow_patterns=["config.json", "model.safetensors"],
+            allow_patterns=[
+                "config.json",
+                "model.safetensors",
+                "model.safetensors.index.json",
+                "model-*.safetensors",
+            ],
         )
     )
     config = json.loads((snapshot / "config.json").read_text())
@@ -86,11 +91,15 @@ def load_language_model(
         tokenizer=tokenizer,
         use_flash_attn=False,
     )
-    state = {
-        converted: value
-        for name, value in load_file(snapshot / "model.safetensors").items()
-        if (converted := _esmc_state_name(name)) is not None
-    }
+    state = {}
+    for checkpoint_file in _checkpoint_files(snapshot):
+        for name, value in load_file(checkpoint_file).items():
+            if (converted := _esmc_state_name(name)) is not None:
+                if converted in state:
+                    raise ValueError(
+                        f"Duplicate tensor {converted!r} in model checkpoint."
+                    )
+                state[converted] = value
     model.load_state_dict(state, strict=True, assign=True)
     if resolved_dtype is None:
         model = model.to(target)
@@ -98,6 +107,29 @@ def load_language_model(
         model = model.to(device=target, dtype=resolved_dtype)
     model.eval()
     return tokenizer, model
+
+
+def _checkpoint_files(snapshot: Path) -> tuple[Path, ...]:
+    """Resolve a single-file or Hugging Face sharded safetensors checkpoint."""
+    single_file = snapshot / "model.safetensors"
+    if single_file.is_file():
+        return (single_file,)
+    index_file = snapshot / "model.safetensors.index.json"
+    if not index_file.is_file():
+        raise FileNotFoundError(
+            f"No model.safetensors or model.safetensors.index.json in {snapshot}"
+        )
+    index = json.loads(index_file.read_text())
+    filenames = tuple(dict.fromkeys(index.get("weight_map", {}).values()))
+    if not filenames:
+        raise ValueError(f"Checkpoint index {index_file} has an empty weight_map.")
+    files = tuple(snapshot / str(filename) for filename in filenames)
+    missing = [path.name for path in files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Checkpoint index references missing shards: {', '.join(missing)}"
+        )
+    return files
 
 
 def _esmc_state_name(name: str) -> str | None:

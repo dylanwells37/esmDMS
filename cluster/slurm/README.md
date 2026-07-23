@@ -55,9 +55,10 @@ Do not place final artifacts under node-local `$TMPDIR`. The job scripts use
 
 ## ESM-C 6B GPU smoke test
 
-The smoke test loads the official ESM-C 6B checkpoint and mean-pools the final
-residue embeddings for one full-length (1,863-residue) BRCA1 sequence. It
-records the GPU model, peak CUDA memory, load time, and inference time.
+The smoke test loads the official ESM-C 6B checkpoint once and sequentially
+mean-pools the final residue embeddings for the first 100 full-length
+(1,863-residue) BRCA1 sequences. It records the GPU model, peak CUDA memory,
+load time, total inference time, and per-sequence timing statistics.
 
 ```bash
 export REPO_ROOT=/shared/path/esmDMS
@@ -69,6 +70,14 @@ export GPU_RESOURCE=gpu:a100:1
 bash cluster/slurm/submit_smoke_esmc_6b.sh
 ```
 
+The helper exports these paths into the batch job. Direct submission also works
+when run from the repository root; the job uses `SLURM_SUBMIT_DIR`, `.venv`, and
+a job-specific directory under `results/` as defaults:
+
+```bash
+sbatch cluster/slurm/smoke_esmc_6b.sbatch
+```
+
 The defaults request 160 GB host RAM, one GPU, two hours, BF16 weights, and at
 least 48 GiB of GPU memory. Sites that select GPU memory through a constraint
 can instead set, for example, `GPU_CONSTRAINT=a100_80gb`. Override
@@ -76,7 +85,9 @@ can instead set, for example, `GPU_CONSTRAINT=a100_80gb`. Override
 `TIME_LIMIT` without editing the job. A successful run writes the following
 beneath `$OUTPUT`:
 
-- `brca1_mean_embedding.npy`: the mean-pooled final-layer embedding.
+- `brca1_first100_mean_embeddings.npy`: by default, a 100-by-2,560 matrix of
+  mean-pooled final-layer embeddings. Set `NUM_SEQUENCES` to override the row
+  count; the selected count is included in the filename.
 - `metrics.json`: GPU identity, PyTorch peak allocated/reserved VRAM, and
   model-load, inference, and total Python times.
 - `gpu_memory.csv`: one-second samples of total/used GPU memory, utilization,

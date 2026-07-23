@@ -479,10 +479,20 @@ def prior_sweep(
     alphas: Iterable[float],
     gammas: Iterable[float],
     evaluate: Callable[[FeatureArtifact], dict[str, float | int]] | None = None,
+    basis: SubstitutionBasis | None = None,
+    problem: InferenceProblem | None = None,
 ) -> pd.DataFrame:
-    """Evaluate an alpha-by-gamma LLR-prior grid on the substitution basis."""
-    basis = substitution_basis(dataset)
-    problem = build_problem(dataset, basis)
+    """Evaluate an alpha-by-gamma LLR-prior grid on the substitution basis.
+
+    ``basis`` and ``problem`` may be supplied to reuse a substitution basis and
+    its precomputed moments across several priors on the same dataset; the moments
+    dominate the cost for large assays (MSH2), so rebuilding them per prior is
+    wasteful. When omitted they are constructed here as before.
+    """
+    if basis is None:
+        basis = substitution_basis(dataset)
+    if problem is None:
+        problem = build_problem(dataset, basis)
     base_prior = prior_vector(dataset, basis, prior)
     rows = []
     for alpha in alphas:
@@ -498,3 +508,65 @@ def prior_sweep(
                 row.update(evaluate(result.fitness()))
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def matched_alpha_grid(
+    dataset: Dataset,
+    prior: FeatureArtifact,
+    *,
+    reference_gamma: float,
+    basis: SubstitutionBasis | None = None,
+    problem: InferenceProblem | None = None,
+    scale_multiples: Iterable[float] = (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0),
+    include_unscaled_llr: bool = True,
+) -> tuple[list[float], list[dict[str, Any]], dict[str, float]]:
+    """Build a scale-matched prior-strength (alpha) grid for the prior sweep.
+
+    The LLR prior is scaled so its coefficient spread matches the regular-popDMS
+    selection coefficients: with ``s* = std(c) / std(p)`` (``c`` the zero-prior
+    joint coefficients at ``reference_gamma``, ``p`` the assay-oriented,
+    basis-aligned LLR vector), ``std(s*·p) == std(c)``. The returned alphas are
+    the zero-prior control, ``s*`` times each requested multiple, and optionally
+    the unscaled raw-LLR magnitude (alpha = 1.0).
+
+    Returns ``(alphas, records, meta)`` where ``records`` carries per-alpha
+    semantics (``scale_multiple``, ``unscaled_raw_llr``) and ``meta`` carries the
+    scalar ``matched_scale``/``sigma_coeff``/``sigma_prior``/``reference_gamma``.
+    """
+    if basis is None:
+        basis = substitution_basis(dataset)
+    if problem is None:
+        problem = build_problem(dataset, basis)
+    coefficients = problem.solve(gamma=float(reference_gamma)).joint_coefficients
+    sigma_c = float(np.std(coefficients))
+    prior_values = prior_vector(dataset, basis, prior)
+    sigma_p = float(np.std(prior_values))
+    s_star = sigma_c / sigma_p if sigma_p > 0 else 0.0
+
+    records: list[dict[str, Any]] = [
+        {"alpha": 0.0, "scale_multiple": 0.0, "unscaled_raw_llr": False}
+    ]
+    for multiple in scale_multiples:
+        records.append(
+            {
+                "alpha": s_star * float(multiple),
+                "scale_multiple": float(multiple),
+                "unscaled_raw_llr": False,
+            }
+        )
+    if include_unscaled_llr:
+        records.append(
+            {
+                "alpha": 1.0,
+                "scale_multiple": (1.0 / s_star) if s_star > 0 else float("nan"),
+                "unscaled_raw_llr": True,
+            }
+        )
+    alphas = [record["alpha"] for record in records]
+    meta = {
+        "matched_scale": s_star,
+        "sigma_coeff": sigma_c,
+        "sigma_prior": sigma_p,
+        "reference_gamma": float(reference_gamma),
+    }
+    return alphas, records, meta
