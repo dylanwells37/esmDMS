@@ -32,8 +32,8 @@ echo "dataset=${DATASET_DIR}"
 echo "output=${OUTPUT}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
-# Masked-marginal LLR only (no embeddings): one forward pass per unique mutation
-# position. BRCA2's C-terminal window is read from dataset.json automatically.
+# One masked-marginal forward pass per unique mutation position. BRCA2's
+# C-terminal window is read from dataset.json automatically.
 esmdms llr "${DATASET_DIR}" \
     --model "${MODEL_ID}" \
     --window-size "${WINDOW_SIZE:-2048}" \

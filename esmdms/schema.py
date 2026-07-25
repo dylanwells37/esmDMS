@@ -14,8 +14,8 @@ import pandas as pd
 ARTIFACT_SCHEMA_VERSION = 1
 DATASET_SCHEMA_VERSION = 2
 SEQUENCE_ID = "SequenceIndex"
-ArtifactKind = Literal["embedding", "sae", "llr_prior", "basis", "fitness"]
-ARTIFACT_KINDS = {"embedding", "sae", "llr_prior", "basis", "fitness"}
+ArtifactKind = Literal["llr_prior", "fitness"]
+ARTIFACT_KINDS = {"llr_prior", "fitness"}
 
 VARIANT_COLUMNS = (
     SEQUENCE_ID,
@@ -54,9 +54,8 @@ def _boolean_values(series: pd.Series, *, label: str) -> pd.Series:
 class FeatureArtifact:
     """A finite feature matrix with explicit row and column identities.
 
-    Raw embeddings, SAE activations, LLR priors, substitution bases, and inferred
-    fitness values all use this representation. Rows are always keyed by
-    ``SequenceIndex``; scalar scores use a one-column matrix.
+    LLR priors and inferred fitness values use this representation. Rows are
+    always keyed by ``SequenceIndex``; scalar scores use a one-column matrix.
     """
 
     sequence_ids: tuple[str, ...]
@@ -79,6 +78,8 @@ class FeatureArtifact:
                 "Artifact shape does not match its identifiers: "
                 f"{values.shape} != ({len(sequence_ids)}, {len(feature_names)})."
             )
+        if len(feature_names) != 1:
+            raise ValueError("LLR and fitness artifacts must contain one score column.")
         if not np.issubdtype(values.dtype, np.number):
             raise TypeError("Artifact values must be numeric.")
         if not np.isfinite(values).all():

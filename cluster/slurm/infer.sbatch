@@ -13,11 +13,6 @@ set -euo pipefail
 : "${DATASET:?Set DATASET to a canonical dataset directory}"
 : "${OUTPUT:?Set OUTPUT to the fitness .npz path}"
 
-if [[ -n "${FEATURES:-}" && -n "${PRIOR:-}" ]]; then
-    echo "Do not combine FEATURES and PRIOR: LLR priors use substitution features." >&2
-    exit 2
-fi
-
 cd "${REPO_ROOT}"
 source "${VENV}/bin/activate"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
@@ -28,9 +23,6 @@ arguments=(
     --gamma "${GAMMA:-0.1}"
     --output "${OUTPUT}"
 )
-if [[ -n "${FEATURES:-}" ]]; then
-    arguments+=(--features "${FEATURES}")
-fi
 if [[ -n "${PRIOR:-}" ]]; then
     arguments+=(--prior "${PRIOR}" --alpha "${ALPHA:-1.0}")
 fi

@@ -39,7 +39,7 @@ functional_score                  assay score (last column; see gotchas 3 & 4)
 import pandas as pd
 df = pd.read_csv("MV_BRCA1_Findlay_2018.csv")
 
-# join to embeddings keyed by protein sequence (1:1 — see gotcha 1)
+# join external sequence-level annotations by protein sequence (1:1 — see gotcha 1)
 merged = df.merge(emb_df, left_on="mutated_sequence", right_on="ProteinSequence", how="left")
 
 # keep only clinically-labeled rows for a supervised task

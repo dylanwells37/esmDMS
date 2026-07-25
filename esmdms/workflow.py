@@ -103,7 +103,7 @@ def _baseline_row(
 
 def _best_gamma_baseline(
     dataset: Dataset,
-    features: FeatureArtifact | SubstitutionBasis,
+    features: SubstitutionBasis,
     cutoffs: list[int],
     label: str,
     *,
@@ -226,25 +226,6 @@ def run_analysis(config: dict[str, Any]) -> dict[str, pd.DataFrame]:
                 consistency=regular_consistency,
             )
         )
-
-        for label, artifact_path in dataset_spec.get("features", {}).items():
-            features = FeatureArtifact.load(_resolve(config, artifact_path))
-            table, best_fitness, best_gamma, best_consistency = _best_gamma_baseline(
-                dataset, features, cutoffs, label, corr_cutoff_pct=corr_cutoff_pct
-            )
-            table.to_csv(
-                output_dir / f"{dataset.name}__{_safe_name(label)}__gamma.csv",
-                index=False,
-            )
-            baseline_rows.append(
-                _baseline_row(
-                    dataset,
-                    label,
-                    _metric_columns(dataset, best_fitness, cutoffs),
-                    gamma=best_gamma,
-                    consistency=best_consistency,
-                )
-            )
 
         for label, artifact_path in dataset_spec.get("priors", {}).items():
             raw_prior = FeatureArtifact.load(_resolve(config, artifact_path))

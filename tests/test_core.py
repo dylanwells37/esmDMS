@@ -135,29 +135,16 @@ def test_substitution_prior_inference_and_metrics():
     assert metrics["n_pathogenic"] == 3
 
 
-def test_substitution_basis_is_sparse_and_matches_the_dense_matrix():
+def test_substitution_basis_is_sparse():
     dataset = synthetic_dataset()
     basis = substitution_basis(dataset)
 
     # One column index per variant row; the wild-type row is outside the basis.
     assert isinstance(basis, SubstitutionBasis)
     assert basis.columns.tolist() == [-1, 0, 0, 1, 2]
-    dense = basis.dense()
-    assert dense.shape == (5, 3)
-    assert dense[0].sum() == 0.0
-
     coefficients = np.asarray([0.5, -0.25, 2.0])
-    np.testing.assert_allclose(basis.project(coefficients), dense @ coefficients)
-
-    # Inference through the sparse basis reproduces the dense-artifact result.
-    prior = synthetic_prior(dataset)
-    sparse_result = infer(dataset, basis, gamma=0.1, prior=prior)
-    dense_result = infer(dataset, basis.to_artifact(), gamma=0.1, prior=prior)
     np.testing.assert_allclose(
-        sparse_result.joint_coefficients, dense_result.joint_coefficients, atol=1e-9
-    )
-    np.testing.assert_allclose(
-        sparse_result.fitness().values, dense_result.fitness().values, atol=1e-9
+        basis.project(coefficients), [0.0, 0.5, 0.5, -0.25, 2.0]
     )
 
 

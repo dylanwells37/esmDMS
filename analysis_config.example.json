@@ -6,10 +6,6 @@
   "datasets": [
     {
       "path": "datasets/MV_BRCA1_Findlay_2018",
-      "features": {
-        "ESM-C 300M layer 30": "artifacts/MV_BRCA1_Findlay_2018/300M/layer_30.npz",
-        "ESM-C 300M layer 30 SAE": "artifacts/MV_BRCA1_Findlay_2018/300M_layer30_sae.npz"
-      },
       "priors": {
         "ESM-C 300M LLR": "artifacts/MV_BRCA1_Findlay_2018/300M_llr.npz"
       }

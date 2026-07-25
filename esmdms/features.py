@@ -1,11 +1,10 @@
-"""Protein language-model features, masked-marginal priors, and SAE features."""
+"""Protein language-model masked-marginal LLR calculations."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
@@ -13,8 +12,6 @@ import torch
 from .schema import Dataset, FeatureArtifact, SEQUENCE_ID
 
 
-Pooling = Literal["mean", "max"]
-SparsityMode = Literal["normal", "topk", "batchtopk"]
 AA_ALPHABET = tuple("ACDEFGHIKLMNPQRSTVWY")
 DEFAULT_WINDOW_SIZE = 2048
 ProgressCallback = Callable[[str, int, int], None]
@@ -234,178 +231,6 @@ def _tokenize(sequence: str, tokenizer) -> dict:
     return inputs
 
 
-def _residue_hidden_states(
-    sequence: str,
-    tokenizer,
-    model,
-    layers: Sequence[int] | None,
-) -> tuple[dict[int, np.ndarray], int]:
-    inputs = _tokenize(sequence, tokenizer)
-    special_mask = inputs.pop("special_tokens_mask").bool()
-    residue_mask = (inputs["attention_mask"].bool() & ~special_mask).squeeze(0)
-    model_inputs = {
-        key: value.to(_model_device(model)) for key, value in inputs.items()
-    }
-    with torch.inference_mode():
-        outputs = model(
-            sequence_tokens=model_inputs["input_ids"],
-            sequence_id=model_inputs["attention_mask"].bool(),
-        )
-    n_layers = int(outputs.hidden_states.shape[0])
-    selected_layers = (
-        tuple(range(n_layers + 1))
-        if layers is None
-        else tuple(int(layer) for layer in layers)
-    )
-    invalid = [layer for layer in selected_layers if not 0 <= layer <= n_layers]
-    if invalid:
-        raise ValueError(
-            f"Invalid layer indices {invalid}; model exposes layers 0 through "
-            f"{n_layers}."
-        )
-    layer_values = {0: model.embed(model_inputs["input_ids"])}
-    layer_values.update(
-        {
-            layer: (
-                outputs.embeddings
-                if layer == n_layers
-                else outputs.hidden_states[layer - 1]
-            )
-            for layer in selected_layers
-            if layer > 0
-        }
-    )
-    states = {
-        layer: layer_values[layer][0, residue_mask.to(layer_values[layer].device), :]
-        .detach()
-        .float()
-        .cpu()
-        .numpy()
-        for layer in selected_layers
-    }
-    if any(state.shape[0] != len(sequence) for state in states.values()):
-        raise ValueError(
-            "Tokenizer residue count does not match the protein sequence length."
-        )
-    return states, n_layers
-
-
-def embed(
-    dataset: Dataset,
-    model_name: str,
-    *,
-    layers: Sequence[int] | None = None,
-    pooling: Pooling = "max",
-    window_size: int | None = DEFAULT_WINDOW_SIZE,
-    truncate: tuple[int, int] | None = None,
-    device: str | None = None,
-    dtype: str | None = None,
-) -> dict[int, FeatureArtifact]:
-    """Embed each unique protein sequence and return one artifact per layer."""
-    tokenizer, model = load_language_model(model_name, device=device, dtype=dtype)
-    return _embed_with_model(
-        dataset,
-        model_name,
-        tokenizer,
-        model,
-        sequence_ids=dataset.sequence_ids,
-        layers=layers,
-        pooling=pooling,
-        window_size=window_size,
-        truncate=truncate,
-    )
-
-
-def _embed_with_model(
-    dataset: Dataset,
-    model_name: str,
-    tokenizer,
-    model,
-    *,
-    sequence_ids: Sequence[str],
-    layers: Sequence[int] | None,
-    pooling: Pooling,
-    window_size: int | None,
-    truncate: tuple[int, int] | None,
-    provenance_extra: dict | None = None,
-    progress: ProgressCallback | None = None,
-) -> dict[int, FeatureArtifact]:
-    if pooling not in {"mean", "max"}:
-        raise ValueError("pooling must be 'mean' or 'max'.")
-    sequence_ids = tuple(str(value) for value in sequence_ids)
-    if not sequence_ids:
-        raise ValueError("Embedding shard contains no sequence ids.")
-    unknown = sorted(set(sequence_ids).difference(dataset.sequence_ids))
-    if unknown:
-        raise ValueError(f"Unknown embedding sequence ids: {', '.join(unknown[:5])}")
-
-    window_start, window_end = analysis_window(dataset, window_size, truncate)
-    full_sequence_by_id = dict(
-        zip(
-            dataset.variants[SEQUENCE_ID].astype(str),
-            dataset.variants["protein_sequence"].astype(str),
-        )
-    )
-    sequence_by_id = {
-        sequence_id: full_sequence_by_id[sequence_id][window_start:window_end]
-        for sequence_id in sequence_ids
-    }
-    reducer = np.mean if pooling == "mean" else np.max
-    pooled_by_layer: dict[int, dict[str, np.ndarray]] = {}
-    selected_layers: tuple[int, ...] | None = None
-    final_layer: int | None = None
-    unique_sequences = tuple(dict.fromkeys(sequence_by_id.values()))
-    for completed, sequence in enumerate(unique_sequences, start=1):
-        states, final_layer = _residue_hidden_states(sequence, tokenizer, model, layers)
-        if selected_layers is None:
-            selected_layers = tuple(states)
-            pooled_by_layer = {layer: {} for layer in selected_layers}
-        for layer in selected_layers:
-            pooled_by_layer[layer][sequence] = reducer(states[layer], axis=0).astype(
-                np.float32
-            )
-        if progress is not None:
-            progress("embedding", completed, len(unique_sequences))
-
-    if selected_layers is None:
-        raise ValueError("Embedding shard contains no protein sequences.")
-    artifacts = {}
-    for layer in selected_layers:
-        values = np.vstack(
-            [
-                pooled_by_layer[layer][sequence_by_id[sequence_id]]
-                for sequence_id in sequence_ids
-            ]
-        )
-        provenance = {
-            "model": model_name,
-            "layer": layer,
-            # The final index returns the model's post-LayerNorm output state;
-            # every earlier index is a raw transformer block output. Layers are
-            # therefore on different scales and must not be compared naively.
-            "final_layer_norm_applied": layer == final_layer,
-            "pooling": pooling,
-            "window_selection": (
-                "custom"
-                if truncate is not None
-                else "dataset" if dataset.truncation is not None else "automatic"
-            ),
-            "window_start": window_start + 1,
-            "window_end": window_end,
-            "window_size": window_end - window_start,
-        }
-        provenance.update(provenance_extra or {})
-        artifacts[layer] = FeatureArtifact(
-            sequence_ids,
-            values,
-            tuple(f"embedding_{index:05d}" for index in range(values.shape[1])),
-            "embedding",
-            dataset.name,
-            provenance,
-        )
-    return artifacts
-
-
 def _amino_acid_token_id(tokenizer, amino_acid: str) -> int | None:
     token_ids = tokenizer(amino_acid, add_special_tokens=False).get("input_ids", [])
     return int(token_ids[0]) if len(token_ids) == 1 else None
@@ -419,10 +244,21 @@ def masked_marginal_llr(
     truncate: tuple[int, int] | None = None,
     device: str | None = None,
     dtype: str | None = None,
+    shard_index: int = 0,
+    num_shards: int = 1,
+    progress: ProgressCallback | None = None,
 ) -> FeatureArtifact:
     """Compute mutant-minus-wildtype masked marginal log likelihood ratios."""
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive.")
+    if not 0 <= shard_index < num_shards:
+        raise ValueError("shard_index must be between zero and num_shards - 1.")
+    positions = _llr_positions(dataset)[shard_index::num_shards]
+    if not positions:
+        raise ValueError(
+            f"LLR shard {shard_index} is empty; reduce num_shards={num_shards}."
+        )
     tokenizer, model = load_language_model(model_name, device=device, dtype=dtype)
-    positions = _llr_positions(dataset)
     return _llr_with_model(
         dataset,
         model_name,
@@ -431,6 +267,8 @@ def masked_marginal_llr(
         positions=positions,
         window_size=window_size,
         truncate=truncate,
+        provenance_extra={"shard_index": shard_index, "num_shards": num_shards},
+        progress=progress,
     )
 
 
@@ -529,304 +367,6 @@ def _llr_with_model(
         values,
         ("llr",),
         "llr_prior",
-        dataset.name,
-        provenance,
-    )
-
-
-def embed_and_llr(
-    dataset: Dataset,
-    model_name: str,
-    *,
-    layers: Sequence[int] | None = None,
-    pooling: Pooling = "max",
-    window_size: int | None = DEFAULT_WINDOW_SIZE,
-    truncate: tuple[int, int] | None = None,
-    device: str | None = None,
-    dtype: str | None = None,
-    shard_index: int = 0,
-    num_shards: int = 1,
-    progress: ProgressCallback | None = None,
-) -> tuple[dict[int, FeatureArtifact], FeatureArtifact]:
-    """Generate a deterministic embedding/LLR shard with one model load."""
-    if num_shards <= 0:
-        raise ValueError("num_shards must be positive.")
-    if not 0 <= shard_index < num_shards:
-        raise ValueError("shard_index must be between zero and num_shards - 1.")
-
-    sequence_ids = dataset.sequence_ids[shard_index::num_shards]
-    positions = _llr_positions(dataset)[shard_index::num_shards]
-    if not sequence_ids:
-        raise ValueError(
-            f"Embedding shard {shard_index} is empty; reduce num_shards={num_shards}."
-        )
-    if not positions:
-        raise ValueError(
-            f"LLR shard {shard_index} is empty; reduce num_shards={num_shards}."
-        )
-
-    tokenizer, model = load_language_model(model_name, device=device, dtype=dtype)
-    shard_provenance = {
-        "shard_index": shard_index,
-        "num_shards": num_shards,
-    }
-    embeddings = _embed_with_model(
-        dataset,
-        model_name,
-        tokenizer,
-        model,
-        sequence_ids=sequence_ids,
-        layers=layers,
-        pooling=pooling,
-        window_size=window_size,
-        truncate=truncate,
-        provenance_extra=shard_provenance,
-        progress=progress,
-    )
-    llr = _llr_with_model(
-        dataset,
-        model_name,
-        tokenizer,
-        model,
-        positions=positions,
-        window_size=window_size,
-        truncate=truncate,
-        provenance_extra=shard_provenance,
-        progress=progress,
-    )
-    return embeddings, llr
-
-
-class SparseAutoencoder(torch.nn.Module):
-    """Sparse autoencoder with a tied input/output centering bias."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        n_features: int,
-        mode: SparsityMode = "normal",
-        k: int | None = None,
-    ):
-        super().__init__()
-        if mode not in {"normal", "topk", "batchtopk"}:
-            raise ValueError(f"Unsupported sparsity mode {mode!r}.")
-        if mode in {"topk", "batchtopk"} and (k is None or k <= 0):
-            raise ValueError(f"{mode} requires a positive k.")
-        self.encoder = torch.nn.Linear(input_dim, n_features, bias=False)
-        self.decoder = torch.nn.Linear(n_features, input_dim, bias=False)
-        self.center = torch.nn.Parameter(torch.zeros(input_dim))
-        self.mode = mode
-        self.k = k
-        # BatchTopK couples samples through a per-batch ranking. After training,
-        # a fixed threshold replaces that ranking so a sequence's activations no
-        # longer depend on which other sequences are encoded alongside it.
-        self.register_buffer("activation_threshold", torch.tensor(float("nan")))
-        torch.nn.init.kaiming_uniform_(self.decoder.weight)
-        self.normalize_decoder()
-        with torch.no_grad():
-            self.encoder.weight.copy_(self.decoder.weight.T)
-
-    def normalize_decoder(self) -> None:
-        with torch.no_grad():
-            self.decoder.weight.div_(
-                self.decoder.weight.norm(dim=0, keepdim=True).clamp_min(1e-8)
-            )
-
-    def _batch_topk(self, activations: torch.Tensor) -> torch.Tensor:
-        flat = activations.flatten()
-        count = min(int(self.k) * activations.shape[0], flat.numel())
-        indices = flat.topk(count).indices
-        return (flat * torch.zeros_like(flat).scatter_(0, indices, 1.0)).view_as(
-            activations
-        )
-
-    def encode(self, values: torch.Tensor) -> torch.Tensor:
-        activations = torch.relu(self.encoder(values - self.center))
-        if self.mode == "topk":
-            k = min(int(self.k), activations.shape[1])
-            indices = activations.topk(k, dim=1).indices
-            mask = torch.zeros_like(activations).scatter_(1, indices, 1.0)
-            activations = activations * mask
-        elif self.mode == "batchtopk":
-            threshold = float(self.activation_threshold)
-            if self.training or not np.isfinite(threshold):
-                activations = self._batch_topk(activations)
-            else:
-                activations = activations * (activations > threshold)
-        return activations
-
-    @torch.no_grad()
-    def calibrate_threshold(
-        self, values: torch.Tensor, batch_size: int
-    ) -> float | None:
-        """Fix the BatchTopK decision threshold from the training distribution.
-
-        The threshold is the mean smallest surviving activation across training
-        batches, the standard BatchTopK hand-off from a batch ranking to a
-        sample-independent rule.
-        """
-        if self.mode != "batchtopk" or len(values) == 0:
-            return None
-        was_training = self.training
-        self.train()
-        minima = []
-        for start in range(0, len(values), batch_size):
-            activations = self.encode(values[start : start + batch_size])
-            surviving = activations[activations > 0]
-            if surviving.numel():
-                minima.append(float(surviving.min()))
-        self.train(was_training)
-        if not minima:
-            return None
-        threshold = float(np.mean(minima))
-        self.activation_threshold.fill_(threshold)
-        return threshold
-
-    def forward(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        activations = self.encode(values)
-        return self.decoder(activations) + self.center, activations
-
-
-@dataclass(frozen=True)
-class SAEConfig:
-    n_features: int | None = None
-    sparsity: float = 1e-3
-    learning_rate: float = 1e-3
-    epochs: int = 200
-    batch_size: int = 64
-    train_fraction: float = 0.8
-    mode: SparsityMode = "normal"
-    k: int | None = None
-    seed: int = 42
-    active_frequency: float = 1e-3
-    center_on_reference: bool = True
-
-
-def train_sae(
-    dataset: Dataset,
-    embeddings: FeatureArtifact,
-    *,
-    config: SAEConfig = SAEConfig(),
-    model_path: str | Path | None = None,
-    device: str | None = None,
-) -> FeatureArtifact:
-    """Train an SAE and return active features in the canonical artifact format."""
-    if embeddings.kind != "embedding":
-        raise ValueError("SAE input must be an embedding artifact.")
-    if embeddings.dataset != dataset.name:
-        raise ValueError("Embedding and dataset names do not match.")
-    values = embeddings.align(dataset.sequence_ids).astype(np.float32)
-    if config.center_on_reference:
-        reference_rows = (
-            dataset.variants["protein_sequence"]
-            .astype(str)
-            .eq(dataset.reference_sequence)
-            .to_numpy()
-        )
-        if not reference_rows.any():
-            raise ValueError(
-                "center_on_reference requires a reference protein row in variants.csv."
-            )
-        values = values - values[np.flatnonzero(reference_rows)[0]]
-
-    protein_sequences = dataset.variants["protein_sequence"].astype(str).to_numpy()
-    unique_indices = np.unique(protein_sequences, return_index=True)[1]
-    fit_values = values[np.sort(unique_indices)]
-    if len(fit_values) < 2:
-        raise ValueError("SAE training requires at least two unique protein sequences.")
-    n_features = config.n_features or values.shape[1] * 2
-    target = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    generator = np.random.default_rng(config.seed)
-    split = max(
-        1, min(len(fit_values) - 1, int(len(fit_values) * config.train_fraction))
-    )
-    order = generator.permutation(len(fit_values))
-    train = torch.from_numpy(fit_values[order[:split]]).to(target)
-    # train_fraction holds sequences back, so they are scored rather than
-    # silently discarded; the held-out error is what makes the split meaningful.
-    validation = torch.from_numpy(fit_values[order[split:]]).to(target)
-
-    torch.manual_seed(config.seed)
-    model = SparseAutoencoder(values.shape[1], n_features, config.mode, config.k).to(
-        target
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    for _ in range(config.epochs):
-        order_t = torch.randperm(len(train), device=target)
-        for start in range(0, len(train), config.batch_size):
-            batch = train[order_t[start : start + config.batch_size]]
-            optimizer.zero_grad()
-            reconstruction, activations = model(batch)
-            loss = torch.nn.functional.mse_loss(reconstruction, batch)
-            if config.mode == "normal":
-                loss = loss + config.sparsity * activations.abs().mean()
-            loss.backward()
-            optimizer.step()
-            model.normalize_decoder()
-
-    threshold = model.calibrate_threshold(train, config.batch_size)
-
-    all_values = torch.from_numpy(values).to(target)
-    model.eval()
-    with torch.inference_mode():
-        reconstruction, activations = model(all_values)
-        train_error = float(
-            torch.nn.functional.mse_loss(model(train)[0], train).detach().cpu()
-        )
-        validation_error = (
-            float(
-                torch.nn.functional.mse_loss(model(validation)[0], validation)
-                .detach()
-                .cpu()
-            )
-            if len(validation)
-            else float("nan")
-        )
-    activations_np = activations.float().cpu().numpy()
-    activation_frequency = (activations_np > 0).mean(axis=0)
-    active = (activation_frequency >= config.active_frequency) & (
-        activation_frequency <= 1.0 - config.active_frequency
-    )
-    if not active.any():
-        raise RuntimeError("SAE produced no non-degenerate active features.")
-
-    reconstruction_error = float(
-        torch.nn.functional.mse_loss(reconstruction, all_values).detach().cpu()
-    )
-    provenance = {
-        "source": embeddings.provenance,
-        "config": asdict(config),
-        "input_features": values.shape[1],
-        "active_features": int(active.sum()),
-        "reconstruction_mse": reconstruction_error,
-        "train_sequences": int(len(train)),
-        "validation_sequences": int(len(validation)),
-        "train_reconstruction_mse": train_error,
-        "validation_reconstruction_mse": validation_error,
-        "activation_threshold": threshold,
-    }
-    if model_path is not None:
-        model_path = Path(model_path)
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "state_dict": model.state_dict(),
-                # A tensor rather than a NumPy array so the checkpoint stays
-                # loadable under torch.load(weights_only=True).
-                "active_mask": torch.from_numpy(active),
-                "input_dim": values.shape[1],
-                "n_features": n_features,
-                "provenance": provenance,
-            },
-            model_path,
-        )
-        provenance["model_path"] = str(model_path)
-
-    return FeatureArtifact(
-        dataset.sequence_ids,
-        activations_np[:, active],
-        tuple(f"sae_{index:05d}" for index in np.flatnonzero(active)),
-        "sae",
         dataset.name,
         provenance,
     )

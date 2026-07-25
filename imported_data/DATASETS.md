@@ -20,7 +20,7 @@ Note: four are raw counts; **TP53 is frequencies**, not counts.
 
 ```
 mutant                            protein change, 1-based on the canonical isoform (e.g. "F1821L"; "*" = stop)
-mutated_sequence                  full mutated protein sequence  (unique per row; embedding join key)
+mutated_sequence                  full mutated protein sequence (unique per row)
 has_clinvar                       true/false
 clinvar_significance              free-text ClinVar germline description
 clinvar_significance_normalized   pathogenic | benign | uncertain significance | other
@@ -49,7 +49,7 @@ functional_score                  assay score (see per-dataset direction note; m
      (conflicting / not-provided / risk-factor) is treated as unlabeled. `clinvar_variation_ids`
      keeps the union of all underlying IDs for provenance.
 3. After collapse, `mutated_sequence` is **unique** in every file (verified), so joining to
-   precomputed embeddings is one-to-one.
+   external sequence-level annotations is one-to-one.
 
 Rows before → after collapse: **BRCA1** 2224→1956, **BRCA2 Huang** 4886→4333, **VHL**
 1190→1087, **TP53** 4413→3158, **MSH2** 17746→17746 (no duplicates). For the SGE datasets

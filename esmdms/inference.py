@@ -1,4 +1,4 @@
-"""popDMS inference for any canonical feature artifact, with optional priors."""
+"""popDMS inference on assayed amino-acid substitutions, with optional LLR priors."""
 
 from __future__ import annotations
 
@@ -14,9 +14,6 @@ from .schema import Dataset, FeatureArtifact, SEQUENCE_ID
 
 
 NO_SUBSTITUTION = -1
-FeatureBasis = "FeatureArtifact | SubstitutionBasis"
-
-
 @dataclass(frozen=True)
 class SubstitutionBasis:
     """One-hot amino-acid substitution basis stored as column indices only.
@@ -24,8 +21,7 @@ class SubstitutionBasis:
     Every supported dataset carries one assayed variant per substitution, so the
     dense matrix would be an ``n x n`` permutation matrix. Only the column index
     of each row is kept; ``NO_SUBSTITUTION`` marks rows outside the basis, such
-    as the wild-type reference row. This exposes the same read-only attributes
-    as :class:`~esmdms.schema.FeatureArtifact` so inference can accept either.
+    as the wild-type reference row.
     """
 
     sequence_ids: tuple[str, ...]
@@ -52,44 +48,6 @@ class SubstitutionBasis:
         present = self.columns >= 0
         values[present] = coefficients[self.columns[present]]
         return values
-
-    def dense(self) -> np.ndarray:
-        """Materialize the one-hot matrix. Intended for tests and small data."""
-        values = np.zeros(
-            (len(self.columns), len(self.feature_names)), dtype=np.float32
-        )
-        present = np.flatnonzero(self.columns >= 0)
-        values[present, self.columns[present]] = 1.0
-        return values
-
-    def to_artifact(self) -> FeatureArtifact:
-        """Return the equivalent dense artifact. Allocates the full matrix."""
-        return FeatureArtifact(
-            self.sequence_ids,
-            self.dense(),
-            self.feature_names,
-            "basis",
-            self.dataset,
-            dict(self.provenance),
-        )
-
-
-@dataclass(frozen=True)
-class _DenseRows:
-    """Explicit feature rows for one time point."""
-
-    values: np.ndarray
-
-    @property
-    def n_features(self) -> int:
-        return int(self.values.shape[1])
-
-    def matvec(self, vector: np.ndarray) -> np.ndarray:
-        return self.values @ vector
-
-    def rmatvec(self, weights: np.ndarray) -> np.ndarray:
-        return self.values.T @ weights
-
 
 @dataclass(frozen=True)
 class _OneHotRows:
@@ -121,7 +79,7 @@ class _OneHotRows:
 @dataclass(frozen=True)
 class _Moment:
     integration_weight: float
-    rows: _DenseRows | _OneHotRows
+    rows: _OneHotRows
     probabilities: np.ndarray
     mean: np.ndarray
 
@@ -144,10 +102,10 @@ class _ReplicateStatistics:
 
 @dataclass(frozen=True)
 class InferenceResult:
-    """Per-replicate and joint selection coefficients for a feature basis."""
+    """Per-replicate and joint selection coefficients for assayed substitutions."""
 
     dataset: str
-    features: FeatureArtifact | SubstitutionBasis
+    features: SubstitutionBasis
     gamma: float
     replicate_labels: tuple[str, ...]
     replicate_coefficients: np.ndarray
@@ -171,7 +129,7 @@ class InferenceResult:
             if joint
             else self.replicate_coefficients.mean(axis=0)
         )
-        values = intercept + _project(self.features, coefficients)
+        values = intercept + self.features.project(coefficients)
         return FeatureArtifact(
             self.features.sequence_ids,
             values[:, None],
@@ -184,14 +142,6 @@ class InferenceResult:
                 "source_provenance": self.features.provenance,
             },
         )
-
-
-def _project(
-    features: FeatureArtifact | SubstitutionBasis, coefficients: np.ndarray
-) -> np.ndarray:
-    if isinstance(features, SubstitutionBasis):
-        return features.project(coefficients)
-    return features.values @ coefficients
 
 
 def substitution_basis(dataset: Dataset) -> SubstitutionBasis:
@@ -237,37 +187,26 @@ def _integration_weights(generations: np.ndarray) -> np.ndarray:
 
 
 def _statistics(
-    dataset: Dataset, features: FeatureArtifact | SubstitutionBasis
+    dataset: Dataset, features: SubstitutionBasis
 ) -> tuple[tuple[str, ...], list[_ReplicateStatistics]]:
     if features.dataset != dataset.name:
         raise ValueError("Feature artifact and dataset names do not match.")
 
-    if isinstance(features, SubstitutionBasis):
-        n_features = len(features.feature_names)
-        row_by_id = {
-            sequence_id: int(column)
-            for sequence_id, column in zip(features.sequence_ids, features.columns)
-        }
+    n_features = len(features.feature_names)
+    row_by_id = {
+        sequence_id: int(column)
+        for sequence_id, column in zip(features.sequence_ids, features.columns)
+    }
 
-        def encode(sequence_ids: list[str]) -> _OneHotRows:
-            return _OneHotRows(
-                np.fromiter(
-                    (row_by_id[value] for value in sequence_ids),
-                    dtype=np.int64,
-                    count=len(sequence_ids),
-                ),
-                n_features,
-            )
-
-    else:
-        values = features.values
-        row_by_id = {
-            sequence_id: index
-            for index, sequence_id in enumerate(features.sequence_ids)
-        }
-
-        def encode(sequence_ids: list[str]) -> _DenseRows:
-            return _DenseRows(values[[row_by_id[value] for value in sequence_ids]])
+    def encode(sequence_ids: list[str]) -> _OneHotRows:
+        return _OneHotRows(
+            np.fromiter(
+                (row_by_id[value] for value in sequence_ids),
+                dtype=np.int64,
+                count=len(sequence_ids),
+            ),
+            n_features,
+        )
 
     missing = sorted(
         set(dataset.trajectory[SEQUENCE_ID].astype(str)).difference(row_by_id)
@@ -326,7 +265,7 @@ def assay_oriented_scores(dataset: Dataset, prior: FeatureArtifact) -> pd.Series
 
 def prior_vector(
     dataset: Dataset,
-    basis: FeatureArtifact | SubstitutionBasis,
+    basis: SubstitutionBasis,
     prior: FeatureArtifact | None,
 ) -> np.ndarray:
     """Align an assay-oriented prior to substitution-basis column order."""
@@ -408,7 +347,7 @@ class InferenceProblem:
     """
 
     dataset: str
-    features: FeatureArtifact | SubstitutionBasis
+    features: SubstitutionBasis
     replicate_labels: tuple[str, ...]
     statistics: tuple[_ReplicateStatistics, ...]
 
@@ -445,9 +384,7 @@ class InferenceProblem:
         )
 
 
-def build_problem(
-    dataset: Dataset, features: FeatureArtifact | SubstitutionBasis
-) -> InferenceProblem:
+def build_problem(dataset: Dataset, features: SubstitutionBasis) -> InferenceProblem:
     """Precompute the replicate moments shared by every gamma and alpha."""
     labels, statistics = _statistics(dataset, features)
     return InferenceProblem(dataset.name, features, labels, tuple(statistics))
@@ -455,17 +392,15 @@ def build_problem(
 
 def infer(
     dataset: Dataset,
-    features: FeatureArtifact | SubstitutionBasis,
+    features: SubstitutionBasis,
     *,
     gamma: float,
     prior: FeatureArtifact | None = None,
     prior_scale: float = 1.0,
 ) -> InferenceResult:
-    """Infer popDMS selection coefficients on an arbitrary feature basis."""
+    """Infer popDMS selection coefficients for assayed amino-acid substitutions."""
     if gamma <= 0:
         raise ValueError("gamma must be positive.")
-    if prior is not None and features.kind != "basis":
-        raise ValueError("LLR priors are defined on the substitution basis.")
     prior_values = float(prior_scale) * prior_vector(dataset, features, prior)
     return build_problem(dataset, features).solve(
         gamma=gamma, prior_values=prior_values

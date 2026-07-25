@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "esmdms"
 version = "0.1.0"
-description = "Protein embedding, sparse autoencoder, and popDMS prior analysis"
+description = "Mutational-site popDMS inference with protein language-model LLR priors"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
