@@ -1,0 +1,14 @@
+{
+  "output_dir": "results/multi_dataset_llr_prior",
+  "gammas": {"start": -5, "stop": 4, "num": 52},
+  "alphas": [0.0, 0.25, 0.5, 1.0, 2.0],
+  "review_star_cutoffs": [0, 1, 2, 3],
+  "datasets": [
+    {
+      "path": "datasets/MV_BRCA1_Findlay_2018",
+      "priors": {
+        "ESM-C 300M LLR": "artifacts/MV_BRCA1_Findlay_2018/300M_llr.npz"
+      }
+    }
+  ]
+}
